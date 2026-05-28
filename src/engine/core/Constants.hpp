@@ -33,21 +33,21 @@ namespace constants {
 
 /// Gravitational acceleration (ft/s²).
 /// @see Legacy: GRAVITY in consts.h
-constexpr double GRAVITY       = 32.2;
+constexpr double GRAVITY       = 32.174;
 
 /// sqrt(GRAVITY) — precomputed to avoid per-element std::sqrt in Froude calc.
-constexpr double SQRT_GRAVITY     = 5.67450438786;  // sqrt(32.2)
+constexpr double SQRT_GRAVITY     = 5.67222085;  // sqrt(32.174)
 
 /// 1.0 / sqrt(GRAVITY) — multiply instead of divide in Froude computation.
-constexpr double INV_SQRT_GRAVITY = 0.17622692584;  // 1.0 / sqrt(32.2)
+constexpr double INV_SQRT_GRAVITY = 0.17629784;  // 1.0 / sqrt(32.174)
 
 /// Pi.
 constexpr double PI            = 3.141592654;
 
-/// Manning's equation US customary unit factor (1.486).
-/// Q = (PHI/n) * A * R^(2/3) * S^(1/2) where PHI = 1.486 for US, 1.0 for SI.
+/// Manning's equation US customary unit factor (1.4859).
+/// Q = (PHI/n) * A * R^(2/3) * S^(1/2) where PHI = 1.4859 for US, 1.0 for SI.
 /// @see Legacy: PHI in consts.h
-constexpr double PHI           = 1.486;
+constexpr double PHI           = 1.4859;
 
 /// Manning's overland flow exponent (5/3).
 /// @see Legacy: MEXP in consts.h

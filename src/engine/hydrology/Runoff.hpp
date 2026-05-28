@@ -23,6 +23,7 @@
 #define OPENSWMM_RUNOFF_HPP
 
 #include "../data/SubcatchData.hpp"
+#include "../core/Constants.hpp"
 #include "Infiltration.hpp"
 #include <vector>
 
@@ -38,7 +39,7 @@ namespace runoff {
 
 constexpr double MEXP = 5.0 / 3.0;       ///< Manning's exponent
 constexpr double ODETOL = 0.0001;         ///< ODE solver tolerance (matching legacy)
-constexpr double PHI = 1.486;             ///< Manning's US customary constant
+constexpr double PHI = constants::PHI;    ///< Manning's US customary constant
 
 // ============================================================================
 // Per-subcatchment subarea state (SoA for vectorization)

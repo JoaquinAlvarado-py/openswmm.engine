@@ -35,6 +35,7 @@
 #include "../data/LinkData.hpp"
 #include "../data/NodeData.hpp"
 #include "../data/TableData.hpp"
+#include "../core/Constants.hpp"
 #include <vector>
 
 namespace openswmm {
@@ -47,8 +48,8 @@ namespace hydstruct {
 // Constants
 // ============================================================================
 
-constexpr double GRAVITY = 32.2;
-constexpr double FUDGE   = 0.0001;
+constexpr double GRAVITY = constants::GRAVITY;
+constexpr double FUDGE   = constants::FUDGE;
 
 // ============================================================================
 // Per-type SoA groups (like XSectGroups but for structure types)

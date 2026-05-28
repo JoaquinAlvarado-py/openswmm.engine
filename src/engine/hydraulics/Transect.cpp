@@ -9,6 +9,7 @@
  */
 
 #include "Transect.hpp"
+#include "../core/Constants.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -16,7 +17,7 @@
 namespace openswmm {
 namespace transect {
 
-static constexpr double PHI = 1.486;
+static constexpr double PHI = constants::PHI;
 
 void buildTables(TransectData& td) {
     int n_sta = static_cast<int>(td.stations.size());

@@ -15,7 +15,7 @@
 
 #include "XSectBatch.hpp"
 #include "xsect_tables.hpp"
-
+#include "../core/Constants.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -806,7 +806,7 @@ double getAmax(const XSectParams& xs) {
 double getYcrit(const XSectParams& xs, double q) {
     if (q <= 0.0) return 0.0;
     // Matching legacy xsect_getYcrit in xsect.c
-    static constexpr double GRAVITY = 32.2;
+    static constexpr double GRAVITY = constants::GRAVITY;
     double q2g = q * q / GRAVITY;
 
     if (q2g == 0.0) return 0.0;

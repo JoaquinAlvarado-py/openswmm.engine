@@ -9,6 +9,7 @@
  */
 
 #include "ForceMain.hpp"
+#include "../core/Constants.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -47,7 +48,7 @@ double getFricSlope_DW(double velocity, double hyd_rad, double roughness) {
     }
 
     // Sf = f * v^2 / (2 * g * D)
-    return f * v_abs * v_abs / (2.0 * 32.2 * diameter);
+    return f * v_abs * v_abs / (2.0 * constants::GRAVITY * diameter);
 }
 
 // ============================================================================
@@ -106,7 +107,7 @@ double getEquivN(FrictionModel model, double r_bot, double y_full,
 
 double getRoughFactor(FrictionModel model, double r_bot, double length_factor) {
     if (length_factor <= 0.0) length_factor = 1.0;
-    constexpr double G = 32.2;
+    constexpr double G = constants::GRAVITY;
     switch (model) {
         case FrictionModel::HAZEN_WILLIAMS: {
             // legacy: GRAVITY / pow(1.318 * rBot * pow(lengthFactor, 0.54), 1.852)

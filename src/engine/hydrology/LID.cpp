@@ -10,6 +10,7 @@
 
 #include "LID.hpp"
 #include "../core/SimulationContext.hpp"
+#include "../core/Constants.hpp"
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -239,7 +240,7 @@ void LIDSolver::init(SimulationContext& ctx) {
             g.surf_rough[us]      = (p[2] > 0.0) ? p[2] : 0.01;
             g.surf_slope[us]      = (p[3] > 0.0) ? p[3] : 0.01;
             g.surf_side_slope[us] = p[4];  // swale side slope (run/rise)
-            g.surf_alpha[us] = 1.49 * std::sqrt(g.surf_slope[us]) / g.surf_rough[us];
+            g.surf_alpha[us] = constants::PHI * std::sqrt(g.surf_slope[us]) / g.surf_rough[us];
         }
 
         // SOIL layer: [0]=Thick, [1]=Poros, [2]=FC, [3]=WP, [4]=Ksat, [5]=Kslope, [6]=Suction

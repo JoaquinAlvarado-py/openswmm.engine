@@ -145,13 +145,13 @@
  * \def GRAVITY
  * \brief Acceleration of gravity in US units
  */
-#define GRAVITY 32.2 // accel. of gravity in US units
+#define GRAVITY 32.174 // accel. of gravity in US units
 
 /*!
  * \def SI_GRAVITY
  * \brief Acceleration of gravity in SI units
  */
-#define SI_GRAVITY 9.81 // accel of gravity in SI units
+#define SI_GRAVITY 9.80665 // accel of gravity in SI units
 /* DEPRECATED
 #define   MAXFILESIZE        2147483647L    // largest file size in bytes
 */
@@ -184,7 +184,7 @@
  * \def PHI
  * \brief Units factor in Manning Equation
  */
-#define PHI 1.486
+#define PHI 1.4859
 /*!
  * \}
  */
