@@ -60,8 +60,8 @@ static void   initPastRain(int gage);
 * \param[in] ntoks Number of tokens
 * \return Error code
 * \details Data formats are:
-*  Name RainType RecdFreq SCF TIMESERIES SeriesName
-*  Name RainType RecdFreq SCF FILE FileName Station Units StartDate
+*  Name RainType RecdFreq SCF TIMESERIES SeriesName (RainScaleFactor)
+*  Name RainType RecdFreq SCF FILE FileName Station Units StartDate (RainScaleFactor)
 */
 int gage_readParams(int gageIndex, char* tok[], int ntoks)
 {
@@ -69,7 +69,7 @@ int gage_readParams(int gageIndex, char* tok[], int ntoks)
     char     *id;
     char     fname[MAXFNAME+1];
     char     staID[MAXMSG+1];
-    double   x[7];
+    double   x[8];
 
     // --- check that gage exists
     if ( ntoks < 2 ) return error_setInpError(ERR_ITEMS, "");
@@ -84,6 +84,7 @@ int gage_readParams(int gageIndex, char* tok[], int ntoks)
     x[4] = NO_DATE;      // Default is no start/end date
     x[5] = NO_DATE;
     x[6] = 0.0;          // US units
+    x[7] = 1.0;          // Rain scale factor
     fname[0] = '\0';
     staID[0] = '\0';
 
@@ -110,6 +111,7 @@ int gage_readParams(int gageIndex, char* tok[], int ntoks)
     Gage[gageIndex].rainInterval = (int)x[2];
     Gage[gageIndex].snowFactor   = x[3];
     Gage[gageIndex].rainUnits    = (int)x[6];
+    Gage[gageIndex].scaleFactor  = x[7];
     if ( Gage[gageIndex].tSeries >= 0 ) Gage[gageIndex].dataSource = RAIN_TSERIES;
     else                        Gage[gageIndex].dataSource = RAIN_FILE;
     if ( Gage[gageIndex].dataSource == RAIN_FILE )
@@ -157,6 +159,13 @@ int readGageSeriesFormat(char* tok[], int ntoks, double x[])
     if ( ts < 0 ) return error_setInpError(ERR_NAME, tok[5]);
     x[0] = (double)ts;
     sstrncpy(tok[2], "", 0);
+
+    // --- get optional rain scale factor
+    if ( ntoks > 6 )
+    {
+        if ( !getDouble(tok[6], &x[7]) || x[7] <= 0.0 )
+            return error_setInpError(ERR_NUMBER, tok[6]);
+    }
     return 0;
 }
 
@@ -197,6 +206,13 @@ int readGageFileFormat(char* tok[], int ntoks, double x[])
         if ( !datetime_strToDate(tok[8], &aDate) )
             return error_setInpError(ERR_DATETIME, tok[8]);
         x[4] = (float) aDate;
+    }
+
+    // --- get optional rain scale factor
+    if ( ntoks > 9 )
+    {
+        if ( !getDouble(tok[9], &x[7]) || x[7] <= 0.0 )
+            return error_setInpError(ERR_NUMBER, tok[9]);
     }
     return 0;
 }
@@ -677,7 +693,7 @@ double convertRainfall(int j, double r)
 
       default: r1 = r;
     }
-    return r1 * Gage[j].unitsFactor * Adjust.rainFactor;
+    return r1 * Gage[j].unitsFactor * Gage[j].scaleFactor * Adjust.rainFactor;
 }
 
 //=============================================================================
