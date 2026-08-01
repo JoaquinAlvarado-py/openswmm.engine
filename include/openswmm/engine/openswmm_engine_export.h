@@ -9,15 +9,15 @@
 #  ifndef SWMM_ENGINE_API
 #    ifdef openswmm_engine_EXPORTS
         /* We are building this library */
-#      define SWMM_ENGINE_API __attribute__((visibility("default")))
+#      define SWMM_ENGINE_API 
 #    else
         /* We are using this library */
-#      define SWMM_ENGINE_API __attribute__((visibility("default")))
+#      define SWMM_ENGINE_API 
 #    endif
 #  endif
 
 #  ifndef OPENSWMM_ENGINE_NO_EXPORT
-#    define OPENSWMM_ENGINE_NO_EXPORT __attribute__((visibility("hidden")))
+#    define OPENSWMM_ENGINE_NO_EXPORT 
 #  endif
 #endif
 

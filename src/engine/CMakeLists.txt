@@ -62,14 +62,20 @@ list(FILTER OPENSWMM_ENGINE_HEADERS EXCLUDE REGEX "input/geopackage/.*")
 # ---- Library target ----
 # NOTE: If there are no .cpp files yet (skeleton phase), use a placeholder.
 # Remove this condition when real sources exist.
+if(EMSCRIPTEN)
+    set(OPENSWMM_ENGINE_LIB_TYPE STATIC)
+else()
+    set(OPENSWMM_ENGINE_LIB_TYPE SHARED)
+endif()
+
 if(OPENSWMM_ENGINE_SOURCES)
-    add_library(openswmm_engine SHARED ${OPENSWMM_ENGINE_SOURCES})
+    add_library(openswmm_engine ${OPENSWMM_ENGINE_LIB_TYPE} ${OPENSWMM_ENGINE_SOURCES})
 else()
     # Placeholder object library until sources are written
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/placeholder.cpp
          "// OpenSWMM Engine — placeholder (Phase 2+ sources not yet written)\n"
          "// See docs/MASTER_IMPLEMENTATION_PLAN.md\n")
-    add_library(openswmm_engine SHARED ${CMAKE_CURRENT_BINARY_DIR}/placeholder.cpp)
+    add_library(openswmm_engine ${OPENSWMM_ENGINE_LIB_TYPE} ${CMAKE_CURRENT_BINARY_DIR}/placeholder.cpp)
 endif()
 
 # ---- Alias targets ----
