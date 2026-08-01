@@ -19,7 +19,12 @@ set(SWMM_OUT_PUBLIC_HEADERS
     ${CMAKE_CURRENT_BINARY_DIR}/openswmm_output_export.h
 )
 
-add_library(openswmm_legacy_output SHARED
+if(EMSCRIPTEN)
+    set(OPENSWMM_LEGACY_OUT_LIB_TYPE STATIC)
+else()
+    set(OPENSWMM_LEGACY_OUT_LIB_TYPE SHARED)
+endif()
+add_library(openswmm_legacy_output ${OPENSWMM_LEGACY_OUT_LIB_TYPE}
     swmm_output.c
     errormanager.c
 )

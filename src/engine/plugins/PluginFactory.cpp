@@ -40,7 +40,9 @@
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__EMSCRIPTEN__)
+// Emscripten: static/builtin plugins only; dynamic loading is disabled
+#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
 #  include <dlfcn.h>
 #else
 #  error "PluginFactory: unsupported platform"
@@ -70,6 +72,9 @@ PluginFactory::~PluginFactory() {
 void* PluginFactory::platform_load(const std::string& path) {
 #if defined(_WIN32)
     return static_cast<void*>(::LoadLibraryA(path.c_str()));
+#elif defined(__EMSCRIPTEN__)
+    (void)path;
+    return nullptr;
 #else
     return ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -79,6 +84,8 @@ void PluginFactory::platform_unload(void* handle) noexcept {
     if (!handle) return;
 #if defined(_WIN32)
     ::FreeLibrary(static_cast<HMODULE>(handle));
+#elif defined(__EMSCRIPTEN__)
+    // No-op
 #else
     ::dlclose(handle);
 #endif
@@ -89,6 +96,9 @@ void* PluginFactory::platform_sym(void* handle, const char* sym) noexcept {
 #if defined(_WIN32)
     return reinterpret_cast<void*>(
         ::GetProcAddress(static_cast<HMODULE>(handle), sym));
+#elif defined(__EMSCRIPTEN__)
+    (void)sym;
+    return nullptr;
 #else
     return ::dlsym(handle, sym);
 #endif
@@ -102,6 +112,8 @@ std::string PluginFactory::platform_error() noexcept {
                      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
                      buf, sizeof(buf), nullptr);
     return std::string(buf);
+#elif defined(__EMSCRIPTEN__)
+    return "Dynamic plugin loading is not supported in Emscripten/WASM";
 #else
     const char* msg = ::dlerror();
     return msg ? std::string(msg) : "(unknown dlerror)";
@@ -128,6 +140,8 @@ std::string PluginFactory::get_library_directory() {
         }
     }
     return {};
+#elif defined(__EMSCRIPTEN__)
+    return "/";
 #else
     // Use dladdr to find the shared library containing this function
     Dl_info dl_info;
@@ -158,6 +172,8 @@ bool PluginFactory::is_shared_library(const std::string& filename) {
     };
 #if defined(_WIN32)
     return ends_with(filename, ".dll");
+#elif defined(__EMSCRIPTEN__)
+    return ends_with(filename, ".wasm");
 #elif defined(__APPLE__)
     return ends_with(filename, ".dylib") || ends_with(filename, ".so");
 #else
@@ -170,6 +186,10 @@ bool PluginFactory::is_shared_library(const std::string& filename) {
 // ============================================================================
 
 void PluginFactory::discover(std::function<void(const std::string&)> warn_cb) {
+#if defined(__EMSCRIPTEN__)
+    (void)warn_cb;
+    return;
+#else
     std::string base_dir = get_library_directory();
     if (base_dir.empty()) return;
 
@@ -184,6 +204,7 @@ void PluginFactory::discover(std::function<void(const std::string&)> warn_cb) {
     if (fs::is_directory(components_dir)) {
         scan_directory(components_dir.string(), warn_cb);
     }
+#endif
 }
 
 void PluginFactory::scan_directory(

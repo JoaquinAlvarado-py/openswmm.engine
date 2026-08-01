@@ -84,7 +84,12 @@ set(SWMM_PUBLIC_HEADERS
 # All .c and .h files in this directory
 file(GLOB SWMM_SOURCES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *.c *.h)
 
-add_library(openswmm_legacy_engine SHARED ${SWMM_SOURCES})
+if(EMSCRIPTEN)
+    set(OPENSWMM_LEGACY_LIB_TYPE STATIC)
+else()
+    set(OPENSWMM_LEGACY_LIB_TYPE SHARED)
+endif()
+add_library(openswmm_legacy_engine ${OPENSWMM_LEGACY_LIB_TYPE} ${SWMM_SOURCES})
 
 # Backwards-compatible aliases
 add_library(openswmm::legacy::engine     ALIAS openswmm_legacy_engine)
