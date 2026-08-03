@@ -560,6 +560,11 @@ double ExplicitInertialSolver::advance(double t_current, double t_target) {
             // Quiescent: stride the window; the lazy tier keeps accumulating.
             t = t_target;
             last_dt_ = remaining;
+            // Empty windows still consume a rebuild cycle. Without advancing
+            // this counter, a rainfall-only domain remains permanently
+            // inactive and syncAndRebuild() never gets a chance to promote
+            // cells once their accumulated depth crosses h_on.
+            ++cycles_since_rebuild;
             break;
         }
 
