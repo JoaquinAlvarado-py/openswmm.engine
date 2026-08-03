@@ -33,9 +33,17 @@ IOThread::~IOThread() {
 // ============================================================================
 
 void IOThread::start() {
+#ifdef __EMSCRIPTEN__
+    // The browser build runs inside a dedicated Web Worker but is not built
+    // with Emscripten pthreads. Keep output delivery on that worker instead of
+    // attempting to create a native std::thread, which aborts the WASM runtime.
+    running_.store(true, std::memory_order_relaxed);
+    return;
+#else
     if (running_.load(std::memory_order_relaxed)) return;
     stop_flag_.store(false, std::memory_order_relaxed);
     thread_ = std::thread(&IOThread::run, this);
+#endif
 }
 
 // ============================================================================
@@ -43,6 +51,12 @@ void IOThread::start() {
 // ============================================================================
 
 void IOThread::post(SimulationSnapshot snap) {
+#ifdef __EMSCRIPTEN__
+    const int rc = factory_.update_all(snap);
+    if (rc != 0) last_error_.store(rc, std::memory_order_relaxed);
+    tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+    return;
+#else
     {
         std::unique_lock<std::mutex> lock(mutex_);
         // Block if the queue is full (back-pressure on the sim thread)
@@ -56,6 +70,7 @@ void IOThread::post(SimulationSnapshot snap) {
         queue_.emplace(std::move(snap), next_sequence_++);
     }
     cv_not_empty_.notify_one();
+#endif
 }
 
 // ============================================================================
@@ -63,6 +78,10 @@ void IOThread::post(SimulationSnapshot snap) {
 // ============================================================================
 
 void IOThread::stop() {
+#ifdef __EMSCRIPTEN__
+    running_.store(false, std::memory_order_relaxed);
+    return;
+#else
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_flag_.store(true, std::memory_order_relaxed);
@@ -74,6 +93,7 @@ void IOThread::stop() {
         thread_.join();
     }
     running_.store(false, std::memory_order_relaxed);
+#endif
 }
 
 // ============================================================================
