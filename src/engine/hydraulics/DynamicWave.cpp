@@ -509,7 +509,6 @@ void DWSolver::init(int n_nodes, int n_links, const XSectGroups& groups,
     buildVirtualJunctionPairs(ctx);
 
     // Anderson acceleration state arrays (allocated regardless; only used when enabled)
-    aa_y_prev_.resize(un, 0.0);
     aa_g_prev_.resize(un, 0.0);
     aa_r_prev_.resize(un, 0.0);
     aa_skip_.resize(un, 0);
@@ -2860,25 +2859,50 @@ void DWSolver::gatherConduitNodeFlows(SimulationContext& ctx) {
 }
 
 // ============================================================================
-// computeAASkipFlags -- identify nodes where Anderson acceleration is invalid
-// ============================================================================
-//
-// AA assumes the fixed-point operator G is the same at iterations k-1 and k.
-// These situations violate that assumption and must mark the affected nodes:
-//   EXTRAN surcharge: discontinuous dQ/dH at crown → skip surcharged nodes
-//   DYNAMIC_SLOT:     per-iterate geometry rewrite → skip nodes with active DPS
-//   SLOT:             C⁰ kink near y/yFull ≈ 0.985 → skip nodes near cutoff
-//   Weir / orifice:   flow equation switches at structure crown
-//   Pump:             on/off is discrete, always non-smooth at end nodes
-//
-// Flags are scatter-computed: walk conduits / non-conduits once, set skip
-// on end-nodes. A residual-magnitude gate in updateNodeDepths provides an
-// additional per-iteration safety net for edge cases not enumerated here.
+/**
+ * @brief Ponding eligibility predicate shared by setNodeDepth,
+ *        commitNodeDepthState and computeAASkipFlags.
+ *
+ * Mirrors legacy dynwave.c:649 (canPond = AllowPonding && pondedArea > 0),
+ * extended so 2D-coupled junctions always pond above the crown (their
+ * ponded_area is the auto-assigned 2D-cell footprint).
+ *
+ * @param ctx Simulation context (options + coupling table).
+ * @param ui  Node index.
+ * @return true when the node is allowed to pond.
+ */
+bool DWSolver::nodeCanPond(const SimulationContext& ctx, std::size_t ui) const {
+    const NodeTile& t = node_tile_[ui];
+    const bool is_coupled =
+        (ui < ctx.coupled_node.size() && ctx.coupled_node[ui]);
+    return (ctx.options.allow_ponding || is_coupled) && (t.ponded_area > 0.0);
+}
 
+/**
+ * @brief Identify nodes where Anderson acceleration is invalid for this
+ *        Picard iteration.
+ *
+ * AA assumes the fixed-point operator G is the same at iterations k-1 and k.
+ * These situations violate that assumption and must mark the affected nodes:
+ *   EXTRAN surcharge: discontinuous dQ/dH at crown → skip surcharged nodes
+ *   DYNAMIC_SLOT:     per-iterate geometry rewrite → skip nodes with active DPS
+ *   SLOT:             C⁰ kink near y/yFull ≈ 0.985 → skip nodes near cutoff
+ *   Weir / orifice:   flow equation switches at structure crown
+ *   Pump:             on/off is discrete, always non-smooth at end nodes
+ *   Ponded snap:      setNodeDepth floors a de-ponding node at full_depth-FUDGE
+ *                     (a C⁰ kink at the ponding boundary) → skip ponded nodes
+ *
+ * Flags are scatter-computed: walk conduits / non-conduits once, set skip
+ * on end-nodes. A residual-magnitude gate in updateNodeDepths provides an
+ * additional per-iteration safety net for edge cases not enumerated here.
+ *
+ * @param ctx Simulation context.
+ */
 void DWSolver::computeAASkipFlags(const SimulationContext& ctx) {
     if (!anderson_accel) return;
 
     const auto& links = ctx.links;
+    const auto& nodes = ctx.nodes;
     std::fill(aa_skip_.begin(), aa_skip_.end(), uint8_t(0));
 
     // EXTRAN surcharged-node skip: required ONLY under the EXPLICIT two-branch
@@ -2888,14 +2912,28 @@ void DWSolver::computeAASkipFlags(const SimulationContext& ctx) {
     // (dy = dV / (A + 0.5*dt*sumdqdh)) is C1-smooth through the free-surface ⟷
     // surcharge transition, so plain surcharged junctions are AA-eligible. The
     // genuinely-discrete cases (pumps, weir/orifice at crown, active DPS slot,
-    // static-slot kink) are non-smooth in the link-level sumdqdh inputs — not in
-    // the node-continuity branch — so the dedicated walks below still skip them
-    // in BOTH continuity modes.
+    // static-slot kink, ponded snap) are non-smooth in the link-level sumdqdh
+    // inputs or in the node-continuity branch — so the dedicated walks below
+    // still skip them in BOTH continuity modes.
     if (surcharge_method == SurchargeMethod::EXTRAN &&
         node_continuity == NodeContinuity::EXPLICIT) {
         for (int i = 0; i < n_nodes_; ++i) {
             auto ui = static_cast<std::size_t>(i);
             if (xnode_.is_surcharged[ui])
+                aa_skip_[ui] = 1;
+        }
+    }
+
+    // Ponded snap: setNodeDepth hard-floors a de-ponding node at
+    // full_depth - FUDGE when the update would drop below full depth
+    // (same snap in both continuity branches). That floor is a C⁰ kink in G
+    // exactly at the ponding boundary, so ponding-eligible nodes at/above
+    // full depth are skipped — without this, AA mixes across the kink and the
+    // blended iterate can jitter around full_depth.
+    if (node_continuity == NodeContinuity::SEMI_IMPLICIT) {
+        for (int i = 0; i < n_nodes_; ++i) {
+            auto ui = static_cast<std::size_t>(i);
+            if (nodeCanPond(ctx, ui) && nodes.depth[ui] >= node_tile_[ui].full_depth)
                 aa_skip_[ui] = 1;
         }
     }
@@ -2942,7 +2980,6 @@ void DWSolver::computeAASkipFlags(const SimulationContext& ctx) {
     //
     // This walks all links (not just non-conduits) — cheap (~1.3 k links)
     // and keeps DWSolver independent of StructureSolver's SoA groups.
-    const auto& nodes = ctx.nodes;
     for (int j = 0; j < n_links_; ++j) {
         auto uj = static_cast<std::size_t>(j);
         auto lt = links.type[uj];
@@ -3001,10 +3038,15 @@ void DWSolver::computeAASkipFlags(const SimulationContext& ctx) {
     }
 }
 
-// ============================================================================
-// updateNodeDepthsTeam -- per-node, Picard convergence check (team-callable)
-// ============================================================================
-
+/**
+ * @brief Per-node Picard depth update and convergence check (team-callable).
+ *
+ * @param ctx           Simulation context.
+ * @param dt            Routing timestep (s).
+ * @param step          Picard iteration index (0-based).
+ * @param unconv_shared Shared tally of non-outfall unconverged nodes, combined
+ *                      across threads via atomic adds.
+ */
 void DWSolver::updateNodeDepthsTeam(SimulationContext& ctx, double dt, int step,
                                     int& unconv_shared) {
     auto& nodes = ctx.nodes;
@@ -3112,7 +3154,6 @@ void DWSolver::updateNodeDepthsTeam(SimulationContext& ctx, double dt, int step,
 
         // Record state for next Anderson iteration
         if (use_anderson) {
-            aa_y_prev_[ui] = y_last;
             aa_g_prev_[ui] = g_k;
             aa_r_prev_[ui] = g_k - y_last;
         }
@@ -3159,10 +3200,19 @@ void DWSolver::updateNodeDepthsTeam(SimulationContext& ctx, double dt, int step,
     #pragma omp barrier
 }
 
-// ============================================================================
-// setNodeDepth -- single node depth update (EXTRAN surcharge algorithm)
-// ============================================================================
-
+/**
+ * @brief Single-node depth update for one Picard iteration.
+ *
+ * Computes the candidate depth for a node from its net inflow balance,
+ * dispatching on continuity formulation (EXPLICIT two-branch vs SEMI_IMPLICIT
+ * unified Crank-Nicolson), surcharge method and ponding state. The candidate
+ * is committed through commitNodeDepthState.
+ *
+ * @param ctx       Simulation context.
+ * @param node_idx  Node index.
+ * @param dt        Routing timestep (s).
+ * @param step      Picard iteration index (0-based).
+ */
 void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
                             int step) {
     auto& nodes = ctx.nodes;
@@ -3190,8 +3240,7 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
     // 2D-coupled junctions are an exception: their ponded_area is the auto-
     // assigned 2D-cell footprint, and they must pond above the crown so the
     // 1D HGL tracks the overlying 2D surface — regardless of ALLOW_PONDING.
-    const bool is_coupled = (ui < ctx.coupled_node.size() && ctx.coupled_node[ui]);
-    bool can_pond = (ctx.options.allow_ponding || is_coupled) && (t.ponded_area > 0.0);
+    const bool can_pond = nodeCanPond(ctx, ui);
     bool is_ponded = (can_pond && y_last > full_depth);
 
     nodes.overflow[ui] = 0.0;
@@ -3300,23 +3349,24 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
         //
         //   A * dH = 0.5 * [Q_net_old + Q_net_new] * dt
         //
+        // The engine accumulates sumdqdh POSITIVE with dQ_net/dH = -sumdqdh
+        // (higher head drives more net outflow; see the virtual-junction
+        // comment above and legacy dynwave.c's surcharge denominator).
         // Linearising Q_net_new around the current head estimate:
         //
-        //   Q_net_new ≈ Q_net + (dQ_net/dH) * dH
+        //   Q_net_new ~= Q_net + (dQ_net/dH)*dH = Q_net - sumdqdh*dH
         //
-        // where sumdqdh is accumulated POSITIVE from the link dqdh values
-        // (higher head ⟶ more net outflow through connected links), so
-        // dQ_net/dH = -sumdqdh — the same sign convention the EXTRAN
-        // surcharge branch divides by.  Substituting and rearranging:
+        // Substituting and rearranging:
         //
         //   dH = dV / (A + dt * sumdqdh / 2)
         //
-        // dV already contains the trapezoidal average of old_net_inflow and
-        // current dQ, so the sumdqdh correction folds the head-dependent
-        // flow response into the same timestep.
+        // The sumdqdh term therefore DAMPS the update (a head rise that
+        // increases net outflow reduces the net fill) and keeps the
+        // denominator strictly positive for area-floored nodes; the clamp
+        // below only guards genuinely tiny surface areas.
         //
         // The equation unifies the free-surface and surcharged regimes:
-        // when surfArea dominates the denominator ≈ A (classic dV/A path);
+        // when surfArea dominates the denominator ~= A (classic dV/A path);
         // when the node surcharges and A shrinks, the sumdqdh term takes
         // over, producing a smooth transition without a branch.
         // =================================================================
@@ -3442,26 +3492,31 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
     commitNodeDepthState(ctx, node_idx, y_new, dV, dt);
 }
 
-// ============================================================================
-// commitNodeDepthState -- canonical commit of an accepted node depth
-// ============================================================================
-//
-// The ONLY place an accepted depth candidate becomes committed node state:
-// the physical lower bound, the flooding/ponding upper cap, overflow, volume,
-// dYdT (used by the CFL adaptive-timestep logic) and the depth/head pair are
-// all derived here from the SAME candidate.
-//
-// Callers: setNodeDepth() for the ordinary Picard result, and the accepted-
-// Anderson branch in updateNodeDepthsTeam(). Before this helper existed, the
-// Anderson branch overwrote only depth and head, so an accepted mix on the
-// FINAL Picard iteration left volume, overflow and dYdT describing the
-// unmixed candidate — feeding inconsistent state into flooding totals, mass
-// balance, next-step storage losses and the next adaptive routing step.
-//
-// With Anderson OFF (the default) the single call from setNodeDepth()
-// performs the identical arithmetic the previously-inlined block did, in the
-// same order — bit-exact with the prior behavior.
-
+/**
+ * @brief Canonical commit of an accepted node depth.
+ *
+ * The ONLY place an accepted depth candidate becomes committed node state:
+ * the physical lower bound, the flooding/ponding upper cap, overflow, volume,
+ * dYdT (used by the CFL adaptive-timestep logic) and the depth/head pair are
+ * all derived here from the SAME candidate.
+ *
+ * Callers: setNodeDepth() for the ordinary Picard result, and the accepted-
+ * Anderson branch in updateNodeDepthsTeam(). Before this helper existed, the
+ * Anderson branch overwrote only depth and head, so an accepted mix on the
+ * FINAL Picard iteration left volume, overflow and dYdT describing the
+ * unmixed candidate — feeding inconsistent state into flooding totals, mass
+ * balance, next-step storage losses and the next adaptive routing step.
+ *
+ * With Anderson OFF (the default) the single call from setNodeDepth()
+ * performs the identical arithmetic the previously-inlined block did, in the
+ * same order — bit-exact with the prior behavior.
+ *
+ * @param ctx       Simulation context.
+ * @param node_idx  Node index.
+ * @param y_new     Accepted depth candidate (m).
+ * @param dV        Net volume change for the step (m³).
+ * @param dt        Routing timestep (s).
+ */
 void DWSolver::commitNodeDepthState(SimulationContext& ctx, int node_idx,
                                     double y_new, double dV, double dt) {
     auto& nodes = ctx.nodes;
@@ -3486,10 +3541,7 @@ void DWSolver::commitNodeDepthState(SimulationContext& ctx, int node_idx,
     }
 
     // --- Ponding eligibility (same rule as setNodeDepth's entry logic) ---
-    const bool is_coupled =
-        (ui < ctx.coupled_node.size() && ctx.coupled_node[ui]);
-    const bool can_pond =
-        (ctx.options.allow_ponding || is_coupled) && (t.ponded_area > 0.0);
+    const bool can_pond = nodeCanPond(ctx, ui);
 
     // --- Determine max non-flooded depth ---
     double y_max = t.full_depth;

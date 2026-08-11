@@ -34,8 +34,17 @@ IOThread::~IOThread() {
 
 void IOThread::start() {
     if (running_.load(std::memory_order_relaxed)) return;
+#ifdef __EMSCRIPTEN__
+    // WASM builds have no pthreads, so std::thread cannot be constructed.
+    // Degrade to synchronous output: start() only marks the IOThread as
+    // running (post() writes inline), preserving the threaded build's
+    // running() invariant and FIFO snapshot order.
+    running_.store(true, std::memory_order_relaxed);
+    return;
+#else
     stop_flag_.store(false, std::memory_order_relaxed);
     thread_ = std::thread(&IOThread::run, this);
+#endif
 }
 
 // ============================================================================
@@ -43,6 +52,16 @@ void IOThread::start() {
 // ============================================================================
 
 void IOThread::post(SimulationSnapshot snap) {
+#ifdef __EMSCRIPTEN__
+    // Synchronous fallback (see start()): deliver straight to the plugins,
+    // same call and ordering the threaded run() loop would perform.
+    const int rc = factory_.update_all(std::move(snap));
+    if (rc != 0) {
+        last_error_.store(rc, std::memory_order_relaxed);
+    }
+    tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+    return;
+#else
     {
         std::unique_lock<std::mutex> lock(mutex_);
         // Block if the queue is full (back-pressure on the sim thread)
@@ -56,6 +75,7 @@ void IOThread::post(SimulationSnapshot snap) {
         queue_.emplace(std::move(snap), next_sequence_++);
     }
     cv_not_empty_.notify_one();
+#endif
 }
 
 // ============================================================================
@@ -63,6 +83,11 @@ void IOThread::post(SimulationSnapshot snap) {
 // ============================================================================
 
 void IOThread::stop() {
+#ifdef __EMSCRIPTEN__
+    // No worker thread to join in the synchronous fallback.
+    running_.store(false, std::memory_order_relaxed);
+    return;
+#else
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_flag_.store(true, std::memory_order_relaxed);
@@ -74,6 +99,7 @@ void IOThread::stop() {
         thread_.join();
     }
     running_.store(false, std::memory_order_relaxed);
+#endif
 }
 
 // ============================================================================

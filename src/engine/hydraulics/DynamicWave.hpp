@@ -219,6 +219,9 @@ public:
     int    max_trials = DEFAULT_MAX_TRIALS;
     double omega      = OMEGA;
     SurchargeMethod surcharge_method = SurchargeMethod::EXTRAN;
+    ///< Node-continuity formulation: EXPLICIT (legacy two-branch dV/A and
+    ///< dQ/dH-surcharge update) or SEMI_IMPLICIT (unified Crank-Nicolson
+    ///< update with a head-dependent-flow damping term; see setNodeDepth).
     NodeContinuity  node_continuity  = NodeContinuity::EXPLICIT;
     bool   anderson_accel = false;       ///< Enable Anderson acceleration
 
@@ -479,7 +482,6 @@ private:
     std::vector<double> fasnh_;        ///< Fraction between normal & critical depth
 
     // Anderson acceleration state (per-node, depth-2 mixing)
-    std::vector<double> aa_y_prev_;     ///< Node depths at iteration k-1
     std::vector<double> aa_g_prev_;     ///< G(y_{k-1}) — computed depths at k-1
     std::vector<double> aa_r_prev_;     ///< Residual r_{k-1} = G(y_{k-1}) - y_{k-1}
     std::vector<uint8_t> aa_skip_;      ///< Per-node flag: skip AA this iteration
@@ -537,6 +539,9 @@ private:
     /// area) in ascending link-index order — see the CSR proof note above.
     /// links.flow commit is fused into momentumKernels.
     void gatherConduitNodeFlows(SimulationContext& ctx);
+    /// Ponding eligibility predicate shared by setNodeDepth,
+    /// commitNodeDepthState and computeAASkipFlags.
+    bool nodeCanPond(const SimulationContext& ctx, std::size_t ui) const;
     void computeAASkipFlags(const SimulationContext& ctx);
     /// Team-callable node-depth update (former updateNodeDepths): orphaned
     /// `omp for nowait` over nodes + per-thread unconverged tallies combined
