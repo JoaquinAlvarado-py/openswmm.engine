@@ -119,7 +119,8 @@ private:
     double t_last_sync_ = 0.0;
     int    cycles_since_rebuild_ = 1000;
     double last_dt_ = 0.0;
-    long   last_steps_ = 0, substeps_run_ = 0, face_passes_ = 0;
+    long   last_steps_ = 0, substeps_run_ = 0;
+    long long face_passes_ = 0;
     bool   initialized_ = false;
 
     std::array<long, 8> tier_occupancy_{};

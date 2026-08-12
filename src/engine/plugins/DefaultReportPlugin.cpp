@@ -868,8 +868,8 @@ void DefaultReportPlugin::write_results(std::FILE* f,
             std::fprintf(f, "\n  *************************");
             std::fprintf(f, "\n  2D Solver Statistics");
             std::fprintf(f, "\n  *************************");
-            auto srow = [&](const char* label, long v) {
-                std::fprintf(f, "\n  %s%14ld", label, v);
+            auto srow = [&](const char* label, long long v) {
+                std::fprintf(f, "\n  %s%14lld", label, v);
             };
             srow("Internal Steps ...........", mb2.solver_nsteps);
             srow("Face-Kernel Evals ........", mb2.solver_nrhs);
@@ -1037,8 +1037,17 @@ void DefaultReportPlugin::write_results(std::FILE* f,
             // massbal_getStorage (massbal.c: NodeOutflow[j] += newVolume at the
             // final period) — a node that ends the run holding its inflow is
             // balanced, not a 100% loss.
+            //
+            // stat_total_outflow_vol ALREADY includes the overflow term for
+            // non-ponding flooded nodes (SWMMEngine.cpp updateStatistics
+            // matches legacy massbal.c:587-593: NodeOutflow += overflow when
+            // newVolume <= fullVolume). Adding stat_vol_flooded here on top
+            // counts the SAME flooded water twice — a node that floods every
+            // step then reports out ≈ 2·in (e.g. −48% at the 2D-coupled
+            // nodes, where the spill is the dominant flood). Legacy computes
+            // the node error as 1 − NodeOutflow/NodeInflow (stats.c:787-788),
+            // with NO separate flooded term.
             double out_vol = ctx.nodes.stat_total_outflow_vol[uj]
-                           + ctx.nodes.stat_vol_flooded[uj]
                            + ctx.nodes.volume[uj];
             double denom = std::max(in_vol, out_vol);
             if (denom < 1.0) continue; // skip nodes with negligible flow

@@ -147,9 +147,9 @@ private:
     /// Lazy-source landing without the O(nt) rebuild (advance boundaries
     /// between rebuild cadences).
     void lazySourcesOnly(double t);
-    long   substeps_run_ = 0;           ///< cumulative substeps (whole run)
-    long   face_passes_  = 0;           ///< cumulative face-kernel passes
-    long   last_steps_   = 0;           ///< substeps in the last advance()
+    long long substeps_run_ = 0;           ///< cumulative substeps (whole run)
+    long long face_passes_  = 0;           ///< cumulative face-kernel passes
+    long      last_steps_   = 0;           ///< substeps in the last advance()
     double last_dt_      = 0.0;
     bool   initialized_  = false;
 

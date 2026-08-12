@@ -87,10 +87,10 @@ public:
     /// Cumulative marcher statistics over the whole run — the throughput
     /// numbers the "2D Solver Statistics" report block reads.
     struct RunStats {
-        long   nsteps    = 0;   ///< internal (marcher) substeps
-        long   nrhs      = 0;   ///< face-kernel evaluations
-        double last_h    = 0.0; ///< last accepted internal step (s)
-        double avg_h     = 0.0; ///< sim-time / nsteps (s), filled by the caller
+        long long nsteps    = 0;  ///< internal (marcher) substeps
+        long long nrhs      = 0;  ///< face-kernel evaluations
+        double    last_h    = 0.0; ///< last accepted internal step (s)
+        double    avg_h     = 0.0; ///< sim-time / nsteps (s), filled by the caller
 
         // Marcher telemetry. Guarded: n_tiers == 0 and negative fractions
         // mean "not populated".

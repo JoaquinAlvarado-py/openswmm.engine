@@ -1027,8 +1027,8 @@ struct SimulationContext {
         // Cumulative marcher statistics (published by SurfaceRouter2D at
         // finalize from ISurfaceSolver::run_stats). Printed as the "2D Solver
         // Statistics" report block. -1 = not populated.
-        long   solver_nsteps         = -1;   ///< internal (marcher) substeps
-        long   solver_nrhs           = 0;    ///< face-kernel evaluations
+        long long solver_nsteps         = -1;   ///< internal (marcher) substeps
+        long long solver_nrhs           = 0;    ///< face-kernel evaluations
         double solver_avg_h          = 0.0;  ///< mean accepted internal step (s)
         double solver_last_h         = 0.0;  ///< last accepted internal step (s)
 
