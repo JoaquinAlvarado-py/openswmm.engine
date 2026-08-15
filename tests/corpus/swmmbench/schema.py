@@ -24,9 +24,10 @@ class Status:
 
 
 VARIANT_A = "A"      # our engine, new options explicitly off
-VARIANT_B = "B"      # our engine, Anderson + continuity options on
+VARIANT_B = "B"      # our engine, Anderson acceleration on
+VARIANT_C = "C"      # our engine, semi-implicit (Crank-Nicolson) node continuity on
 VARIANT_REF = "REF"  # the corpus .rpt, parsed but never re-run
-VARIANTS = (VARIANT_A, VARIANT_B)
+VARIANTS = (VARIANT_A, VARIANT_B, VARIANT_C)
 
 # Which counter the "Average ... per Step" line actually reports. The report
 # writer relabels it under FV routing (DefaultReportPlugin.cpp:1194-1203) and

@@ -27,6 +27,21 @@ def test_feature_variant_turns_anderson_on():
     assert "ANDERSON_ACCEL       NO" not in result
 
 
+def test_a_and_b_both_state_node_continuity_explicit():
+    result_a = variants.apply_options(DECK, variants.OPTIONS[schema.VARIANT_A])
+    result_b = variants.apply_options(DECK, variants.OPTIONS[schema.VARIANT_B])
+
+    assert "NODE_CONTINUITY      EXPLICIT" in result_a
+    assert "NODE_CONTINUITY      EXPLICIT" in result_b
+
+
+def test_variant_c_turns_on_semi_implicit_continuity_and_keeps_anderson_off():
+    result = variants.apply_options(DECK, variants.OPTIONS[schema.VARIANT_C])
+
+    assert "NODE_CONTINUITY      SEMI_IMPLICIT" in result
+    assert "ANDERSON_ACCEL       NO" in result
+
+
 def test_existing_key_is_overwritten_not_duplicated():
     deck = DECK.replace("[OPTIONS]\n", "[OPTIONS]\nANDERSON_ACCEL       NO\n")
 

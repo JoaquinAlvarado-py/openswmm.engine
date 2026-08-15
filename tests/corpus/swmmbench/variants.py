@@ -1,8 +1,8 @@
-"""Emission of the A and B decks.
+"""Emission of the A, B and C decks.
 
-Both variants state every option under study explicitly. Leaving A to inherit
-engine defaults would let a future change to a default silently redefine the
-baseline and invalidate comparisons against earlier sweeps.
+Every variant states every option under study explicitly. Leaving A to
+inherit engine defaults would let a future change to a default silently
+redefine the baseline and invalidate comparisons against earlier sweeps.
 """
 
 from __future__ import annotations
@@ -14,16 +14,26 @@ from typing import Iterator
 
 from . import schema
 
-#: Options under study, written verbatim into both decks.
+#: Options under study, written verbatim into all three decks.
 #:
 #: B isolates Anderson acceleration alone: `ANDERSON_ACCEL` is the ONLY key
-#: whose value differs between A and B. Every other option is stated
-#: identically in both so that a single variable moves and the B - A delta is
-#: attributable. This is deliberate -- do not fold a second knob into B.
+#: whose value differs between A and B. C isolates semi-implicit
+#: (Crank-Nicolson) node continuity alone: `NODE_CONTINUITY` is the ONLY key
+#: whose value differs between A and C. Every other option is stated
+#: identically across all three so that a single variable moves per pairing
+#: and the B - A and C - A deltas are each attributable to exactly one
+#: feature. This is deliberate -- do not fold Anderson and Crank-Nicolson
+#: into a single variant; doing so would make every observed shift
+#: unattributable between the two causes.
+#:
+#: `NODE_CONTINUITY` is stated explicitly in every variant, including A and
+#: B, even though EXPLICIT is the engine default (OptionsHandler.cpp:443):
+#: leaving it implicit would let a future change to that default silently
+#: redefine the baseline these variants are compared against.
 #:
 #: The other continuity knobs the engine exposes, for whoever adds the next
-#: variant (a variant C, not a change to B). Keyword spellings are the
-#: `[OPTIONS]` keys accepted by OptionsHandler.cpp:
+#: variant. Keyword spellings are the `[OPTIONS]` keys accepted by
+#: OptionsHandler.cpp:
 #:   SURCHARGE_METHOD             EXTRAN | SLOT | DYNAMIC_SLOT
 #:   VIRTUAL_JUNCTION_MOMENTUM    BASIC (FULL is retired and warns)
 #:   DPS_CELERITY                 the dps_target_celerity knob
@@ -32,11 +42,19 @@ from . import schema
 OPTIONS: dict[str, dict[str, str]] = {
     schema.VARIANT_A: {
         "ANDERSON_ACCEL": "NO",
+        "NODE_CONTINUITY": "EXPLICIT",
         "SURCHARGE_METHOD": "EXTRAN",
         "VIRTUAL_JUNCTION_MOMENTUM": "BASIC",
     },
     schema.VARIANT_B: {
         "ANDERSON_ACCEL": "YES",
+        "NODE_CONTINUITY": "EXPLICIT",
+        "SURCHARGE_METHOD": "EXTRAN",
+        "VIRTUAL_JUNCTION_MOMENTUM": "BASIC",
+    },
+    schema.VARIANT_C: {
+        "ANDERSON_ACCEL": "NO",
+        "NODE_CONTINUITY": "SEMI_IMPLICIT",
         "SURCHARGE_METHOD": "EXTRAN",
         "VIRTUAL_JUNCTION_MOMENTUM": "BASIC",
     },
