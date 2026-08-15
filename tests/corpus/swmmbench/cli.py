@@ -300,20 +300,17 @@ def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
     _flush_diff_batch(out_dir, rows, pending)
 
 
-#: Derived tables that stage_report recomputes from scratch on every run.
-#: Unlike `runs`, `elements` and `models` -- which are resumable keyed
-#: appends -- these three are pure functions of already-persisted data, so a
-#: second `report` run must replace them, not append to them.
-#: store.write_table's basename carries a fresh UUID on every call
-#: (deliberately, so a resumed sweep accumulates), which means a second
-#: `report` run would otherwise double every row and silently corrupt any
-#: downstream aggregation.
-_DERIVED_TABLES = ("deltas", "element_deltas", "topology_status")
-
-
 def _replace_table(frame: pd.DataFrame, out_dir: Path, name: str,
                     partition_by: list[str] | None = None) -> None:
     """Delete the existing dataset for a derived table, then write `frame`.
+
+    `deltas`, `element_deltas` and `topology_status` are pure functions of
+    already-persisted data -- unlike `runs`, `elements` and `models`, which
+    are resumable keyed appends -- so a second `report` run must replace
+    them, not append to them. store.write_table's basename carries a fresh
+    UUID on every call (deliberately, so a resumed sweep accumulates), which
+    means a second `report` run would otherwise double every row and
+    silently corrupt any downstream aggregation.
 
     Deleting even when `frame` is empty ensures a report run that no longer
     produces a status (e.g. every reference topology now matches) actually
