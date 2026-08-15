@@ -148,18 +148,39 @@ def test_markdown_names_the_estimate_as_an_estimate(tmp_path):
     assert "EPA" in text
 
 
-def test_markdown_reports_both_b_minus_a_and_c_minus_a_axes(tmp_path):
+def _markdown_section(text: str, heading: str) -> str:
+    """The body of a `## heading` section, up to the next `## ` heading."""
+    start = text.index(heading) + len(heading)
+    rest = text[start:]
+    end = rest.find("\n## ")
+    return rest[:end] if end != -1 else rest
+
+
+def test_markdown_reports_both_b_minus_a_and_c_minus_a_axes_with_their_own_rows(
+    tmp_path,
+):
+    # A test asserting only that the strings "B - A" and "C - A" appear
+    # anywhere in the document would also pass with both axis sections
+    # deleted, because the Caveats text mentions them. This instead checks
+    # each axis's section is a real, separate table carrying that axis's own
+    # computed values -- not the other axis's, and not an empty heading.
     deltas = report.build_deltas(_runs(), METRICS)
 
     path = report.write_markdown(deltas, _runs(), tmp_path / "summary.md")
     text = path.read_text(encoding="utf-8")
 
-    assert "B - A" in text
-    assert "C - A" in text
-    # The two axes are kept visible side by side, not collapsed into one.
-    b_section = text.index("B - A")
-    c_section = text.index("C - A")
-    assert b_section != c_section
+    b_section = _markdown_section(text, "## B - A by metric")
+    c_section = _markdown_section(text, "## C - A by metric")
+
+    # _runs(): avg_iterations_per_step is A=4.0, B=2.0, C=3.0, so
+    # delta_b_minus_a = -2.0 and delta_c_minus_a = -1.0 for the one model.
+    assert "avg_iterations_per_step" in b_section
+    assert "-2.0000" in b_section
+    assert "-1.0000" not in b_section
+
+    assert "avg_iterations_per_step" in c_section
+    assert "-1.0000" in c_section
+    assert "-2.0000" not in c_section
 
 
 def test_empty_input_produces_an_empty_frame_not_an_error():
