@@ -63,6 +63,32 @@ def test_inventory_writes_one_row_per_model(corpus_root, tmp_path):
     assert store.read_table(tmp_path / "out", "models").shape[0] == 2
 
 
+def test_a_second_inventory_replaces_rather_than_doubles_the_corpus(
+    corpus_root, tmp_path,
+):
+    # `inventory` is step 1 of every documented sweep, so an appending write
+    # would double the corpus -- and every downstream number -- with no error.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    before = store.read_table(out, "models")
+
+    cli.stage_inventory(corpus_root, out)
+    after = store.read_table(out, "models")
+
+    assert len(after) == len(before) == 2
+    assert sorted(after["model_id"]) == ["EPA/m1", "LID/m2"]
+
+
+def test_inventory_drops_a_model_that_left_the_corpus(corpus_root, tmp_path):
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    (corpus_root / "LID" / "m2.inp").unlink()
+
+    cli.stage_inventory(corpus_root, out)
+
+    assert sorted(store.read_table(out, "models")["model_id"]) == ["EPA/m1"]
+
+
 def test_run_produces_two_variants_per_model(corpus_root, tmp_path, fake_engine):
     out = tmp_path / "out"
     cli.stage_inventory(corpus_root, out)
@@ -243,3 +269,5 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
 
     captured = capsys.readouterr()
     assert "F/bad" in captured.out
+
+

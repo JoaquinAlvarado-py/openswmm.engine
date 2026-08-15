@@ -17,13 +17,20 @@ RESUME_KEY = ["model_id", "variant", "engine_version", "inp_sha256"]
 
 
 def stage_inventory(corpus_root: Path, out_dir: Path) -> pd.DataFrame:
+    """Re-derive the model list from the corpus, replacing any earlier one.
+
+    `models` is a pure function of the corpus tree, so a second `inventory`
+    must replace it rather than append: `store.write_table` appends by design
+    (fresh UUID basename per call), and the README makes `inventory` step 1 of
+    every sweep, so an appending write would silently double the corpus -- and
+    every downstream count computed over it -- with no error.
+    """
     records = corpus.discover(Path(corpus_root))
     frame = pd.DataFrame([
         {k: v for k, v in dataclasses.asdict(r).items() if k != "abs_path"}
         for r in records
     ])
-    if not frame.empty:
-        store.write_table(frame, out_dir, "models", partition_by=["family"])
+    _replace_table(frame, out_dir, "models", partition_by=["family"])
     return frame
 
 
@@ -304,13 +311,14 @@ def _replace_table(frame: pd.DataFrame, out_dir: Path, name: str,
                     partition_by: list[str] | None = None) -> None:
     """Delete the existing dataset for a derived table, then write `frame`.
 
-    `deltas`, `element_deltas` and `topology_status` are pure functions of
-    already-persisted data -- unlike `runs`, `elements` and `models`, which
-    are resumable keyed appends -- so a second `report` run must replace
-    them, not append to them. store.write_table's basename carries a fresh
-    UUID on every call (deliberately, so a resumed sweep accumulates), which
-    means a second `report` run would otherwise double every row and
-    silently corrupt any downstream aggregation.
+    `models`, `deltas`, `element_deltas` and `topology_status` are pure
+    functions of already-persisted (or on-disk) data -- unlike `runs`,
+    `elements`, `scalars` and `ts_diff`, which are resumable keyed appends --
+    so re-running the stage that produces them must replace them, not append
+    to them. store.write_table's basename carries a fresh UUID on every call
+    (deliberately, so a resumed sweep accumulates), which means a second run
+    would otherwise double every row and silently corrupt any downstream
+    aggregation.
 
     Deleting even when `frame` is empty ensures a report run that no longer
     produces a status (e.g. every reference topology now matches) actually
