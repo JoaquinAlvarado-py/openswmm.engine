@@ -156,6 +156,12 @@ def test_a_refusal_leaves_an_earlier_report_intact(store_dir):
     assert len(store.read_table(store_dir, "deltas")) == before
 
 
+def test_main_surfaces_the_refusal_as_a_non_zero_exit(store_dir):
+    store.write_table(_runs(ENGINE_V2), store_dir, "runs", partition_by=["family"])
+
+    assert cli.main(["report", "--out", str(store_dir)]) != 0
+
+
 def test_the_reference_sentinel_is_not_counted_as_an_engine_build(store_dir):
     # REF rows always carry `corpus-reference`; counting it would make every
     # single-build store look mixed.

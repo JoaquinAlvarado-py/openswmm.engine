@@ -394,3 +394,42 @@ def test_main_returns_zero_for_a_clean_run(corpus_root, tmp_path, fake_engine):
     assert code == 0
 
 
+# ---------------------------------------------------------------------------
+# --corpus-root applies only to the stages that read the corpus
+# ---------------------------------------------------------------------------
+
+
+def test_diff_is_invocable_without_a_corpus_root(tmp_path):
+    # `diff` works purely from the Parquet store; requiring --corpus-root made
+    # the documented invocation exit 2 before any stage code ran.
+    code = cli.main(["diff", "--out", str(tmp_path / "out")])
+
+    assert code == 0
+
+
+def test_report_is_invocable_without_a_corpus_root(tmp_path, capsys):
+    code = cli.main(["report", "--out", str(tmp_path / "out")])
+
+    assert code == 0
+    assert "no runs" in capsys.readouterr().out
+
+
+def test_inventory_without_a_corpus_root_fails_cleanly(tmp_path, capsys):
+    code = cli.main(["inventory", "--out", str(tmp_path / "out")])
+
+    assert code != 0
+    assert "--corpus-root" in capsys.readouterr().out
+
+
+def test_check_without_a_corpus_root_fails_cleanly(tmp_path, capsys):
+    code = cli.main(["check", "--out", str(tmp_path / "out")])
+
+    assert code != 0
+    assert "--corpus-root" in capsys.readouterr().out
+
+
+def test_run_without_a_corpus_root_fails_cleanly(tmp_path, capsys):
+    code = cli.main(["run", "--out", str(tmp_path / "out"), "--engine", "x"])
+
+    assert code != 0
+    assert "--corpus-root" in capsys.readouterr().out

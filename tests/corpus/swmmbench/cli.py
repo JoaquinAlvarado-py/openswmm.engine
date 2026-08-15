@@ -411,10 +411,18 @@ def stage_report(out_dir: Path) -> int:
     return 0
 
 
+#: Stages that read the corpus tree. `diff` and `report` work purely from the
+#: Parquet store, so requiring `--corpus-root` for them at the parser level
+#: would make the documented `diff`/`report` invocations exit 2 before any
+#: stage code ran.
+CORPUS_STAGES = ("inventory", "run", "check")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="swmmbench")
     parser.add_argument("stage", choices=["inventory", "run", "diff", "report", "check"])
-    parser.add_argument("--corpus-root", required=True, type=Path)
+    parser.add_argument("--corpus-root", type=Path, default=None,
+                        help=f"required for the {', '.join(CORPUS_STAGES)} stages")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--engine", nargs="+", default=None,
                         help="engine executable and any leading arguments")
@@ -428,6 +436,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.stage in CORPUS_STAGES and args.corpus_root is None:
+        print(f"error: --corpus-root is required for the {args.stage} stage")
+        return 2
 
     if args.stage == "inventory":
         frame = stage_inventory(args.corpus_root, args.out)
