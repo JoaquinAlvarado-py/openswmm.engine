@@ -168,3 +168,53 @@ def test_the_reference_sentinel_is_not_counted_as_an_engine_build(store_dir):
     versions = cli.executed_engine_versions(store.read_table(store_dir, "runs"))
 
     assert versions == [ENGINE_V1]
+
+
+# ---------------------------------------------------------------------------
+# Engine-echoed option values vs. variant intent
+# ---------------------------------------------------------------------------
+
+
+def _option_echo_runs(c_reported_node_continuity: str = "SEMI_IMPLICIT") -> pd.DataFrame:
+    """One model x {A, B, C}, each echoing its intended option value unless
+    overridden -- e.g. a C run whose engine actually resolved EXPLICIT."""
+    variant_echoes = {
+        schema.VARIANT_A: ("EXPLICIT", "NO"),
+        schema.VARIANT_B: ("EXPLICIT", "YES"),
+        schema.VARIANT_C: (c_reported_node_continuity, "NO"),
+    }
+    return pd.DataFrame([
+        {"model_id": "EPA/m1", "family": "EPA", "variant": variant,
+         "engine_version": ENGINE_V1, "status": schema.Status.OK,
+         "reported_node_continuity": node_continuity,
+         "reported_anderson_accel": anderson}
+        for variant, (node_continuity, anderson) in variant_echoes.items()
+    ])
+
+
+def test_report_warns_about_a_c_run_that_echoes_explicit_node_continuity(
+    tmp_path, capsys,
+):
+    out = tmp_path / "out"
+    store.write_table(_option_echo_runs(c_reported_node_continuity="EXPLICIT"),
+                      out, "runs", partition_by=["family"])
+
+    code = cli.stage_report(out)
+
+    assert code == 0  # an anomaly is reported, not a hard failure
+    captured = capsys.readouterr().out
+    assert "EPA/m1" in captured
+    assert "NODE_CONTINUITY" in captured
+
+
+def test_report_stays_silent_when_every_run_echoes_its_intended_option(
+    tmp_path, capsys,
+):
+    out = tmp_path / "out"
+    store.write_table(_option_echo_runs(), out, "runs", partition_by=["family"])
+
+    cli.stage_report(out)
+
+    captured = capsys.readouterr().out
+    assert "NODE_CONTINUITY" not in captured
+    assert "ANDERSON_ACCEL" not in captured

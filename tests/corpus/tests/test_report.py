@@ -185,3 +185,75 @@ def test_markdown_reports_both_b_minus_a_and_c_minus_a_axes_with_their_own_rows(
 
 def test_empty_input_produces_an_empty_frame_not_an_error():
     assert report.build_deltas(pd.DataFrame(), METRICS).empty
+
+
+# ---------------------------------------------------------------------------
+# Engine-echoed option values vs. variant intent
+# ---------------------------------------------------------------------------
+
+
+def _option_runs(**overrides):
+    """One executed run per variant, each echoing what its variant intends
+    unless overridden by `overrides[variant] = {"reported_node_continuity": ...}`."""
+    base = {
+        schema.VARIANT_A: {"reported_node_continuity": "EXPLICIT",
+                           "reported_anderson_accel": "NO"},
+        schema.VARIANT_B: {"reported_node_continuity": "EXPLICIT",
+                           "reported_anderson_accel": "YES"},
+        schema.VARIANT_C: {"reported_node_continuity": "SEMI_IMPLICIT",
+                           "reported_anderson_accel": "NO"},
+    }
+    for variant, patch in overrides.items():
+        base[variant].update(patch)
+    return pd.DataFrame([
+        {"model_id": "EPA/m1", "family": "EPA", "variant": variant, **echoes}
+        for variant, echoes in base.items()
+    ])
+
+
+def test_option_anomalies_is_empty_when_every_run_echoes_its_intent():
+    anomalies = report.option_anomalies(_option_runs())
+
+    assert anomalies.empty
+
+
+def test_option_anomalies_flags_a_c_run_that_echoes_explicit():
+    runs = _option_runs(C={"reported_node_continuity": "EXPLICIT"})
+
+    anomalies = report.option_anomalies(runs)
+
+    assert len(anomalies) == 1
+    row = anomalies.iloc[0]
+    assert row["model_id"] == "EPA/m1"
+    assert row["variant"] == schema.VARIANT_C
+    assert row["option"] == "NODE_CONTINUITY"
+    assert row["expected"] == "SEMI_IMPLICIT"
+    assert row["reported"] == "EXPLICIT"
+
+
+def test_option_anomalies_flags_a_b_run_that_echoes_anderson_off():
+    runs = _option_runs(B={"reported_anderson_accel": "NO"})
+
+    anomalies = report.option_anomalies(runs)
+
+    assert len(anomalies) == 1
+    row = anomalies.iloc[0]
+    assert row["variant"] == schema.VARIANT_B
+    assert row["option"] == "ANDERSON_ACCEL"
+    assert row["expected"] == "YES"
+    assert row["reported"] == "NO"
+
+
+def test_option_anomalies_ignores_a_run_with_no_echo():
+    # FV/STEADY/KINWAVE routing never prints the block at all -- absence is
+    # not a contradiction, there is nothing to check.
+    runs = _option_runs(C={"reported_node_continuity": None,
+                           "reported_anderson_accel": None})
+
+    anomalies = report.option_anomalies(runs)
+
+    assert anomalies.empty
+
+
+def test_option_anomalies_on_empty_input_is_an_empty_frame_not_an_error():
+    assert report.option_anomalies(pd.DataFrame()).empty

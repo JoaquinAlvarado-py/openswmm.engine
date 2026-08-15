@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import schema
+from . import schema, variants
 
 DEFAULT_METRICS = [
     "avg_iterations_per_step",
@@ -102,6 +102,59 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
             })
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Engine-echoed option values vs. variant intent
+# ---------------------------------------------------------------------------
+
+#: Options whose engine-reported value can be checked against the variant's
+#: stated intent, keyed by the `runs` column that carries the echo
+#: (DefaultReportPlugin.cpp prints both under the DYNWAVE-only Analysis
+#: Options block; rptparse.parse_scalars reads them into these columns).
+#: OptionsHandler.cpp silently ignores an unrecognised value for either --
+#: no `else`, no warning -- so `options_applied` (what the harness's deck
+#: asked for) cannot alone prove the engine actually did it. Without this
+#: check, a typo in an option name or value would read as "the feature has
+#: no effect" across the whole corpus instead of as a broken deck.
+OPTION_ECHO_COLUMNS = {
+    "NODE_CONTINUITY": "reported_node_continuity",
+    "ANDERSON_ACCEL": "reported_anderson_accel",
+}
+
+ANOMALY_COLUMNS = ["model_id", "variant", "option", "expected", "reported"]
+
+
+def option_anomalies(runs: pd.DataFrame) -> pd.DataFrame:
+    """Executed runs whose engine-reported option value contradicts intent.
+
+    A row with no echo (FV/STEADY/KINWAVE routing never prints the block at
+    all) is not an anomaly: there is nothing to contradict, so it is silently
+    skipped rather than flagged.
+    """
+    if runs.empty:
+        return pd.DataFrame(columns=ANOMALY_COLUMNS)
+
+    executed = runs[runs["variant"].isin(schema.VARIANTS)]
+    rows: list[dict] = []
+
+    for option, echo_column in OPTION_ECHO_COLUMNS.items():
+        if echo_column not in executed.columns:
+            continue
+        for _, row in executed.iterrows():
+            reported = row.get(echo_column)
+            if reported is None or (isinstance(reported, float) and pd.isna(reported)):
+                continue
+            expected = variants.OPTIONS.get(row["variant"], {}).get(option)
+            if expected is None:
+                continue
+            if str(reported).strip().upper() != str(expected).strip().upper():
+                rows.append({
+                    "model_id": row["model_id"], "variant": row["variant"],
+                    "option": option, "expected": expected, "reported": reported,
+                })
+
+    return pd.DataFrame(rows, columns=ANOMALY_COLUMNS)
 
 
 def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path:

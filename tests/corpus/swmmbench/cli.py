@@ -438,6 +438,21 @@ def stage_report(out_dir: Path) -> int:
         print("Re-run `report` against a store holding a single engine build.")
         return 1
 
+    # A reported anomaly, not a hard failure: an operator deliberately
+    # studying a different configuration should not be blocked. It exists
+    # because OptionsHandler.cpp silently ignores an unrecognised
+    # NODE_CONTINUITY/ANDERSON_ACCEL value -- a typo would otherwise read as
+    # "the feature has no effect" across the whole corpus.
+    anomalies = report.option_anomalies(runs)
+    if not anomalies.empty:
+        n_models = anomalies["model_id"].nunique()
+        print(f"WARNING: {len(anomalies)} run(s) across {n_models} model(s) "
+              f"report an option value that contradicts their variant's "
+              f"intent (the engine may have silently ignored the option):")
+        for _, row in anomalies.iterrows():
+            print(f"  {row['model_id']} ({row['variant']}): {row['option']} "
+                  f"expected {row['expected']!r}, engine reported {row['reported']!r}")
+
     deltas = report.build_deltas(runs, report.DEFAULT_METRICS)
     _replace_table(deltas, out_dir, "deltas", partition_by=["family"])
 
