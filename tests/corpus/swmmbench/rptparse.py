@@ -96,8 +96,12 @@ def parse_scalars(text: str) -> dict:
         for candidate in lines[index: index + 40]:
             error = _CONTINUITY_ERROR.search(candidate)
             if error:
-                out[field] = float(error.group(1))
-                break
+                try:
+                    out[field] = float(error.group(1))
+                    break
+                except ValueError:
+                    # Malformed continuity error value — skip and continue looking
+                    continue
 
     for line in lines:
         colon = _COLON.match(line)
@@ -181,11 +185,16 @@ def parse_rankings(text: str) -> list[dict]:
             entry = _RANKING_ENTRY.match(lines[cursor])
             if not entry:
                 break
+            try:
+                value = float(entry.group("value"))
+            except ValueError:
+                # Malformed value (e.g., "1.2.3" or ".") — terminate this block
+                break
             rows.append({
                 "element_type": entry.group("kind").upper(),
                 "element_id": entry.group("id"),
                 "metric": metric,
-                "value": float(entry.group("value")),
+                "value": value,
             })
             cursor += 1
 

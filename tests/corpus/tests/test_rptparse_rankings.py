@@ -94,3 +94,43 @@ def test_real_reference_report_reports_four_nonconverging_nodes(fixtures):
 
 def test_junk_input_yields_no_rows_rather_than_raising():
     assert rptparse.parse_rankings("\x00 garbage \n") == []
+
+
+def test_malformed_ranking_values_do_not_raise_and_terminate_block():
+    """Malformed values like '1.2.3' or '.' must not raise ValueError.
+
+    Valid entries before the malformed one are returned; the malformed entry
+    and anything after it are skipped as the block terminates.
+    """
+    malformed_input = """
+  *************************
+  Highest Continuity Errors
+  *************************
+  Node J1 (-0.36%)
+  Node X (1.2.3%)
+  Node Y (3.0%)
+
+
+  *********************************
+  Most Frequent Nonconverging Nodes
+  *********************************
+  Node M (2.5%)
+  Node N (.)
+  Node O (1.0%)
+"""
+    rows = rptparse.parse_rankings(malformed_input)
+
+    # Verify no exception was raised and valid entries are returned
+    assert len(rows) == 2
+
+    # First valid entry (before malformed in continuity block)
+    continuity = [r for r in rows if r["metric"] == "continuity_error_pct"]
+    assert len(continuity) == 1
+    assert continuity[0]["element_id"] == "J1"
+    assert continuity[0]["value"] == pytest.approx(-0.36)
+
+    # First valid entry in nonconverging block (before malformed)
+    nonconv = [r for r in rows if r["metric"] == "nonconverging_pct"]
+    assert len(nonconv) == 1
+    assert nonconv[0]["element_id"] == "M"
+    assert nonconv[0]["value"] == pytest.approx(2.5)

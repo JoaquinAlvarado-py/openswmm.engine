@@ -110,3 +110,27 @@ def test_quality_continuity_is_none_when_absent_in_multi_block_report(multi_cont
     scalars = rptparse.parse_scalars(multi_continuity)
 
     assert scalars["continuity_error_quality"] is None
+
+
+def test_malformed_continuity_error_value_does_not_raise():
+    """Malformed continuity error values like '1.2.3' or '.' must not raise.
+
+    If a line matches the pattern but has a malformed value, the parser should
+    continue looking for the next valid continuity error line.
+    """
+    report_with_malformed_continuity = """
+  Flow Routing Continuity
+  ***********************
+  Continuity Error (%) .............. 1.2.3
+  There are no discernible errors.
+
+  Flow Routing Continuity
+  ***********************
+  Continuity Error (%) .............. -0.542
+  There are no discernible errors.
+"""
+    # Should not raise ValueError when parsing malformed "1.2.3"
+    scalars = rptparse.parse_scalars(report_with_malformed_continuity)
+
+    # The parser should have skipped the malformed value and found the valid one
+    assert scalars["continuity_error_flow"] == pytest.approx(-0.542)
