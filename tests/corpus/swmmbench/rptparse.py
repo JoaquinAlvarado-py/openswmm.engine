@@ -127,3 +127,66 @@ def parse_scalars(text: str) -> dict:
             )
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-element convergence rankings
+# ---------------------------------------------------------------------------
+
+#: Ranking block title -> metric name emitted for its entries.
+RANKING_BLOCKS = {
+    "Highest Continuity Errors": "continuity_error_pct",
+    "Time-Step Critical Elements": "time_step_critical",
+    "Highest Flow Instability Indexes": "flow_instability_index",
+    "Most Frequent Nonconverging Nodes": "nonconverging_pct",
+}
+
+#: Prose the engine prints instead of entries when a ranking is empty. These
+#: are statements of health, not parse failures.
+EMPTY_SENTINELS = (
+    "none",
+    "all links are stable.",
+    "convergence obtained at all time steps.",
+    "all nodes converged.",
+)
+
+#: `Node 10208 (3.68%)` and `Link 8060 (1)` — the percent sign is optional
+#: because the instability index is a bare count.
+_RANKING_ENTRY = re.compile(
+    r"^\s*(?P<kind>Node|Link)\s+(?P<id>\S+)\s+\((?P<value>-?[\d.]+)%?\)\s*$"
+)
+
+
+def parse_rankings(text: str) -> list[dict]:
+    """Extract per-element ranking entries from every ranking block."""
+    lines = text.splitlines()
+    rows: list[dict] = []
+
+    for index, line in enumerate(lines):
+        metric = RANKING_BLOCKS.get(line.strip())
+        if metric is None:
+            continue
+        # The title sits inside a three-line asterisk banner; entries begin
+        # after the closing banner line.
+        cursor = index + 1
+        if cursor < len(lines) and set(lines[cursor].strip()) == {"*"}:
+            cursor += 1
+
+        while cursor < len(lines):
+            body = lines[cursor].strip()
+            if not body:
+                break
+            if body.lower() in EMPTY_SENTINELS:
+                break
+            entry = _RANKING_ENTRY.match(lines[cursor])
+            if not entry:
+                break
+            rows.append({
+                "element_type": entry.group("kind").upper(),
+                "element_id": entry.group("id"),
+                "metric": metric,
+                "value": float(entry.group("value")),
+            })
+            cursor += 1
+
+    return rows
