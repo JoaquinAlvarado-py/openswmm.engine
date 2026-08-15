@@ -15,6 +15,20 @@ from typing import Iterator
 from . import schema
 
 #: Options under study, written verbatim into both decks.
+#:
+#: B isolates Anderson acceleration alone: `ANDERSON_ACCEL` is the ONLY key
+#: whose value differs between A and B. Every other option is stated
+#: identically in both so that a single variable moves and the B - A delta is
+#: attributable. This is deliberate -- do not fold a second knob into B.
+#:
+#: The other continuity knobs the engine exposes, for whoever adds the next
+#: variant (a variant C, not a change to B). Keyword spellings are the
+#: `[OPTIONS]` keys accepted by OptionsHandler.cpp:
+#:   SURCHARGE_METHOD             EXTRAN | SLOT | DYNAMIC_SLOT
+#:   VIRTUAL_JUNCTION_MOMENTUM    BASIC (FULL is retired and warns)
+#:   DPS_CELERITY                 the dps_target_celerity knob
+#:   DPS_ALPHA
+#:   DPS_DECAY_TIME
 OPTIONS: dict[str, dict[str, str]] = {
     schema.VARIANT_A: {
         "ANDERSON_ACCEL": "NO",
