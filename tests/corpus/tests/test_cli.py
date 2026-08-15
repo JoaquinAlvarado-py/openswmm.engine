@@ -364,6 +364,78 @@ def test_both_comparisons_failing_writes_nothing_and_keeps_all_three_files(
     assert good_c.exists()
 
 
+def _partial_diff_runs_fixture(tmp_path, present_variants):
+    """One OK model whose `runs` rows exist only for `present_variants`."""
+    paths = {}
+    for variant in present_variants:
+        path = tmp_path / f"partial_{variant}.out"
+        path.write_bytes(b"not really a binary .out file")
+        paths[variant] = path
+
+    runs = pd.DataFrame([
+        {"model_id": "F/partial", "family": "F", "variant": variant,
+         "status": schema.Status.OK, "out_path": str(path)}
+        for variant, path in paths.items()
+    ])
+    return runs, paths
+
+
+def _fake_diff_out_files_always_succeeding(a_out, other_out, abs_tol):
+    return [{"element_type": "NODE", "element_id": "n1",
+             "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
+             "rmse": 1.0, "first_div_period": None, "first_div_time": None,
+             "n_periods": 1}]
+
+
+def test_a_missing_c_run_still_yields_b_minus_a(tmp_path, monkeypatch):
+    # C is the newest scheme and, across a large third-party corpus, the
+    # variant most likely to fail outright (crash/timeout/parse error) --
+    # its absence must not cost the model its otherwise-computable B - A.
+    out = tmp_path / "out"
+    runs, paths = _partial_diff_runs_fixture(
+        tmp_path, [schema.VARIANT_A, schema.VARIANT_B])
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    rows = ts_diff[ts_diff["model_id"] == "F/partial"]
+    assert set(rows["comparison"]) == {"B_minus_A"}
+
+
+def test_a_missing_b_run_still_yields_c_minus_a(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    runs, paths = _partial_diff_runs_fixture(
+        tmp_path, [schema.VARIANT_A, schema.VARIANT_C])
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    rows = ts_diff[ts_diff["model_id"] == "F/partial"]
+    assert set(rows["comparison"]) == {"C_minus_A"}
+
+
+def test_a_model_with_only_a_yields_nothing_and_keeps_its_out_file(
+    tmp_path, monkeypatch,
+):
+    out = tmp_path / "out"
+    runs, paths = _partial_diff_runs_fixture(tmp_path, [schema.VARIANT_A])
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    assert ts_diff.empty or "F/partial" not in set(ts_diff["model_id"])
+    assert paths[schema.VARIANT_A].exists()
+
+
 def test_diff_stage_prints_a_warning_naming_the_failed_model(
     tmp_path, monkeypatch, capsys,
 ):
@@ -377,6 +449,12 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
 
     captured = capsys.readouterr()
     assert "F/bad" in captured.out
+    # `_fake_diff_out_files_raising_for_bad` fails for every comparison of
+    # this model (it keys off `a_out`, which both read), so both labels must
+    # be identifiable in the warning output -- naming the model alone would
+    # also be satisfied by a message that dropped which comparison failed.
+    assert "B_minus_A" in captured.out
+    assert "C_minus_A" in captured.out
 
 
 def test_multi_worker_runs_produce_the_same_results_as_a_single_worker(

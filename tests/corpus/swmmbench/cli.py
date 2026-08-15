@@ -284,21 +284,28 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
     `abs_tol` is an absolute tolerance on the value difference, not a relative
     one: it is the threshold `outdiff.diff_series` compares `|b - a|` against.
 
-    Each comparison is isolated, not each model: B - A reads `a_out` and
-    `b_out`; C - A reads `a_out` and `c_out`. A truncated `b_out` must not
-    cost an otherwise-computable C - A result (or vice versa) -- the same
-    "a missing/bad thing must not cost an unrelated computable result"
-    principle already applied to the iteration-kind guard in
-    `report.build_deltas` and, one level up, to per-model isolation in this
-    very stage.
+    Only variant A is required per model: it is the shared baseline both
+    comparisons read. B - A runs whenever B's `.out` is present, C - A
+    whenever C's is, independently of whether the other variant ran at all
+    -- a model whose C run crashed still yields its B - A.
 
-    Deletion follows the comparisons that actually read each file: `b_out`
-    is deletable once B - A has flushed, `c_out` once C - A has flushed, and
-    `a_out` -- read by both -- only once BOTH have flushed. A comparison
-    that raises leaves every `.out` file IT reads in place for a future
-    re-run; it never touches the other comparison's outcome. Rows are
-    flushed to disk in batches of `FLUSH_BATCH_SIZE` models, and only the
-    `.out` files behind an already-flushed batch are deleted.
+    Each comparison is isolated, not each model: B - A reads `a_out` and
+    `b_out`; C - A reads `a_out` and `c_out`. A truncated `b_out` (or a
+    missing one) must not cost an otherwise-computable C - A result (or vice
+    versa) -- the same "a missing/bad thing must not cost an unrelated
+    computable result" principle already applied to the iteration-kind guard
+    in `report.build_deltas` and, one level up, to per-model isolation in
+    this very stage.
+
+    Deletion follows the comparisons that actually ran and succeeded for
+    each file: `b_out` is deletable once B - A has flushed, `c_out` once
+    C - A has flushed, and `a_out` -- read by both -- only once BOTH have
+    flushed. A comparison that raises, OR was never attempted because its
+    variant's `.out` is missing, leaves every `.out` file IT would have read
+    in place for a future re-run; it never touches the other comparison's
+    outcome. Rows are flushed to disk in batches of `FLUSH_BATCH_SIZE`
+    models, and only the `.out` files behind an already-flushed batch are
+    deleted.
     """
     from . import outdiff
 
@@ -318,13 +325,21 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
 
     for model_id, group in ok.groupby("model_id"):
         paths = dict(zip(group["variant"], group["out_path"]))
-        if set(paths) != set(schema.VARIANTS):
+        # Only A is required here: it is the shared baseline both
+        # comparisons read, so without it neither is possible. Requiring B
+        # AND C used to mean a model whose brand-new C run crashed (the
+        # variant most likely to fail, across a 1646-model third-party
+        # corpus) lost its otherwise-perfectly-computable B - A too. Each
+        # comparison below is then run only if ITS OTHER variant is present.
+        if schema.VARIANT_A not in paths:
             continue
         a_out = Path(paths[schema.VARIANT_A])
         family = group["family"].iloc[0]
 
         succeeded: set[str] = set()
         for variant, comparison in DIFF_COMPARISONS:
+            if variant not in paths:
+                continue  # that variant's run is missing; not attempted
             other_out = Path(paths[variant])
             try:
                 diff_rows = outdiff.diff_out_files(a_out, other_out, abs_tol)
