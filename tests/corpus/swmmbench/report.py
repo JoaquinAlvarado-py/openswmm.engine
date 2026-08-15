@@ -94,12 +94,8 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
         lines += ["## B - A by metric (feature effect)", "",
                   "| metric | models | mean | median | min | max |",
                   "| --- | --- | --- | --- | --- | --- |"]
-        # `metric` is plain object dtype here (built row-by-row above), so
-        # groupby's default observed=False is harmless. `family`, however,
-        # round-trips out of a partitioned Parquet dataset as a pandas
-        # `category` dtype; grouping it with observed=False would
-        # materialise every category in the dataset -- including families
-        # with zero rows in `deltas` -- as spurious empty-group rows below.
+        # `metric` here is plain object dtype (built row-by-row in
+        # build_deltas), so groupby's default observed=False is harmless.
         grouped = deltas.dropna(subset=["delta_b_minus_a"]).groupby("metric")
         for metric, group in grouped:
             column = group["delta_b_minus_a"].astype(float)
@@ -113,6 +109,16 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
                   "| family | models | mean abs B-A iterations |",
                   "| --- | --- | --- |"]
         iterations = deltas[deltas.metric == "avg_iterations_per_step"]
+        # `deltas["family"]` is object dtype in the direct build_deltas ->
+        # write_markdown pipeline (build_deltas reconstructs it from plain
+        # Python scalars), so this groupby is unaffected either way here.
+        # But `deltas` can also be re-read from its own persisted dataset
+        # (stage_report writes it partitioned by family), where pandas
+        # restores `family` as a `category` dtype. groupby on a categorical
+        # defaults to observed=False and materialises EVERY category,
+        # including ones with zero rows in the (already-filtered)
+        # `iterations` frame, as spurious empty-group rows. observed=True
+        # avoids that in both cases.
         for family, group in iterations.groupby("family", observed=True):
             column = group["delta_b_minus_a"].dropna().astype(float).abs()
             if column.empty:
