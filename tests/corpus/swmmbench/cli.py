@@ -267,17 +267,29 @@ def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> N
         path.unlink(missing_ok=True)
 
 
+#: Which variant's `.out` is compared against A, and the label stamped on
+#: the rows that comparison produces. B isolates Anderson acceleration; C
+#: isolates semi-implicit (Crank-Nicolson) node continuity -- kept as two
+#: distinct comparisons, both anchored on A, for the same attribution reason
+#: the A/B/C matrix itself exists.
+DIFF_COMPARISONS = (
+    (schema.VARIANT_B, "B_minus_A"),
+    (schema.VARIANT_C, "C_minus_A"),
+)
+
+
 def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
-    """Diff the retained A/B `.out` pairs, then discard the binaries.
+    """Diff the retained A/B and A/C `.out` pairs, then discard the binaries.
 
     `abs_tol` is an absolute tolerance on the value difference, not a relative
     one: it is the threshold `outdiff.diff_series` compares `|b - a|` against.
 
     Each model's diff is isolated: an unreadable or truncated `.out` costs
-    only that model's row, never the batch, and its files are left in place
-    for a future re-run rather than deleted out from under a lost result.
-    Rows are flushed to disk in batches of `FLUSH_BATCH_SIZE` models, and
-    only the `.out` files behind an already-flushed batch are deleted.
+    only that model's rows -- from BOTH comparisons, since they share `a_out`
+    -- never the batch, and its files are left in place for a future re-run
+    rather than deleted out from under a lost result. Rows are flushed to
+    disk in batches of `FLUSH_BATCH_SIZE` models, and only the `.out` files
+    behind an already-flushed batch are deleted.
     """
     from . import outdiff
 
@@ -300,23 +312,36 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
         if set(paths) != set(schema.VARIANTS):
             continue
         a_out = Path(paths[schema.VARIANT_A])
-        b_out = Path(paths[schema.VARIANT_B])
         family = group["family"].iloc[0]
 
+        # Both comparisons for a model live inside one try/except: `a_out`
+        # is read by both, so a model must succeed or fail as a whole. A
+        # partial success (B - A written, C - A raised) would either strand
+        # the C comparison without its `a_out` input on a future re-run, or
+        # require deleting `a_out` before the C diff had actually run --
+        # exactly the write-before-delete ordering this stage exists to
+        # guarantee.
         try:
-            diff_rows = outdiff.diff_out_files(a_out, b_out, abs_tol)
+            model_rows: list[dict] = []
+            for variant, comparison in DIFF_COMPARISONS:
+                other_out = Path(paths[variant])
+                for row in outdiff.diff_out_files(a_out, other_out, abs_tol):
+                    model_rows.append({
+                        "model_id": model_id, "family": family,
+                        "comparison": comparison, **row,
+                    })
         except Exception as error:  # noqa: BLE001  isolate one bad model
             print(f"WARNING: diff failed for model {model_id!r}: {error}")
             continue
 
-        for row in diff_rows:
-            rows.append({"model_id": model_id, "family": family, **row})
-        # Deletion is deferred to `_flush_diff_batch`, after these rows have
-        # been written: retaining raw series for 878 models across two
-        # configurations would run to billions of rows, but deleting before
-        # persisting would let one unreadable `.out` lose every model diffed
-        # earlier in the sweep.
-        pending.extend([a_out, b_out])
+        rows.extend(model_rows)
+        # Deletion is deferred to `_flush_diff_batch`, after every row from
+        # BOTH comparisons has been written: retaining raw series for 878
+        # models across three configurations would run to billions of rows,
+        # but deleting before persisting would let one unreadable `.out`
+        # lose every model diffed earlier in the sweep.
+        pending.extend([a_out, Path(paths[schema.VARIANT_B]),
+                        Path(paths[schema.VARIANT_C])])
         batch_count += 1
 
         if batch_count >= FLUSH_BATCH_SIZE:

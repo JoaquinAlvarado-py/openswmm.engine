@@ -27,7 +27,7 @@ def mini_corpus(tmp_path):
     return root
 
 
-def test_full_pipeline_produces_all_three_variants(mini_corpus, tmp_path):
+def test_full_pipeline_produces_all_four_variants(mini_corpus, tmp_path):
     out = tmp_path / "results"
     engine = [os.environ[ENGINE_ENV]]
 
@@ -37,7 +37,7 @@ def test_full_pipeline_produces_all_three_variants(mini_corpus, tmp_path):
 
     runs = store.read_table(out, "runs")
 
-    assert set(runs["variant"]) == {"A", "B", "REF"}
+    assert set(runs["variant"]) == {"A", "B", "C", "REF"}
     executed = runs[runs["variant"].isin(schema.VARIANTS)]
     assert set(executed["status"]) == {schema.Status.OK}
     assert executed["avg_iterations_per_step"].notna().all()
