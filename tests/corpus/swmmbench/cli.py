@@ -224,12 +224,38 @@ def corpus_is_clean(corpus_root: Path) -> tuple[bool, list[str]]:
     return not leftovers, leftovers
 
 
+#: How many models' rows are persisted between flushes. Bounds the cost of a
+#: crash (or an unhandled exception) mid-sweep to at most one unflushed
+#: batch, rather than every model diffed since the stage started.
+FLUSH_BATCH_SIZE = 50
+
+
+def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> None:
+    """Persist accumulated diff rows, then delete the `.out` files behind them.
+
+    Order matters: writing before deleting means a crash between the two
+    calls leaves `.out` files undeleted (harmless, re-runnable) rather than
+    deleting source data whose derived rows were never written (irrecoverable).
+    """
+    if rows:
+        store.write_table(pd.DataFrame(rows), out_dir, "ts_diff",
+                          partition_by=["family"])
+    for path in pending:
+        path.unlink(missing_ok=True)
+
+
 def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
-    """Diff the retained A/B `.out` pairs, then discard the binaries."""
+    """Diff the retained A/B `.out` pairs, then discard the binaries.
+
+    Each model's diff is isolated: an unreadable or truncated `.out` costs
+    only that model's row, never the batch, and its files are left in place
+    for a future re-run rather than deleted out from under a lost result.
+    Rows are flushed to disk in batches of `FLUSH_BATCH_SIZE` models, and
+    only the `.out` files behind an already-flushed batch are deleted.
+    """
     from . import outdiff
 
     out_dir = Path(out_dir)
-    rows: list[dict] = []
 
     runs = store.read_table(out_dir, "runs")
     if runs.empty or "out_path" not in runs.columns:
@@ -238,6 +264,11 @@ def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
     ok = runs[(runs["status"] == schema.Status.OK)
               & (runs["variant"].isin(schema.VARIANTS))
               & runs["out_path"].notna()]
+
+    rows: list[dict] = []
+    pending: list[Path] = []
+    batch_count = 0
+
     for model_id, group in ok.groupby("model_id"):
         paths = dict(zip(group["variant"], group["out_path"]))
         if set(paths) != set(schema.VARIANTS):
@@ -245,16 +276,28 @@ def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
         a_out = Path(paths[schema.VARIANT_A])
         b_out = Path(paths[schema.VARIANT_B])
         family = group["family"].iloc[0]
-        for row in outdiff.diff_out_files(a_out, b_out, rel_tol):
-            rows.append({"model_id": model_id, "family": family, **row})
-        # Each `.out` is read once and discarded: retaining raw series for
-        # 878 models across two configurations would run to billions of rows.
-        a_out.unlink(missing_ok=True)
-        b_out.unlink(missing_ok=True)
 
-    if rows:
-        store.write_table(pd.DataFrame(rows), out_dir, "ts_diff",
-                          partition_by=["family"])
+        try:
+            diff_rows = outdiff.diff_out_files(a_out, b_out, rel_tol)
+        except Exception as error:  # noqa: BLE001  isolate one bad model
+            print(f"WARNING: diff failed for model {model_id!r}: {error}")
+            continue
+
+        for row in diff_rows:
+            rows.append({"model_id": model_id, "family": family, **row})
+        # Deletion is deferred to `_flush_diff_batch`, after these rows have
+        # been written: retaining raw series for 878 models across two
+        # configurations would run to billions of rows, but deleting before
+        # persisting would let one unreadable `.out` lose every model diffed
+        # earlier in the sweep.
+        pending.extend([a_out, b_out])
+        batch_count += 1
+
+        if batch_count >= FLUSH_BATCH_SIZE:
+            _flush_diff_batch(out_dir, rows, pending)
+            rows, pending, batch_count = [], [], 0
+
+    _flush_diff_batch(out_dir, rows, pending)
 
 
 def build_parser() -> argparse.ArgumentParser:

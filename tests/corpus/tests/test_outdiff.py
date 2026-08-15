@@ -35,8 +35,9 @@ def test_relative_difference_is_scaled_by_the_baseline():
 def test_relative_difference_is_finite_when_the_baseline_is_zero():
     result = outdiff.diff_series(_series([0.0]), _series([5.0]))
 
-    assert result["max_rel"] is not None
-    assert result["max_rel"] == pytest.approx(0.0) or result["max_rel"] > 0
+    # Baseline is zero, so the scale falls back to 1.0: the ratio is the raw
+    # delta, not inf/nan.
+    assert result["max_rel"] == pytest.approx(5.0)
 
 
 def test_first_divergence_is_the_earliest_period_past_tolerance():

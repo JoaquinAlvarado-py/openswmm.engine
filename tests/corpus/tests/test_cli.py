@@ -2,9 +2,10 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
-from swmmbench import cli, schema, store
+from swmmbench import cli, outdiff, schema, store
 
 DECK = "[TITLE]\nt\n\n[OPTIONS]\nFLOW_UNITS CFS\n"
 
@@ -153,3 +154,92 @@ def test_main_requires_an_engine_for_the_run_stage(corpus_root, tmp_path, capsys
                      "--out", str(tmp_path / "out")])
 
     assert code != 0
+
+
+def _diff_runs_fixture(tmp_path):
+    """A `runs` table with two OK models, each with real (fake) .out files."""
+    a1, b1 = tmp_path / "bad_A.out", tmp_path / "bad_B.out"
+    a2, b2 = tmp_path / "good_A.out", tmp_path / "good_B.out"
+    for path in (a1, b1, a2, b2):
+        path.write_bytes(b"not really a binary .out file")
+
+    runs = pd.DataFrame([
+        {"model_id": "F/bad", "family": "F", "variant": schema.VARIANT_A,
+         "status": schema.Status.OK, "out_path": str(a1)},
+        {"model_id": "F/bad", "family": "F", "variant": schema.VARIANT_B,
+         "status": schema.Status.OK, "out_path": str(b1)},
+        {"model_id": "F/good", "family": "F", "variant": schema.VARIANT_A,
+         "status": schema.Status.OK, "out_path": str(a2)},
+        {"model_id": "F/good", "family": "F", "variant": schema.VARIANT_B,
+         "status": schema.Status.OK, "out_path": str(b2)},
+    ])
+    return runs, (a1, b1), (a2, b2)
+
+
+def _fake_diff_out_files_raising_for_bad(a_out, b_out, rel_tol):
+    if "bad" in str(a_out):
+        raise RuntimeError("truncated .out file")
+    return [{"element_type": "NODE", "element_id": "n1",
+             "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
+             "rmse": 1.0, "first_div_period": None, "first_div_time": None,
+             "n_periods": 1}]
+
+
+def test_diff_stage_does_not_raise_when_one_models_diff_raises(
+    tmp_path, monkeypatch,
+):
+    out = tmp_path / "out"
+    runs, _bad_paths, _good_paths = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_for_bad)
+
+    cli.stage_diff(out, rel_tol=1e-9)  # must not raise
+
+
+def test_diff_stage_keeps_out_files_for_a_model_whose_diff_raised(
+    tmp_path, monkeypatch,
+):
+    out = tmp_path / "out"
+    runs, (bad_a, bad_b), _good_paths = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_for_bad)
+
+    cli.stage_diff(out, rel_tol=1e-9)
+
+    assert bad_a.exists()
+    assert bad_b.exists()
+
+
+def test_diff_stage_deletes_out_files_and_writes_rows_for_a_succeeding_model(
+    tmp_path, monkeypatch,
+):
+    out = tmp_path / "out"
+    runs, _bad_paths, (good_a, good_b) = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_for_bad)
+
+    cli.stage_diff(out, rel_tol=1e-9)
+
+    assert not good_a.exists()
+    assert not good_b.exists()
+
+    ts_diff = store.read_table(out, "ts_diff")
+    assert set(ts_diff["model_id"]) == {"F/good"}
+
+
+def test_diff_stage_prints_a_warning_naming_the_failed_model(
+    tmp_path, monkeypatch, capsys,
+):
+    out = tmp_path / "out"
+    runs, _bad_paths, _good_paths = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_for_bad)
+
+    cli.stage_diff(out, rel_tol=1e-9)
+
+    captured = capsys.readouterr()
+    assert "F/bad" in captured.out
