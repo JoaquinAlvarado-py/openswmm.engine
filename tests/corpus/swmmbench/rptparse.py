@@ -199,3 +199,103 @@ def parse_rankings(text: str) -> list[dict]:
             cursor += 1
 
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Summary tables
+# ---------------------------------------------------------------------------
+
+#: Sentinel for the two-token `days hr:min` field. It consumes two columns
+#: and emits no metric.
+TIME_OF_MAX = "@time_of_max"
+
+#: Column layout per summary table, after the element id. `None` skips a
+#: single token (typically the element `Type`).
+TABLE_SPECS = {
+    "Node Depth Summary": ("NODE", [
+        None, "node_avg_depth", "node_max_depth", "node_max_hgl",
+        TIME_OF_MAX, "node_reported_max_depth",
+    ]),
+    "Node Inflow Summary": ("NODE", [
+        None, "node_max_lateral_inflow", "node_max_total_inflow",
+        TIME_OF_MAX, "node_lateral_inflow_volume", "node_total_inflow_volume",
+        "node_flow_balance_error",
+    ]),
+    "Node Flooding Summary": ("NODE", [
+        "node_hours_flooded", "node_max_flooding_rate",
+        TIME_OF_MAX, "node_total_flood_volume", "node_max_ponded_depth",
+    ]),
+    "Link Flow Summary": ("LINK", [
+        None, "link_max_flow", TIME_OF_MAX, "link_max_velocity",
+        "link_max_full_flow", "link_max_full_depth",
+    ]),
+    "Outfall Loading Summary": ("NODE", [
+        "outfall_pct_freq", "outfall_avg_flow", "outfall_max_flow",
+        "outfall_total_volume",
+    ]),
+    "Storage Volume Summary": ("NODE", [
+        None, "storage_avg_volume", "storage_avg_pct_full",
+        "storage_evap_pct_loss", "storage_exfil_pct_loss",
+        "storage_max_volume", "storage_max_pct_full",
+        TIME_OF_MAX, "storage_max_outflow",
+    ]),
+}
+
+
+def _table_row(tokens: list[str], columns: list[str | None]) -> dict[str, float]:
+    """Map tokens after the element id onto metric names. Empty on mismatch."""
+    values: dict[str, float] = {}
+    cursor = 0
+    for column in columns:
+        if column is TIME_OF_MAX:
+            cursor += 2  # `days` and `hr:min`
+            continue
+        if cursor >= len(tokens):
+            return {}
+        if column is not None:
+            try:
+                values[column] = float(tokens[cursor])
+            except ValueError:
+                return {}
+        cursor += 1
+    return values
+
+
+def parse_tables(text: str) -> list[dict]:
+    """Extract per-element metrics from every recognised summary table."""
+    lines = text.splitlines()
+    rows: list[dict] = []
+
+    for index, line in enumerate(lines):
+        spec = TABLE_SPECS.get(line.strip())
+        if spec is None:
+            continue
+        element_type, columns = spec
+
+        # Skip forward past the banner and the dashed header block; data
+        # begins after the second run of dashes.
+        cursor = index + 1
+        dashes_seen = 0
+        while cursor < len(lines) and dashes_seen < 2:
+            if set(lines[cursor].strip()) == {"-"}:
+                dashes_seen += 1
+            cursor += 1
+        if dashes_seen < 2:
+            continue
+
+        while cursor < len(lines):
+            body = lines[cursor].strip()
+            if not body or set(body) in ({"-"}, {"*"}):
+                break
+            tokens = body.split()
+            values = _table_row(tokens[1:], columns)
+            for metric, value in values.items():
+                rows.append({
+                    "element_type": element_type,
+                    "element_id": tokens[0],
+                    "metric": metric,
+                    "value": value,
+                })
+            cursor += 1
+
+    return rows
