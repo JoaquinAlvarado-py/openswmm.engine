@@ -300,6 +300,33 @@ def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
     _flush_diff_batch(out_dir, rows, pending)
 
 
+#: Derived tables that stage_report recomputes from scratch on every run.
+#: Unlike `runs`, `elements` and `models` -- which are resumable keyed
+#: appends -- these three are pure functions of already-persisted data, so a
+#: second `report` run must replace them, not append to them.
+#: store.write_table's basename carries a fresh UUID on every call
+#: (deliberately, so a resumed sweep accumulates), which means a second
+#: `report` run would otherwise double every row and silently corrupt any
+#: downstream aggregation.
+_DERIVED_TABLES = ("deltas", "element_deltas", "topology_status")
+
+
+def _replace_table(frame: pd.DataFrame, out_dir: Path, name: str,
+                    partition_by: list[str] | None = None) -> None:
+    """Delete the existing dataset for a derived table, then write `frame`.
+
+    Deleting even when `frame` is empty ensures a report run that no longer
+    produces a status (e.g. every reference topology now matches) actually
+    clears the stale dataset from a previous run, instead of leaving it
+    behind to be read as still current.
+    """
+    import shutil
+
+    shutil.rmtree(Path(out_dir) / name, ignore_errors=True)
+    if not frame.empty:
+        store.write_table(frame, out_dir, name, partition_by=partition_by)
+
+
 def stage_report(out_dir: Path) -> None:
     from . import report
 
@@ -310,8 +337,21 @@ def stage_report(out_dir: Path) -> None:
         return
 
     deltas = report.build_deltas(runs, report.DEFAULT_METRICS)
-    if not deltas.empty:
-        store.write_table(deltas, out_dir, "deltas", partition_by=["family"])
+    _replace_table(deltas, out_dir, "deltas", partition_by=["family"])
+
+    elements = store.read_table(out_dir, "elements")
+    if not elements.empty:
+        element_deltas = report.build_element_deltas(elements)
+        _replace_table(element_deltas, out_dir, "element_deltas",
+                       partition_by=["family"])
+        mismatched = report.topology_status(elements)
+        _replace_table(mismatched, out_dir, "topology_status")
+        if not mismatched.empty:
+            print(f"{len(mismatched)} models have a mismatched reference topology")
+    else:
+        _replace_table(pd.DataFrame(), out_dir, "element_deltas")
+        _replace_table(pd.DataFrame(), out_dir, "topology_status")
+
     path = report.write_markdown(deltas, runs, out_dir / "summary.md")
     print(f"wrote {path}")
 

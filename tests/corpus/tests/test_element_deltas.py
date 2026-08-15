@@ -1,0 +1,71 @@
+import pandas as pd
+import pytest
+
+from swmmbench import report, schema
+
+
+def _elements(rows):
+    return pd.DataFrame([
+        {"model_id": "EPA/m1", "family": "EPA", "element_type": "NODE", **row}
+        for row in rows
+    ])
+
+
+def test_element_deltas_pair_by_element_and_metric():
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "B", "value": 4.5},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "REF", "value": 3.9},
+    ])
+
+    (row,) = report.build_element_deltas(frame).to_dict("records")
+
+    assert row["element_id"] == "J1"
+    assert row["delta_b_minus_a"] == pytest.approx(0.5)
+    assert row["delta_a_minus_ref"] == pytest.approx(0.1)
+
+
+def test_elements_present_in_only_one_variant_yield_a_null_delta():
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+        {"element_id": "J2", "metric": "node_max_depth", "variant": "B", "value": 9.0},
+    ])
+
+    deltas = report.build_element_deltas(frame)
+
+    assert set(deltas["element_id"]) == {"J1", "J2"}
+    assert deltas["delta_b_minus_a"].isna().all()
+
+
+def test_disjoint_reference_topology_is_flagged():
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+        {"element_id": "OTHER", "metric": "node_max_depth", "variant": "REF", "value": 3.0},
+    ])
+
+    status = report.topology_status(frame).set_index("model_id")
+
+    assert status.loc["EPA/m1", "status"] == schema.Status.REF_TOPOLOGY_MISMATCH
+
+
+def test_overlapping_topology_is_not_flagged():
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "REF", "value": 3.0},
+    ])
+
+    assert report.topology_status(frame).empty
+
+
+def test_a_model_with_no_reference_elements_is_not_flagged():
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "B", "value": 4.0},
+    ])
+
+    assert report.topology_status(frame).empty
+
+
+def test_empty_elements_produce_empty_results():
+    assert report.build_element_deltas(pd.DataFrame()).empty
+    assert report.topology_status(pd.DataFrame()).empty

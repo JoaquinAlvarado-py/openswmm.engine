@@ -159,3 +159,68 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+# ---------------------------------------------------------------------------
+# Element-level comparison
+# ---------------------------------------------------------------------------
+
+ELEMENT_KEY = ["model_id", "family", "element_type", "element_id", "metric"]
+
+
+def build_element_deltas(elements: pd.DataFrame) -> pd.DataFrame:
+    """Per-element A/B/REF values and both deltas."""
+    if elements.empty:
+        return pd.DataFrame()
+
+    # `elements` is read back from a dataset partitioned by `family`
+    # (store.write_table(..., partition_by=["family"])), so pandas restores
+    # `family` as a `category` dtype. pivot_table's index includes `family`
+    # (via ELEMENT_KEY); pivoting on a categorical index materialises the
+    # full cartesian product of categories by default, which with 20+
+    # families and thousands of elements is a real blow-up, not a rounding
+    # error. Cast to plain str first so only the categories actually present
+    # form the index -- the same hazard write_markdown documents and fixes
+    # with observed=True for groupby.
+    elements = elements.copy()
+    if isinstance(elements["family"].dtype, pd.CategoricalDtype):
+        elements["family"] = elements["family"].astype(str)
+
+    wide = elements.pivot_table(
+        index=ELEMENT_KEY, columns="variant", values="value", aggfunc="first"
+    ).reset_index()
+
+    for variant in (schema.VARIANT_A, schema.VARIANT_B, schema.VARIANT_REF):
+        if variant not in wide.columns:
+            wide[variant] = pd.NA
+
+    wide = wide.rename(columns={
+        schema.VARIANT_A: "value_a",
+        schema.VARIANT_B: "value_b",
+        schema.VARIANT_REF: "value_ref",
+    })
+    wide["delta_b_minus_a"] = wide["value_b"] - wide["value_a"]
+    wide["delta_a_minus_ref"] = wide["value_a"] - wide["value_ref"]
+    return wide[ELEMENT_KEY + ["value_a", "value_b", "value_ref",
+                               "delta_b_minus_a", "delta_a_minus_ref"]]
+
+
+def topology_status(elements: pd.DataFrame) -> pd.DataFrame:
+    """Models whose reference report shares no element ids with variant A.
+
+    Their scalars remain comparable; only the per-element join does not
+    apply. Left unnamed, an empty join would read as "no differences".
+    """
+    if elements.empty:
+        return pd.DataFrame(columns=["model_id", "status"])
+
+    rows: list[dict] = []
+    for model_id, group in elements.groupby("model_id"):
+        ours = set(group.loc[group.variant == schema.VARIANT_A, "element_id"])
+        theirs = set(group.loc[group.variant == schema.VARIANT_REF, "element_id"])
+        if ours and theirs and not (ours & theirs):
+            rows.append({
+                "model_id": model_id,
+                "status": schema.Status.REF_TOPOLOGY_MISMATCH,
+            })
+    return pd.DataFrame(rows, columns=["model_id", "status"])
