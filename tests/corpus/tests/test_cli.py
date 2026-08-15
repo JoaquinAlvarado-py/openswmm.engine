@@ -281,34 +281,87 @@ def test_diff_stage_emits_both_comparisons_distinguishable_by_column(
     assert len(good) == 2  # one diff row per comparison from the fake
 
 
-def test_diff_stage_does_not_delete_a_models_out_files_until_both_comparisons_flush(
-    tmp_path, monkeypatch,
-):
-    # If the second comparison (C - A) fails after the first (B - A)
-    # succeeded, `a_out` -- read by both -- must not have been deleted on
-    # the strength of the first alone, and nothing for this model should be
-    # persisted: the model is isolated as a whole, not comparison-by-comparison.
-    out = tmp_path / "out"
-    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
-    store.write_table(runs, out, "runs", partition_by=["family"])
-
-    def diff_fails_for_c(a_out, other_out, abs_tol):
-        if "_C" in str(other_out):
-            raise RuntimeError("truncated .out file")
+def _fake_diff_out_files_raising_when(fail_needle):
+    """A fake `diff_out_files` that fails only for the comparison whose
+    `other_out` path contains `fail_needle`, succeeding for every other."""
+    def fake(a_out, other_out, abs_tol):
+        if fail_needle in str(other_out):
+            raise RuntimeError(f"truncated {fail_needle} .out file")
         return [{"element_type": "NODE", "element_id": "n1",
                  "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
                  "rmse": 1.0, "first_div_period": None, "first_div_time": None,
                  "n_periods": 1}]
+    return fake
 
-    monkeypatch.setattr(outdiff, "diff_out_files", diff_fails_for_c)
+
+def _fake_diff_out_files_always_raising(a_out, other_out, abs_tol):
+    raise RuntimeError("truncated .out file")
+
+
+def test_a_failing_b_minus_a_does_not_cost_a_computable_c_minus_a(
+    tmp_path, monkeypatch,
+):
+    # b_out is the only bad input; a_out and c_out are perfectly readable,
+    # so C - A must still be computed and persisted. Only b_out -- the input
+    # the failed comparison actually read -- may be deleted... and since it
+    # failed, it must NOT be: it stays for a future retry of B - A.
+    out = tmp_path / "out"
+    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_when("_B"))
 
     cli.stage_diff(out, abs_tol=1e-9)
 
+    ts_diff = store.read_table(out, "ts_diff")
+    good = ts_diff[ts_diff["model_id"] == "F/good"]
+    assert set(good["comparison"]) == {"C_minus_A"}
+
+    # a_out is shared by both comparisons; B - A never succeeded, so a_out
+    # must survive for its retry. b_out (the failed comparison's own input)
+    # survives too. c_out's comparison succeeded and flushed, so it is gone.
+    assert good_a.exists()
+    assert good_b.exists()
+    assert not good_c.exists()
+
+
+def test_a_failing_c_minus_a_does_not_cost_a_computable_b_minus_a(
+    tmp_path, monkeypatch,
+):
+    # Mirror of the above: c_out is the only bad input.
+    out = tmp_path / "out"
+    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_when("_C"))
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    good = ts_diff[ts_diff["model_id"] == "F/good"]
+    assert set(good["comparison"]) == {"B_minus_A"}
+
+    assert good_a.exists()
+    assert not good_b.exists()
+    assert good_c.exists()
+
+
+def test_both_comparisons_failing_writes_nothing_and_keeps_all_three_files(
+    tmp_path, monkeypatch,
+):
+    out = tmp_path / "out"
+    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_raising)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    assert ts_diff.empty or "F/good" not in set(ts_diff["model_id"])
     assert good_a.exists()
     assert good_b.exists()
     assert good_c.exists()
-    ts_diff = store.read_table(out, "ts_diff")
-    assert ts_diff.empty or "F/good" not in set(ts_diff["model_id"])
 
 
 def test_diff_stage_prints_a_warning_naming_the_failed_model(

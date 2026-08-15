@@ -284,12 +284,21 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
     `abs_tol` is an absolute tolerance on the value difference, not a relative
     one: it is the threshold `outdiff.diff_series` compares `|b - a|` against.
 
-    Each model's diff is isolated: an unreadable or truncated `.out` costs
-    only that model's rows -- from BOTH comparisons, since they share `a_out`
-    -- never the batch, and its files are left in place for a future re-run
-    rather than deleted out from under a lost result. Rows are flushed to
-    disk in batches of `FLUSH_BATCH_SIZE` models, and only the `.out` files
-    behind an already-flushed batch are deleted.
+    Each comparison is isolated, not each model: B - A reads `a_out` and
+    `b_out`; C - A reads `a_out` and `c_out`. A truncated `b_out` must not
+    cost an otherwise-computable C - A result (or vice versa) -- the same
+    "a missing/bad thing must not cost an unrelated computable result"
+    principle already applied to the iteration-kind guard in
+    `report.build_deltas` and, one level up, to per-model isolation in this
+    very stage.
+
+    Deletion follows the comparisons that actually read each file: `b_out`
+    is deletable once B - A has flushed, `c_out` once C - A has flushed, and
+    `a_out` -- read by both -- only once BOTH have flushed. A comparison
+    that raises leaves every `.out` file IT reads in place for a future
+    re-run; it never touches the other comparison's outcome. Rows are
+    flushed to disk in batches of `FLUSH_BATCH_SIZE` models, and only the
+    `.out` files behind an already-flushed batch are deleted.
     """
     from . import outdiff
 
@@ -314,36 +323,35 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
         a_out = Path(paths[schema.VARIANT_A])
         family = group["family"].iloc[0]
 
-        # Both comparisons for a model live inside one try/except: `a_out`
-        # is read by both, so a model must succeed or fail as a whole. A
-        # partial success (B - A written, C - A raised) would either strand
-        # the C comparison without its `a_out` input on a future re-run, or
-        # require deleting `a_out` before the C diff had actually run --
-        # exactly the write-before-delete ordering this stage exists to
-        # guarantee.
-        try:
-            model_rows: list[dict] = []
-            for variant, comparison in DIFF_COMPARISONS:
-                other_out = Path(paths[variant])
-                for row in outdiff.diff_out_files(a_out, other_out, abs_tol):
-                    model_rows.append({
-                        "model_id": model_id, "family": family,
-                        "comparison": comparison, **row,
-                    })
-        except Exception as error:  # noqa: BLE001  isolate one bad model
-            print(f"WARNING: diff failed for model {model_id!r}: {error}")
-            continue
+        succeeded: set[str] = set()
+        for variant, comparison in DIFF_COMPARISONS:
+            other_out = Path(paths[variant])
+            try:
+                diff_rows = outdiff.diff_out_files(a_out, other_out, abs_tol)
+            except Exception as error:  # noqa: BLE001  isolate one bad comparison
+                print(f"WARNING: diff failed for model {model_id!r} "
+                      f"({comparison}): {error}")
+                continue
 
-        rows.extend(model_rows)
-        # Deletion is deferred to `_flush_diff_batch`, after every row from
-        # BOTH comparisons has been written: retaining raw series for 878
-        # models across three configurations would run to billions of rows,
-        # but deleting before persisting would let one unreadable `.out`
-        # lose every model diffed earlier in the sweep.
-        pending.extend([a_out, Path(paths[schema.VARIANT_B]),
-                        Path(paths[schema.VARIANT_C])])
+            for row in diff_rows:
+                rows.append({
+                    "model_id": model_id, "family": family,
+                    "comparison": comparison, **row,
+                })
+            # `other_out` (b_out or c_out) is read only by this comparison,
+            # so it may be scheduled for deletion as soon as this
+            # comparison's own rows are queued -- the batch flush below
+            # still writes them before anything in `pending` is unlinked.
+            pending.append(other_out)
+            succeeded.add(variant)
+
+        # `a_out` is read by BOTH comparisons. It may only be scheduled for
+        # deletion once both have succeeded: if either failed, that
+        # comparison's future retry still needs `a_out` on disk.
+        if len(succeeded) == len(DIFF_COMPARISONS):
+            pending.append(a_out)
+
         batch_count += 1
-
         if batch_count >= FLUSH_BATCH_SIZE:
             _flush_diff_batch(out_dir, rows, pending)
             rows, pending, batch_count = [], [], 0
