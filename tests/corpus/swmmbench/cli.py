@@ -100,9 +100,13 @@ def _run_one(job: dict) -> dict:
         except (OSError, ValueError):
             row["status"] = schema.Status.PARSE_ERROR
 
+    # `engine_version` travels with every element row for the same reason it
+    # is part of the `runs` resume key: two engine builds legitimately coexist
+    # in one store, and without the column their rows cannot be told apart --
+    # not even in principle -- so any pivot over them would silently mix builds.
     for element in elements:
         element.update(model_id=record["model_id"], family=record["family"],
-                       variant=variant)
+                       variant=variant, engine_version=job["engine_version"])
 
     return {"run": {**row, **scalars}, "elements": elements}
 
@@ -146,7 +150,8 @@ def _reference_rows(corpus_root: Path, record: dict) -> tuple[dict, list[dict]]:
 
     for element in elements:
         element.update(model_id=record["model_id"], family=record["family"],
-                       variant=schema.VARIANT_REF)
+                       variant=schema.VARIANT_REF,
+                       engine_version=REF_ENGINE_VERSION)
     return {**base, "status": schema.Status.OK, **scalars}, elements
 
 
@@ -204,7 +209,9 @@ def stage_run(
         store.write_table(pd.DataFrame(run_rows), out_dir, "runs",
                           partition_by=["family"])
         scalar_frame = pd.DataFrame(run_rows).melt(
-            id_vars=["model_id", "family", "variant"],
+            # `engine_version` is an id, not a metric: without it a scalar row
+            # from one engine build is indistinguishable from another's.
+            id_vars=["model_id", "family", "variant", "engine_version"],
             value_vars=[c for c in rptparse.SCALAR_KEYS
                         if c not in ("reported_version", "start_date", "end_date",
                                      "iteration_metric_kind")],
@@ -332,14 +339,44 @@ def _replace_table(frame: pd.DataFrame, out_dir: Path, name: str,
         store.write_table(frame, out_dir, name, partition_by=partition_by)
 
 
-def stage_report(out_dir: Path) -> None:
+def executed_engine_versions(runs: pd.DataFrame) -> list[str]:
+    """Distinct engine builds among the executed (non-reference) rows.
+
+    Reference rows are excluded: they always carry the `corpus-reference`
+    sentinel, which identifies the corpus anchor rather than any build of ours.
+    """
+    if runs.empty or "engine_version" not in runs.columns:
+        return []
+    executed = runs[runs["variant"].isin(schema.VARIANTS)]
+    return sorted(executed["engine_version"].dropna().astype(str).unique())
+
+
+def stage_report(out_dir: Path) -> int:
+    """Materialise the derived tables and the markdown summary.
+
+    Returns a process exit code. Non-zero means nothing was written.
+    """
     from . import report
 
     out_dir = Path(out_dir)
     runs = store.read_table(out_dir, "runs")
     if runs.empty:
         print("no runs to report")
-        return
+        return 0
+
+    # `runs` is keyed on (model_id, variant, engine_version, inp_sha256), so
+    # two engine builds legitimately coexist in one store. The report pivots
+    # on model_id/variant with aggfunc="first", which would arbitrarily pick
+    # one build's value per cell -- a number no reader could attribute. Refuse
+    # rather than guess; splitting the store is the operator's call.
+    versions = executed_engine_versions(runs)
+    if len(versions) > 1:
+        print("ERROR: `runs` mixes results from more than one engine build; "
+              "report refuses to guess which to publish.")
+        for version in versions:
+            print(f"  {version}")
+        print("Re-run `report` against a store holding a single engine build.")
+        return 1
 
     deltas = report.build_deltas(runs, report.DEFAULT_METRICS)
     _replace_table(deltas, out_dir, "deltas", partition_by=["family"])
@@ -359,6 +396,7 @@ def stage_report(out_dir: Path) -> None:
 
     path = report.write_markdown(deltas, runs, out_dir / "summary.md")
     print(f"wrote {path}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -393,8 +431,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.stage == "report":
-        stage_report(args.out)
-        return 0
+        return stage_report(args.out)
 
     if not args.engine:
         print("error: --engine is required for the run stage")

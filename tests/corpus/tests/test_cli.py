@@ -271,3 +271,76 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
     assert "F/bad" in captured.out
 
 
+#: FAKE_REPORT plus a Node Depth Summary, so `parse_tables` yields element
+#: rows. Kept separate from FAKE_REPORT so the scalar-only tests above keep
+#: exercising the minimal report.
+FAKE_REPORT_WITH_ELEMENTS = FAKE_REPORT + """
+  ******************
+  Node Depth Summary
+  ******************
+
+  ---------------------------------------------------------------------------------
+                                 Average  Maximum  Maximum  Time of Max    Reported
+                                   Depth    Depth      HGL   Occurrence   Max Depth
+  Node                 Type         Feet     Feet     Feet  days hr:min        Feet
+  ---------------------------------------------------------------------------------
+  N1                   JUNCTION     4.11    13.40   138.00     0  00:38       12.75
+"""
+
+
+@pytest.fixture
+def corpus_with_elements(tmp_path):
+    root = tmp_path / "corpus_e"
+    (root / "EPA").mkdir(parents=True)
+    (root / "EPA" / "m1.inp").write_text(DECK, encoding="latin-1")
+    (root / "EPA" / "m1.rpt").write_text(FAKE_REPORT_WITH_ELEMENTS,
+                                         encoding="latin-1")
+    return root
+
+
+@pytest.fixture
+def engine_with_elements(tmp_path):
+    script = tmp_path / "engine_e.py"
+    script.write_text(textwrap.dedent(f"""
+        import sys, pathlib
+        pathlib.Path(sys.argv[2]).write_text(
+            {FAKE_REPORT_WITH_ELEMENTS!r}, encoding="latin-1")
+        pathlib.Path(sys.argv[3]).write_bytes(b"out")
+    """), encoding="utf-8")
+    return [sys.executable, str(script)]
+
+
+def test_element_rows_carry_the_engine_version(
+    corpus_with_elements, tmp_path, engine_with_elements,
+):
+    # Without this column, rows from two engine builds cannot be told apart
+    # even in principle, so no pivot over `elements` can be trusted.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_with_elements, out)
+    cli.stage_run(corpus_with_elements, out, engine_with_elements,
+                  timeout_s=30.0, jobs=1, limit=None)
+
+    elements = store.read_table(out, "elements")
+
+    assert not elements.empty
+    assert "engine_version" in elements.columns
+    assert elements["engine_version"].notna().all()
+
+    executed = elements[elements["variant"].isin(schema.VARIANTS)]
+    assert set(executed["engine_version"]) == {
+        cli._engine_version(engine_with_elements)}
+    ref = elements[elements["variant"] == schema.VARIANT_REF]
+    assert set(ref["engine_version"]) == {cli.REF_ENGINE_VERSION}
+
+
+def test_scalar_rows_carry_the_engine_version(corpus_root, tmp_path, fake_engine):
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+
+    scalars = store.read_table(out, "scalars")
+
+    assert "engine_version" in scalars.columns
+    assert scalars["engine_version"].notna().all()
+
+
