@@ -1,5 +1,3 @@
-import math
-
 import pytest
 
 from swmmbench import rptparse, schema
@@ -13,6 +11,11 @@ def extran1(fixtures):
 @pytest.fixture
 def fv(fixtures):
     return rptparse.read(fixtures / "fv_substeps.rpt")
+
+
+@pytest.fixture
+def multi_continuity(fixtures):
+    return rptparse.read(fixtures / "multi_continuity.rpt")
 
 
 def test_reads_the_reported_engine_version(extran1):
@@ -93,3 +96,17 @@ def test_parsing_junk_yields_nones_rather_than_raising():
         scalars[key] is None
         for key in ("avg_step", "avg_iterations_per_step", "continuity_error_flow")
     )
+
+
+def test_extracts_all_three_continuity_blocks_from_multi_block_report(multi_continuity):
+    scalars = rptparse.parse_scalars(multi_continuity)
+
+    assert scalars["continuity_error_runoff"] == pytest.approx(0.000)
+    assert scalars["continuity_error_flow"] == pytest.approx(-1.051)
+    assert scalars["continuity_error_2d"] == pytest.approx(-0.507)
+
+
+def test_quality_continuity_is_none_when_absent_in_multi_block_report(multi_continuity):
+    scalars = rptparse.parse_scalars(multi_continuity)
+
+    assert scalars["continuity_error_quality"] is None
