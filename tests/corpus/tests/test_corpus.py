@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from swmmbench import corpus
+from swmmbench import corpus, variants
 
 
 def _write(path: Path, text: str = "[OPTIONS]\n") -> None:
@@ -57,6 +57,22 @@ def test_version_directories_contribute_no_models(tmp_path):
     _write(tmp_path / "v12" / "orphan.rpt")
 
     assert corpus.discover(tmp_path) == []
+
+
+def test_harness_temporary_decks_are_not_inventoried(tmp_path):
+    """A deck the harness wrote is its own leftover, not a corpus model.
+
+    A killed sweep leaves variant decks behind; inventorying them would run
+    the corpus against decks we wrote and grow the model count on every
+    interrupted sweep.
+    """
+    _write(tmp_path / "EPA" / "m1.inp")
+    _write(tmp_path / "EPA" / f"{variants.TEMP_PREFIX}A_m1.inp")
+    _write(tmp_path / "EPA" / f"{variants.TEMP_PREFIX}B_m1.inp")
+
+    records = corpus.discover(tmp_path)
+
+    assert [r.model_id for r in records] == ["EPA/m1"]
 
 
 def test_hash_is_stable_and_content_sensitive(tmp_path):

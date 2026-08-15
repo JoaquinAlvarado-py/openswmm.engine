@@ -12,6 +12,8 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import variants
+
 # Report-only directories holding historical reference runs for models that
 # live elsewhere in the tree. They contribute anchors, never models.
 VERSION_ANCHOR_DIRS = {"v12": "ref_v12_path", "v13": "ref_v13_path"}
@@ -60,6 +62,13 @@ def discover(root: Path) -> list[ModelRecord]:
 
     records: list[ModelRecord] = []
     for inp in sorted(root.rglob("*.inp")):
+        # A variant deck that survived a killed sweep is the harness's own
+        # leftover, not a corpus model. Inventorying it would run the corpus
+        # against a deck we wrote, and grow the model count every time a sweep
+        # was interrupted.
+        if inp.name.startswith(variants.TEMP_PREFIX):
+            continue
+
         rel = _posix(root, inp)
         family = _family(rel)
         if family in VERSION_ANCHOR_DIRS:
