@@ -109,3 +109,23 @@ def test_the_deck_directory_is_the_working_directory(tmp_path, deck):
     result = _run(script, tmp_path, deck)
 
     assert Path(result.rpt_path.read_text(encoding="latin-1")).resolve() == deck.parent.resolve()
+
+
+def test_work_dir_mkdir_failure_returns_crash_not_exception(tmp_path, deck):
+    # If a regular file occupies the work_dir path, mkdir will raise OSError.
+    # This must return a crash status, not propagate an exception.
+    bad_work_dir = tmp_path / "bad_work_dir"
+    bad_work_dir.write_text("I am a file, not a directory", encoding="utf-8")
+
+    result = runner.run_once(
+        engine=["/does/not/exist"],
+        deck=deck,
+        work_dir=bad_work_dir,
+        timeout_s=5.0,
+    )
+
+    assert result.status == schema.Status.CRASH
+    assert result.exit_code is None
+    assert result.signal is None
+    assert result.rpt_path is None
+    assert result.out_path is None

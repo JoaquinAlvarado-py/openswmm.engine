@@ -64,7 +64,6 @@ def run_once(
     engine_argv = [engine] if isinstance(engine, str) else list(engine)
     deck = Path(deck)
     work_dir = Path(work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
 
     rpt = work_dir / f"{deck.stem}.rpt"
     out = work_dir / f"{deck.stem}.out"
@@ -72,6 +71,7 @@ def run_once(
 
     started = time.monotonic()
     try:
+        work_dir.mkdir(parents=True, exist_ok=True)
         process = subprocess.Popen(
             argv,
             cwd=str(deck.parent),
@@ -97,7 +97,11 @@ def run_once(
         _, stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         timed_out = True
-        process.kill()
+        try:
+            process.kill()
+        except OSError:
+            # Process exited in the race window between timeout and kill.
+            pass
         _, stderr = process.communicate()
 
     wall_ms = (time.monotonic() - started) * 1000.0
