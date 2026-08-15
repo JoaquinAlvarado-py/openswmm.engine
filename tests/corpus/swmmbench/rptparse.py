@@ -31,6 +31,7 @@ SCALAR_KEYS = (
     "min_step", "avg_step", "max_step", "pct_steady_state",
     "avg_iterations_per_step", "iteration_metric_kind",
     "pct_steps_not_converging", "n_steps_est", "total_iterations_est",
+    "reported_node_continuity", "reported_anderson_accel",
 )
 
 _CONTINUITY_ERROR = re.compile(r"Continuity Error \(%\)\s*\.+\s*(-?[\d.]+)")
@@ -82,6 +83,17 @@ def parse_scalars(text: str) -> dict:
             out["start_date"] = _parse_date(dotted.group("value"))
         elif label == "Ending Date":
             out["end_date"] = _parse_date(dotted.group("value"))
+        elif label == "Node Continuity":
+            # DefaultReportPlugin.cpp:562-564 echoes what OptionsHandler.cpp
+            # actually resolved NODE_CONTINUITY to. OptionsHandler.cpp:443
+            # silently ignores an unrecognised value (no else, no warning),
+            # so `options_applied` alone (the harness's intent) cannot prove
+            # the deck's option was actually honoured -- only present when
+            # routing is DYNWAVE.
+            out["reported_node_continuity"] = dotted.group("value").strip()
+        elif label == "Anderson Acceleration":
+            # DefaultReportPlugin.cpp:565-566, same DYNWAVE-only gate.
+            out["reported_anderson_accel"] = dotted.group("value").strip()
 
     if out["start_date"] and out["end_date"]:
         out["duration_s"] = (out["end_date"] - out["start_date"]).total_seconds()

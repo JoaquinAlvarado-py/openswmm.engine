@@ -112,6 +112,36 @@ def test_quality_continuity_is_none_when_absent_in_multi_block_report(multi_cont
     assert scalars["continuity_error_quality"] is None
 
 
+def test_reads_the_reported_node_continuity_and_anderson_acceleration():
+    # DefaultReportPlugin.cpp echoes both resolved option values back into
+    # the report. OptionsHandler.cpp silently ignores an unrecognised
+    # NODE_CONTINUITY value (no else/warning), so `options_applied` alone
+    # (what the harness asked for) cannot prove the engine actually did it;
+    # this is the only way to check what the engine actually resolved to.
+    report_text = """
+  ****************
+  Analysis Options
+  ****************
+  Flow Routing Method ...... DYNWAVE
+  Surcharge Method ......... EXTRAN
+  Node Continuity .......... SEMI_IMPLICIT
+  Anderson Acceleration .... YES
+"""
+    scalars = rptparse.parse_scalars(report_text)
+
+    assert scalars["reported_node_continuity"] == "SEMI_IMPLICIT"
+    assert scalars["reported_anderson_accel"] == "YES"
+
+
+def test_reported_node_continuity_and_anderson_are_none_when_absent():
+    # FV routing (or STEADY/KINWAVE) never prints this block at all
+    # (DefaultReportPlugin.cpp gates it on the DYNWAVE routing method).
+    scalars = rptparse.parse_scalars("  Nothing useful here\n")
+
+    assert scalars["reported_node_continuity"] is None
+    assert scalars["reported_anderson_accel"] is None
+
+
 def test_malformed_continuity_error_value_does_not_raise():
     """Malformed continuity error values like '1.2.3' or '.' must not raise.
 
