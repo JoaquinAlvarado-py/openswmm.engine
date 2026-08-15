@@ -68,5 +68,5 @@ def test_empty_series_do_not_raise():
 def test_binding_backed_diff_is_skipped_without_the_binding(tmp_path):
     pytest.importorskip("openswmm.legacy.output")
     # With the binding present, a missing file must still not raise.
-    rows = outdiff.diff_out_files(tmp_path / "a.out", tmp_path / "b.out", rel_tol=1e-6)
+    rows = outdiff.diff_out_files(tmp_path / "a.out", tmp_path / "b.out", abs_tol=1e-6)
     assert rows == []

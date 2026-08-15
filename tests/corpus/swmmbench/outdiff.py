@@ -57,8 +57,12 @@ NODE_ATTRIBUTES = ("INVERT_DEPTH", "HYDRAULIC_HEAD", "TOTAL_INFLOW",
 LINK_ATTRIBUTES = ("FLOW_RATE", "FLOW_DEPTH", "FLOW_VELOCITY", "CAPACITY")
 
 
-def diff_out_files(a_out: Path, b_out: Path, rel_tol: float) -> list[dict]:
-    """Per-element, per-attribute divergence between two `.out` files."""
+def diff_out_files(a_out: Path, b_out: Path, abs_tol: float) -> list[dict]:
+    """Per-element, per-attribute divergence between two `.out` files.
+
+    `abs_tol` is absolute: it is compared against `|b - a|` directly. The
+    reported `max_rel` is scaled by the baseline but is never thresholded.
+    """
     a_out, b_out = Path(a_out), Path(b_out)
     if not (a_out.is_file() and b_out.is_file()):
         return []
@@ -85,7 +89,7 @@ def diff_out_files(a_out: Path, b_out: Path, rel_tol: float) -> list[dict]:
                     stats = diff_series(
                         getattr(left, getter)(name, code),
                         getattr(right, getter)(name, code),
-                        abs_tol=rel_tol,
+                        abs_tol=abs_tol,
                     )
                     if stats["n_periods"] == 0:
                         continue

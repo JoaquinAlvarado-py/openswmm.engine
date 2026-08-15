@@ -202,7 +202,7 @@ def _diff_runs_fixture(tmp_path):
     return runs, (a1, b1), (a2, b2)
 
 
-def _fake_diff_out_files_raising_for_bad(a_out, b_out, rel_tol):
+def _fake_diff_out_files_raising_for_bad(a_out, b_out, abs_tol):
     if "bad" in str(a_out):
         raise RuntimeError("truncated .out file")
     return [{"element_type": "NODE", "element_id": "n1",
@@ -220,7 +220,7 @@ def test_diff_stage_does_not_raise_when_one_models_diff_raises(
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_for_bad)
 
-    cli.stage_diff(out, rel_tol=1e-9)  # must not raise
+    cli.stage_diff(out, abs_tol=1e-9)  # must not raise
 
 
 def test_diff_stage_keeps_out_files_for_a_model_whose_diff_raised(
@@ -232,7 +232,7 @@ def test_diff_stage_keeps_out_files_for_a_model_whose_diff_raised(
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_for_bad)
 
-    cli.stage_diff(out, rel_tol=1e-9)
+    cli.stage_diff(out, abs_tol=1e-9)
 
     assert bad_a.exists()
     assert bad_b.exists()
@@ -247,7 +247,7 @@ def test_diff_stage_deletes_out_files_and_writes_rows_for_a_succeeding_model(
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_for_bad)
 
-    cli.stage_diff(out, rel_tol=1e-9)
+    cli.stage_diff(out, abs_tol=1e-9)
 
     assert not good_a.exists()
     assert not good_b.exists()
@@ -265,7 +265,7 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_for_bad)
 
-    cli.stage_diff(out, rel_tol=1e-9)
+    cli.stage_diff(out, abs_tol=1e-9)
 
     captured = capsys.readouterr()
     assert "F/bad" in captured.out

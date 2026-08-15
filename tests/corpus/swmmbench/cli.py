@@ -267,8 +267,11 @@ def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> N
         path.unlink(missing_ok=True)
 
 
-def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
+def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
     """Diff the retained A/B `.out` pairs, then discard the binaries.
+
+    `abs_tol` is an absolute tolerance on the value difference, not a relative
+    one: it is the threshold `outdiff.diff_series` compares `|b - a|` against.
 
     Each model's diff is isolated: an unreadable or truncated `.out` costs
     only that model's row, never the batch, and its files are left in place
@@ -301,7 +304,7 @@ def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
         family = group["family"].iloc[0]
 
         try:
-            diff_rows = outdiff.diff_out_files(a_out, b_out, rel_tol)
+            diff_rows = outdiff.diff_out_files(a_out, b_out, abs_tol)
         except Exception as error:  # noqa: BLE001  isolate one bad model
             print(f"WARNING: diff failed for model {model_id!r}: {error}")
             continue
@@ -418,7 +421,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--rel-tol", type=float, default=1e-9)
+    parser.add_argument("--abs-tol", type=float, default=1e-9,
+                        help="absolute tolerance on time-series differences")
     return parser
 
 
@@ -436,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if clean else 1
 
     if args.stage == "diff":
-        stage_diff(args.out, args.rel_tol)
+        stage_diff(args.out, args.abs_tol)
         return 0
 
     if args.stage == "report":
