@@ -10,7 +10,7 @@ directly, so they need no engine.
 import pandas as pd
 import pytest
 
-from swmmbench import cli, schema, store
+from swmmbench import cli, report, schema, store
 
 ENGINE_V1 = "openswmm 1.0.0 (build abc123)"
 ENGINE_V2 = "openswmm 1.1.0 (build def456)"
@@ -87,6 +87,8 @@ def test_report_writes_the_derived_tables(store_dir):
 
 
 def test_report_writes_a_summary_naming_the_estimate_caveat(store_dir):
+    # stage_report's default language is `es`; assert via the same mapping
+    # write_markdown draws from, not a hardcoded copy of the translation.
     cli.stage_report(store_dir)
 
     summary = store_dir / "summary.md"
@@ -94,7 +96,7 @@ def test_report_writes_a_summary_naming_the_estimate_caveat(store_dir):
     text = summary.read_text(encoding="utf-8")
 
     assert "total_iterations_est" in text
-    assert "estimate" in text.lower()
+    assert "\n".join(report.MARKDOWN_STRINGS["es"]["caveat_estimate"]) in text
 
 
 def test_a_second_report_replaces_rather_than_doubles_the_derived_tables(store_dir):

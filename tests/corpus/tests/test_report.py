@@ -141,11 +141,16 @@ def test_a_c_kind_mismatch_does_not_cost_the_a_ref_delta():
 def test_markdown_names_the_estimate_as_an_estimate(tmp_path):
     deltas = report.build_deltas(_runs(), METRICS)
 
-    path = report.write_markdown(deltas, _runs(), tmp_path / "summary.md")
-    text = path.read_text(encoding="utf-8")
+    for lang in ("en", "es"):
+        path = report.write_markdown(deltas, _runs(), tmp_path / f"summary_{lang}.md",
+                                     lang=lang)
+        text = path.read_text(encoding="utf-8")
 
-    assert "estimate" in text.lower()
-    assert "EPA" in text
+        assert "total_iterations_est" in text
+        # Asserted via the same mapping write_markdown draws from, not a
+        # hardcoded copy of the translation, so the two cannot drift apart.
+        assert "\n".join(report.MARKDOWN_STRINGS[lang]["caveat_estimate"]) in text
+        assert "EPA" in text
 
 
 def _markdown_section(text: str, heading: str) -> str:
@@ -165,12 +170,13 @@ def test_markdown_reports_both_b_minus_a_and_c_minus_a_axes_with_their_own_rows(
     # each axis's section is a real, separate table carrying that axis's own
     # computed values -- not the other axis's, and not an empty heading.
     deltas = report.build_deltas(_runs(), METRICS)
+    strings = report.MARKDOWN_STRINGS["en"]
 
-    path = report.write_markdown(deltas, _runs(), tmp_path / "summary.md")
+    path = report.write_markdown(deltas, _runs(), tmp_path / "summary.md", lang="en")
     text = path.read_text(encoding="utf-8")
 
-    b_section = _markdown_section(text, "## B - A by metric")
-    c_section = _markdown_section(text, "## C - A by metric")
+    b_section = _markdown_section(text, strings["b_minus_a_heading"])
+    c_section = _markdown_section(text, strings["c_minus_a_heading"])
 
     # _runs(): avg_iterations_per_step is A=4.0, B=2.0, C=3.0, so
     # delta_b_minus_a = -2.0 and delta_c_minus_a = -1.0 for the one model.

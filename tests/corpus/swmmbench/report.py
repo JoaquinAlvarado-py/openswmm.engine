@@ -157,13 +157,104 @@ def option_anomalies(runs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=ANOMALY_COLUMNS)
 
 
-def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path:
-    """Write a summary readable without opening a notebook."""
+#: Default report language. The harness's own author works in Spanish, but
+#: the harness is being submitted upstream to an English-language project --
+#: so the *code* stays English (identifiers, comments, docstrings) while only
+#: the generated prose is switchable. `es` is the default because that is
+#: this harness's primary operator; `en` exists for the upstream project.
+DEFAULT_LANG = "es"
+
+#: All prose that lands in the generated `summary.md`, keyed by language so
+#: the two versions sit side by side and cannot drift apart -- deliberately
+#: not a scatter of `if lang == "es"` branches through write_markdown's body.
+#: Metric names, status values, family names and the `B - A` / `C - A` /
+#: `A - REF` axis notation are NOT here: they are Parquet column values and
+#: identifiers a reader cross-references against the data and the code, and
+#: must stay verbatim in both languages.
+MARKDOWN_STRINGS = {
+    "en": {
+        "title": "# Corpus Benchmark Summary",
+        "coverage_heading": "## Coverage",
+        "coverage_header": "| status | runs |",
+        "coverage_sep": "| --- | --- |",
+        "b_minus_a_heading": "## B - A by metric (Anderson acceleration effect)",
+        "c_minus_a_heading": "## C - A by metric (Crank-Nicolson continuity effect)",
+        "metric_header": "| metric | models | mean | median | min | max |",
+        "metric_sep": "| --- | --- | --- | --- | --- | --- |",
+        "iter_shift_b_heading": "## Iteration shift by family (B - A)",
+        "iter_shift_c_heading": "## Iteration shift by family (C - A)",
+        "family_header": "| family | models | mean abs iterations |",
+        "family_sep": "| --- | --- | --- |",
+        "caveats_heading": "## Caveats",
+        "caveat_estimate": [
+            "- `total_iterations_est` is a derived **estimate**",
+            "  (`avg_iterations_per_step x duration / avg_step`); the report",
+            "  publishes only a two-decimal mean. Its error grows on",
+            "  variable-time-step models. Use `avg_iterations_per_step` for any",
+            "  conclusion that matters.",
+        ],
+        "caveat_kind_mismatch": [
+            "- Rows whose `iteration_metric_kind` differs from A's are excluded",
+            "  from that variant's iteration deltas (B - A, C - A independently):",
+            "  FV substeps are not Picard iterations.",
+        ],
+        "caveat_time_series": [
+            "- Time series are compared only between our own runs. The external",
+            "  anchor is summary-level.",
+        ],
+    },
+    "es": {
+        "title": "# Resumen del Benchmark del Corpus",
+        "coverage_heading": "## Cobertura",
+        "coverage_header": "| estado | corridas |",
+        "coverage_sep": "| --- | --- |",
+        "b_minus_a_heading": "## B - A por métrica (efecto de la aceleración de Anderson)",
+        "c_minus_a_heading": "## C - A por métrica (efecto de continuidad de Crank-Nicolson)",
+        "metric_header": "| métrica | modelos | media | mediana | mínimo | máximo |",
+        "metric_sep": "| --- | --- | --- | --- | --- | --- |",
+        "iter_shift_b_heading": "## Cambio de iteraciones por familia (B - A)",
+        "iter_shift_c_heading": "## Cambio de iteraciones por familia (C - A)",
+        "family_header": "| familia | modelos | media de iteraciones absolutas |",
+        "family_sep": "| --- | --- | --- |",
+        "caveats_heading": "## Advertencias",
+        "caveat_estimate": [
+            "- `total_iterations_est` es una **estimación** derivada",
+            "  (`avg_iterations_per_step x duration / avg_step`); el informe",
+            "  publica solo una media con dos decimales. Su error crece en",
+            "  modelos de paso de tiempo variable. Use `avg_iterations_per_step`",
+            "  para cualquier conclusión que importe.",
+        ],
+        "caveat_kind_mismatch": [
+            "- Las filas cuyo `iteration_metric_kind` difiere del de A se",
+            "  excluyen de los deltas de iteraciones de esa variante (B - A,",
+            "  C - A de forma independiente): los subpasos de VF no son",
+            "  iteraciones de Picard.",
+        ],
+        "caveat_time_series": [
+            "- Las series temporales se comparan solo entre nuestras propias",
+            "  corridas. El ancla externa es a nivel de resumen.",
+        ],
+    },
+}
+
+
+def write_markdown(
+    deltas: pd.DataFrame, runs: pd.DataFrame, path: Path, lang: str = DEFAULT_LANG,
+) -> Path:
+    """Write a summary readable without opening a notebook.
+
+    `lang` selects the language of the generated prose only (headings, table
+    column headers, the Caveats bullets). Metric names, status values, family
+    names and the `B - A` / `C - A` / `A - REF` notation are data, not prose,
+    and are identical in both languages.
+    """
     path = Path(path)
-    lines = ["# Corpus Benchmark Summary", ""]
+    strings = MARKDOWN_STRINGS[lang]
+    lines = [strings["title"], ""]
 
     if not runs.empty and "status" in runs.columns:
-        lines += ["## Coverage", "", "| status | runs |", "| --- | --- |"]
+        lines += [strings["coverage_heading"], "",
+                  strings["coverage_header"], strings["coverage_sep"]]
         for status, count in runs["status"].value_counts().items():
             lines.append(f"| {status} | {count} |")
         lines.append("")
@@ -174,12 +265,11 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
         # rather than columns of one table so neither axis reads as derived
         # from, or secondary to, the other.
         for delta_col, heading in (
-            ("delta_b_minus_a", "## B - A by metric (Anderson acceleration effect)"),
-            ("delta_c_minus_a", "## C - A by metric (Crank-Nicolson continuity effect)"),
+            ("delta_b_minus_a", strings["b_minus_a_heading"]),
+            ("delta_c_minus_a", strings["c_minus_a_heading"]),
         ):
             lines += [heading, "",
-                      "| metric | models | mean | median | min | max |",
-                      "| --- | --- | --- | --- | --- | --- |"]
+                      strings["metric_header"], strings["metric_sep"]]
             # `metric` here is plain object dtype (built row-by-row in
             # build_deltas), so groupby's default observed=False is harmless.
             grouped = deltas.dropna(subset=[delta_col]).groupby("metric")
@@ -193,12 +283,11 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
 
         iterations = deltas[deltas.metric == "avg_iterations_per_step"]
         for delta_col, heading in (
-            ("delta_b_minus_a", "## Iteration shift by family (B - A)"),
-            ("delta_c_minus_a", "## Iteration shift by family (C - A)"),
+            ("delta_b_minus_a", strings["iter_shift_b_heading"]),
+            ("delta_c_minus_a", strings["iter_shift_c_heading"]),
         ):
             lines += [heading, "",
-                      "| family | models | mean abs iterations |",
-                      "| --- | --- | --- |"]
+                      strings["family_header"], strings["family_sep"]]
             # `deltas["family"]` is object dtype in the direct build_deltas ->
             # write_markdown pipeline (build_deltas reconstructs it from
             # plain Python scalars), so this groupby is unaffected either
@@ -216,21 +305,11 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
                 lines.append(f"| {family} | {len(column)} | {column.mean():.4f} |")
             lines.append("")
 
-    lines += [
-        "## Caveats",
-        "",
-        "- `total_iterations_est` is a derived **estimate**",
-        "  (`avg_iterations_per_step x duration / avg_step`); the report",
-        "  publishes only a two-decimal mean. Its error grows on",
-        "  variable-time-step models. Use `avg_iterations_per_step` for any",
-        "  conclusion that matters.",
-        "- Rows whose `iteration_metric_kind` differs from A's are excluded",
-        "  from that variant's iteration deltas (B - A, C - A independently):",
-        "  FV substeps are not Picard iterations.",
-        "- Time series are compared only between our own runs. The external",
-        "  anchor is summary-level.",
-        "",
-    ]
+    lines += [strings["caveats_heading"], ""]
+    lines += strings["caveat_estimate"]
+    lines += strings["caveat_kind_mismatch"]
+    lines += strings["caveat_time_series"]
+    lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")

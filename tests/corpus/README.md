@@ -54,8 +54,21 @@ python -m swmmbench check     --corpus-root /path/to/1729-SWMM5-Models --out ./r
 | `inventory` | the corpus tree | `models` | `--corpus-root`, `--out` |
 | `run` | `models`, the corpus tree | `runs`, `scalars`, `elements` | `--corpus-root`, `--out`, `--engine`, `--jobs`, `--timeout`, `--limit` |
 | `diff` | `runs`, the retained A/B/C `.out` triples | `ts_diff` | `--out`, `--abs-tol` |
-| `report` | `runs`, `elements` | `deltas`, `element_deltas`, `topology_status`, `summary.md` | `--out` |
+| `report` | `runs`, `elements` | `deltas`, `element_deltas`, `topology_status`, `summary.md` | `--out`, `--lang` |
 | `check` | the corpus tree | nothing | `--corpus-root`, `--out` |
+
+`--lang` (`es` or `en`, default `es`) selects the language of `summary.md`'s
+prose -- section headings, table column headers, and the Caveats bullets --
+and of the `report` stage's own console messages. Metric names, status
+values, family names and the `B - A` / `C - A` / `A - REF` axis notation are
+data, not prose, and are identical in both languages so the report stays
+cross-referenceable against the Parquet columns and the code regardless of
+`--lang`. The default is `es` for this harness's own operator; pass
+`--lang en` for an English-language report:
+
+```bash
+python -m swmmbench report --out ./results --lang en
+```
 
 `--abs-tol` is an **absolute** tolerance on the time-series difference
 (`|b - a|`), not a relative one. The reported `max_rel` is scaled by the

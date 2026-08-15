@@ -616,7 +616,9 @@ def test_report_is_invocable_without_a_corpus_root(tmp_path, capsys):
     code = cli.main(["report", "--out", str(tmp_path / "out")])
 
     assert code == 0
-    assert "no runs" in capsys.readouterr().out
+    # `--lang` defaults to `es`; assert via the same mapping stage_report
+    # draws from, not a hardcoded copy of the translation.
+    assert cli.STAGE_REPORT_STRINGS["es"]["empty_store"] in capsys.readouterr().out
 
 
 def test_inventory_without_a_corpus_root_fails_cleanly(tmp_path, capsys):

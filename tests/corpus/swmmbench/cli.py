@@ -411,17 +411,57 @@ def executed_engine_versions(runs: pd.DataFrame) -> list[str]:
     return sorted(executed["engine_version"].dropna().astype(str).unique())
 
 
-def stage_report(out_dir: Path) -> int:
+#: Operator-facing console messages `stage_report` prints, keyed by language
+#: alongside `report.MARKDOWN_STRINGS` so the two cannot drift apart. Only
+#: the messages `stage_report` itself prints are here -- `stage_run` and
+#: `stage_diff` warnings are out of scope and stay English-only.
+STAGE_REPORT_STRINGS = {
+    "en": {
+        "empty_store": "no runs to report",
+        "mixed_engine_error": (
+            "ERROR: `runs` mixes results from more than one engine build; "
+            "report refuses to guess which to publish."
+        ),
+        "mixed_engine_hint": "Re-run `report` against a store holding a single engine build.",
+        "anomaly_warning": (
+            "WARNING: {n} run(s) across {n_models} model(s) report an option "
+            "value that contradicts their variant's intent (the engine may "
+            "have silently ignored the option):"
+        ),
+        "anomaly_row": "  {model_id} ({variant}): {option} expected {expected!r}, engine reported {reported!r}",
+    },
+    "es": {
+        "empty_store": "no hay corridas para reportar",
+        "mixed_engine_error": (
+            "ERROR: `runs` mezcla resultados de más de una compilación del "
+            "motor; el informe se niega a adivinar cuál publicar."
+        ),
+        "mixed_engine_hint": "Vuelva a ejecutar `report` sobre un almacén que contenga una sola compilación del motor.",
+        "anomaly_warning": (
+            "ADVERTENCIA: {n} corrida(s) en {n_models} modelo(s) reportan un "
+            "valor de opción que contradice la intención de su variante (el "
+            "motor pudo haber ignorado la opción silenciosamente):"
+        ),
+        "anomaly_row": "  {model_id} ({variant}): {option} esperado {expected!r}, motor reportó {reported!r}",
+    },
+}
+
+
+def stage_report(out_dir: Path, lang: str = "es") -> int:
     """Materialise the derived tables and the markdown summary.
 
-    Returns a process exit code. Non-zero means nothing was written.
+    `lang` (`es` or `en`) selects the language of the generated `summary.md`
+    prose and of this stage's own console messages; it is passed straight
+    through to `report.write_markdown`. Returns a process exit code.
+    Non-zero means nothing was written.
     """
     from . import report
 
     out_dir = Path(out_dir)
+    strings = STAGE_REPORT_STRINGS[lang]
     runs = store.read_table(out_dir, "runs")
     if runs.empty:
-        print("no runs to report")
+        print(strings["empty_store"])
         return 0
 
     # `runs` is keyed on (model_id, variant, engine_version, inp_sha256), so
@@ -431,11 +471,10 @@ def stage_report(out_dir: Path) -> int:
     # rather than guess; splitting the store is the operator's call.
     versions = executed_engine_versions(runs)
     if len(versions) > 1:
-        print("ERROR: `runs` mixes results from more than one engine build; "
-              "report refuses to guess which to publish.")
+        print(strings["mixed_engine_error"])
         for version in versions:
             print(f"  {version}")
-        print("Re-run `report` against a store holding a single engine build.")
+        print(strings["mixed_engine_hint"])
         return 1
 
     # A reported anomaly, not a hard failure: an operator deliberately
@@ -446,12 +485,13 @@ def stage_report(out_dir: Path) -> int:
     anomalies = report.option_anomalies(runs)
     if not anomalies.empty:
         n_models = anomalies["model_id"].nunique()
-        print(f"WARNING: {len(anomalies)} run(s) across {n_models} model(s) "
-              f"report an option value that contradicts their variant's "
-              f"intent (the engine may have silently ignored the option):")
+        print(strings["anomaly_warning"].format(n=len(anomalies), n_models=n_models))
         for _, row in anomalies.iterrows():
-            print(f"  {row['model_id']} ({row['variant']}): {row['option']} "
-                  f"expected {row['expected']!r}, engine reported {row['reported']!r}")
+            print(strings["anomaly_row"].format(
+                model_id=row["model_id"], variant=row["variant"],
+                option=row["option"], expected=row["expected"],
+                reported=row["reported"],
+            ))
 
     deltas = report.build_deltas(runs, report.DEFAULT_METRICS)
     _replace_table(deltas, out_dir, "deltas", partition_by=["family"])
@@ -469,7 +509,7 @@ def stage_report(out_dir: Path) -> int:
         _replace_table(pd.DataFrame(), out_dir, "element_deltas")
         _replace_table(pd.DataFrame(), out_dir, "topology_status")
 
-    path = report.write_markdown(deltas, runs, out_dir / "summary.md")
+    path = report.write_markdown(deltas, runs, out_dir / "summary.md", lang=lang)
     print(f"wrote {path}")
     return 0
 
@@ -494,6 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--abs-tol", type=float, default=1e-9,
                         help="absolute tolerance on time-series differences")
+    parser.add_argument("--lang", choices=["es", "en"], default="es",
+                        help="language of the generated summary.md and report "
+                             "stage console messages (default: es)")
     return parser
 
 
@@ -519,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.stage == "report":
-        return stage_report(args.out)
+        return stage_report(args.out, args.lang)
 
     if not args.engine:
         print("error: --engine is required for the run stage")
