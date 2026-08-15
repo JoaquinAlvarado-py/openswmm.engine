@@ -162,7 +162,14 @@ def stage_run(
     timeout_s: float,
     jobs: int,
     limit: int | None,
-) -> None:
+) -> int:
+    """Run every outstanding (model, variant) pair. Returns a process exit code.
+
+    Non-zero means the corpus was left dirty. That is a hard failure, not a
+    warning: the harness's input is read-only by contract, and a surviving
+    temporary deck becomes a corpus model on the next `inventory`, poisoning
+    every subsequent sweep.
+    """
     corpus_root = Path(corpus_root)
     models = store.read_table(out_dir, "models")
     if models.empty:
@@ -224,9 +231,11 @@ def stage_run(
 
     clean, leftovers = corpus_is_clean(corpus_root)
     if not clean:
-        print(f"WARNING: {len(leftovers)} temporary decks left in the corpus:")
+        print(f"ERROR: {len(leftovers)} temporary decks left in the corpus:")
         for item in leftovers[:10]:
             print(f"  {item}")
+        return 1
+    return 0
 
 
 def corpus_is_clean(corpus_root: Path) -> tuple[bool, list[str]]:
@@ -437,6 +446,5 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --engine is required for the run stage")
         return 2
 
-    stage_run(args.corpus_root, args.out, args.engine,
-              args.timeout, args.jobs, args.limit)
-    return 0
+    return stage_run(args.corpus_root, args.out, args.engine,
+                     args.timeout, args.jobs, args.limit)

@@ -344,3 +344,53 @@ def test_scalar_rows_carry_the_engine_version(corpus_root, tmp_path, fake_engine
     assert scalars["engine_version"].notna().all()
 
 
+# ---------------------------------------------------------------------------
+# The corpus cleanliness gate
+# ---------------------------------------------------------------------------
+
+
+def test_a_dirty_corpus_fails_the_run_stage(corpus_root, tmp_path, fake_engine,
+                                            capsys):
+    """A leftover deck is a hard failure, not a warning.
+
+    The harness's input is read-only by contract; a surviving temporary deck
+    would be inventoried as a corpus model by the next sweep.
+    """
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    # Named for a model no longer in the corpus, so this run's own temp_deck
+    # cleanup cannot remove it -- exactly what a killed earlier sweep leaves.
+    leftover = corpus_root / "EPA" / ".swmmbench_A_killed.inp"
+    leftover.write_text("x", encoding="latin-1")
+
+    code = cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0,
+                         jobs=1, limit=None)
+
+    assert code != 0
+    assert ".swmmbench_A_killed.inp" in capsys.readouterr().out
+
+
+def test_main_returns_non_zero_when_the_run_stage_dirties_the_corpus(
+    corpus_root, tmp_path, fake_engine,
+):
+    # Both entry points must agree: the standalone `check` stage already
+    # returns non-zero, and `run` must not disagree with it.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    (corpus_root / "EPA" / ".swmmbench_A_killed.inp").write_text("x", encoding="latin-1")
+
+    code = cli.main(["run", "--corpus-root", str(corpus_root), "--out", str(out),
+                     "--engine", *fake_engine])
+
+    assert code != 0
+
+
+def test_main_returns_zero_for_a_clean_run(corpus_root, tmp_path, fake_engine):
+    out = tmp_path / "out"
+
+    code = cli.main(["run", "--corpus-root", str(corpus_root), "--out", str(out),
+                     "--engine", *fake_engine])
+
+    assert code == 0
+
+
