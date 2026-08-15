@@ -224,9 +224,42 @@ def corpus_is_clean(corpus_root: Path) -> tuple[bool, list[str]]:
     return not leftovers, leftovers
 
 
+def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
+    """Diff the retained A/B `.out` pairs, then discard the binaries."""
+    from . import outdiff
+
+    out_dir = Path(out_dir)
+    rows: list[dict] = []
+
+    runs = store.read_table(out_dir, "runs")
+    if runs.empty or "out_path" not in runs.columns:
+        return
+
+    ok = runs[(runs["status"] == schema.Status.OK)
+              & (runs["variant"].isin(schema.VARIANTS))
+              & runs["out_path"].notna()]
+    for model_id, group in ok.groupby("model_id"):
+        paths = dict(zip(group["variant"], group["out_path"]))
+        if set(paths) != set(schema.VARIANTS):
+            continue
+        a_out = Path(paths[schema.VARIANT_A])
+        b_out = Path(paths[schema.VARIANT_B])
+        family = group["family"].iloc[0]
+        for row in outdiff.diff_out_files(a_out, b_out, rel_tol):
+            rows.append({"model_id": model_id, "family": family, **row})
+        # Each `.out` is read once and discarded: retaining raw series for
+        # 878 models across two configurations would run to billions of rows.
+        a_out.unlink(missing_ok=True)
+        b_out.unlink(missing_ok=True)
+
+    if rows:
+        store.write_table(pd.DataFrame(rows), out_dir, "ts_diff",
+                          partition_by=["family"])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="swmmbench")
-    parser.add_argument("stage", choices=["inventory", "run", "check"])
+    parser.add_argument("stage", choices=["inventory", "run", "diff", "check"])
     parser.add_argument("--corpus-root", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--engine", nargs="+", default=None,
@@ -234,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--rel-tol", type=float, default=1e-9)
     return parser
 
 
@@ -249,6 +283,10 @@ def main(argv: list[str] | None = None) -> int:
         clean, leftovers = corpus_is_clean(args.corpus_root)
         print("corpus clean" if clean else f"{len(leftovers)} leftovers")
         return 0 if clean else 1
+
+    if args.stage == "diff":
+        stage_diff(args.out, args.rel_tol)
+        return 0
 
     if not args.engine:
         print("error: --engine is required for the run stage")
