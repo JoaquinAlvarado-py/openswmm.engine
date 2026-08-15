@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file SolverOptions2D.hpp
  * @brief Configuration options for the 2D surface routing solver.
@@ -7,7 +23,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_2D_SOLVER_OPTIONS_HPP
@@ -55,6 +71,16 @@ enum class CellClosure2D : int8_t {
  * Eq. 14, adapted as the Manning conveyance depth): zero when the upwind
  * surface is below the whole edge (no flow — the wetting gate), the exact
  * partially-submerged mean when the waterline crosses the edge. C¹ in η.
+ *
+ * Scope per solver path: BOUNDARY edges honour the mode in
+ * SurfaceFluxCalculator::boundaryEdgeFlux. Under the explicit local-inertial
+ * marcher, VFR_FACE also governs INTERIOR faces: the face flow depth becomes
+ * faceFlowDepthVfr(η_L, η_R, ze_lo, ze_hi) — the Eq. 14 wetted-edge depth of
+ * the driving surface over the shared edge's TRUE endpoint beds — so thin
+ * crests (embankments/levees/road crowns resolved as lines of high vertices)
+ * block until the water genuinely reaches the crest instead of the
+ * centroid-diluted zface (≈ ⅓-height early overtopping). MEAN keeps the
+ * legacy centroid zface bit-identical on interior faces.
  *
  * Parsed from [2D_OPTIONS] FACE_RECONSTRUCTION (MEAN|VFR_FACE).
  * See plans/2d/2D_VFR_SOLVER_CLOSURE_PLAN.md.
@@ -160,12 +186,32 @@ struct SolverOptions2D {
     /// (no numerical diffusion), <1 blends the Perot-reconstructed neighbour
     /// discharge to damp thin-film checkerboarding on steep faces.
     double theta        = 0.8;    ///< [2D_OPTIONS] THETA, (0, 1]
-    double cfl_number   = 0.7;    ///< [2D_OPTIONS] CFL_NUMBER — α in dt = α·L/√(gh)
+    double cfl_number   = 0.7;    ///< [2D_OPTIONS] CFL_NUMBER — α in
+                                  ///< dt = α·L_char/(√(gh)+|u|). L_char is
+                                  ///< derived from the discrete wave operator
+                                  ///< (InertialEdges), so α is a TRUE Courant
+                                  ///< fraction: 1.0 = linear stability limit,
+                                  ///< 0.7 default = 30% margin on any mesh.
     /// Flux-activation depth (m): cells below it are source-only (lazy rain
     /// accumulation, no face flux). Hysteresis band ±1 mm around it.
-    double h_move       = 0.003;  ///< [2D_OPTIONS] H_MOVE (m)
+    double h_move       = 0.003;  ///< [2D_OPTIONS] H_MOVE (m) — flux-active
+                                  ///< cell threshold; the marcher's on/off
+                                  ///< hysteresis band is min(1 mm, h_move/2),
+                                  ///< so thin-depth models (H_MOVE ≪ 1 mm)
+                                  ///< activate near h_move as requested.
     int    lts_tiers    = 4;      ///< [2D_OPTIONS] LTS_TIERS, 1..8 (1 = global dt)
     double froude_max   = 1.5;    ///< [2D_OPTIONS] FROUDE_MAX face |u| clamp
+    /// Convective momentum flux ∂(u·q)/∂n at interior faces, in
+    /// Stelling–Duinmeijer staggered upwind form on the Perot cell vectors.
+    /// This is the term the pure local-inertial formulation drops, and
+    /// without it the scheme has no velocity head: a transcritical reach
+    /// holds a FLAT free surface upstream of a control (measured on the
+    /// SWASHES bump: η = 0.59 m against an analytic backwater of 1.02 m) and
+    /// bores land on the wrong Rankine–Hugoniot states. Vanishes identically
+    /// at rest and in uniform flow, so lake-at-rest exactness is untouched.
+    /// OPT-IN while the 2D validation ladder is re-graded against it: the
+    /// default reproduces the established local-inertial results exactly.
+    bool advection      = false;  ///< [2D_OPTIONS] ADVECTION YES|NO
     /// Positivity/exchange availability fraction β: max share of a cell's
     /// volume that outgoing fluxes (or a coupling drain) may take per own-step.
     double exchange_beta  = 0.8;

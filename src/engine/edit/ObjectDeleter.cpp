@@ -1,10 +1,26 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file ObjectDeleter.cpp
  * @brief Implementation of object deletion and cascade analysis.
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "ObjectDeleter.hpp"
@@ -119,11 +135,7 @@ static void erase_inlet_usage(SimulationContext& ctx, int idx) {
 // ============================================================================
 
 static bool iequals(const std::string& a, const std::string& b) {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i)
-        if (std::toupper(static_cast<unsigned char>(a[i])) !=
-            std::toupper(static_cast<unsigned char>(b[i]))) return false;
-    return true;
+    return ieq(a, b);  // shared ASCII fold (StringCase.hpp, legacy parity)
 }
 
 std::vector<int> find_control_rule_refs(const SimulationContext& ctx,
@@ -316,7 +328,7 @@ CascadeResult analyze_table_impact(const SimulationContext& ctx, int table_idx) 
 
     // External-inflow rows referencing this timeseries by name
     {
-        const std::string& t_name = ctx.table_names.name_of(table_idx);
+        const std::string& t_name = ctx.tables[table_idx].id;
         if (!t_name.empty()) {
             for (int i = 0; i < ctx.ext_inflows.count(); ++i)
                 if (ctx.ext_inflows.ts_name[static_cast<std::size_t>(i)] == t_name)
@@ -728,7 +740,7 @@ CascadeResult delete_table(SimulationContext& ctx, int table_idx) {
 
     // External-inflow rows reference timeseries by name only.
     {
-        const std::string& t_name = ctx.table_names.name_of(table_idx);
+        const std::string& t_name = ctx.tables[table_idx].id;
         if (!t_name.empty()) {
             for (int i = 0; i < ctx.ext_inflows.count(); ++i) {
                 const auto ui = static_cast<std::size_t>(i);
@@ -806,9 +818,12 @@ CascadeResult delete_table(SimulationContext& ctx, int table_idx) {
 
     // --- Step 2: erase the table entry ---
     ctx.tables.tables.erase(ctx.tables.tables.begin() + static_cast<std::ptrdiff_t>(table_idx));
-    ctx.table_names.remove_at(table_idx);
+    // Every index at or past table_idx just shifted down by one, so the
+    // name→index map is stale. Erase is the only non-append mutation of the
+    // table store, and it is already O(n) from the renumbering below.
+    ctx.tables.rebuild_index();
 
-    // Subcatchment adjustment patterns index table_names (see InpWriter tN)
+    // Subcatchment adjustment patterns index ctx.tables (see InpWriter tN)
     auto clear_adj = [&](std::vector<int>& v, const char* field) {
         for (std::size_t i = 0; i < v.size(); ++i) {
             if (v[i] == table_idx) {

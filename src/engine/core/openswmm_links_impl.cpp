@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_links_impl.cpp
  * @brief C API implementation — link identity, creation, properties, state, bulk.
@@ -7,7 +23,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "openswmm_api_common.hpp"
@@ -15,6 +31,7 @@
 #include "../input/PostParseResolver.hpp"
 #include "../hydraulics/Street.hpp"
 #include "TypeHelpers.hpp"
+#include "StringCase.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -706,7 +723,11 @@ SWMM_ENGINE_API int swmm_link_get_xsect(SWMM_Engine engine, int idx,
         const auto& nm = ctx.links.pump_curve_name[uidx];
         if (!nm.empty()) {
             for (int s = 0; s < ctx.streets.count(); ++s) {
-                if (ctx.streets.names[static_cast<std::size_t>(s)] == nm) { si = s; break; }
+                if (openswmm::ieq(ctx.streets.names[static_cast<std::size_t>(s)],
+                                  nm)) {
+                    si = s;
+                    break;
+                }
             }
         }
         if (geom1) *geom1 = static_cast<double>(si);

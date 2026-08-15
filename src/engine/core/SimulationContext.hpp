@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file SimulationContext.hpp
  * @brief The central, reentrant simulation context for the new engine.
@@ -18,7 +34,7 @@
  * | `Subcatch[]`, `Nsubcatch` | `ctx.subcatches` (SubcatchData) + `ctx.subcatch_names` |
  * | `Gage[]`, `Ngages` | `ctx.gages` (GageData) + `ctx.gage_names` |
  * | `Pollut[]`, `Npolluts` + quality state | `ctx.pollutants` (PollutantData) |
- * | `Tseries[]` / `Curve[]` | `ctx.tables` (TableData) + `ctx.table_names` |
+ * | `Tseries[]` / `Curve[]` | `ctx.tables` (TableData; kind-aware find_curve/find_timeseries) |
  * | `Coord[]` | `ctx.spatial` (SpatialFrame) |
  * | — (new) | `ctx.user_flags` (UserFlags) |
  *
@@ -54,13 +70,14 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_SIMULATION_CONTEXT_HPP
 #define OPENSWMM_ENGINE_SIMULATION_CONTEXT_HPP
 
 #include <cmath>
+#include <ctime>
 #include <functional>
 #include "FilePathPair.hpp"
 #include "../data/GageData.hpp"
@@ -86,6 +103,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace openswmm {
@@ -298,6 +316,19 @@ struct SimulationContext {
     /** @brief Current lifecycle state of the engine. */
     EngineState state = EngineState::CREATED;
 
+    /**
+     * @brief Wall-clock time stamped at the start of SWMMEngine::open().
+     *
+     * @details Reported as "Analysis begun on:" and used as the origin for
+     *          "Total elapsed time:" in the .rpt. Stamped before input
+     *          parsing so that parse + cross-reference resolution +
+     *          validation + module initialization are all included in the
+     *          reported elapsed time. This matches legacy, which takes its
+     *          timestamp in report_writeLogo() before project_readInput()
+     *          (see legacy/engine/report.c). Zero until open() runs.
+     */
+    std::time_t wall_start = 0;
+
     // =========================================================================
     // Project title / notes
     // =========================================================================
@@ -504,11 +535,11 @@ struct SimulationContext {
      */
     NameIndex pollutant_names;
 
-    /**
-     * @brief Time series / curve name → table index.
-     * @see Legacy: project_findObject(TIMESERIES, name) in project.c
-     */
-    NameIndex table_names;
+    // NOTE: there is deliberately NO shared name registry for tables.
+    // Legacy keeps TSERIES and CURVE in separate hash tables, so a curve and
+    // a timeseries may legally share one name; ctx.tables is the authority
+    // (each row stores id + type) and lookups are kind-aware via
+    // find_timeseries() / find_curve() below.
 
     // =========================================================================
     // Quality data (landuse, buildup, washoff, treatment)
@@ -590,7 +621,7 @@ struct SimulationContext {
 
     /**
      * @brief Per-subcatchment pattern indices for N-PERV, DSTORE, INFIL adjustments.
-     * @details Index into ctx.table_names / pattern tables. -1 = no pattern.
+     * @details Index into ctx.tables / pattern tables. -1 = no pattern.
      * @see Legacy: Subcatch[i].nPervPattern, dStorePattern, infilPattern
      */
     std::vector<int> subcatch_n_perv_pattern;
@@ -716,6 +747,23 @@ struct SimulationContext {
         std::vector<twoD::PendingBoundaryRow>*       pending_bc = nullptr;
         std::vector<twoD::PendingEdgeConveyanceRow>* pending_ec = nullptr;
     } twod_io;
+
+    /**
+     * @brief Section rows whose target object had not been parsed yet.
+     *
+     * @details Sections are dispatched in the order they appear in the file,
+     *          so a property section that names an object defined further down
+     *          (e.g. an [XSECTIONS] row for a link declared in a later
+     *          [ORIFICES]) cannot resolve its name on the first pass. Legacy
+     *          SWMM avoids this with an ID pre-pass; here a handler stashes the
+     *          unresolved row as (section tag, raw line) and InputReader
+     *          re-dispatches it once every section has been read. Rows still
+     *          unresolved after that replay name an object that does not exist
+     *          and raise ERROR 209, as legacy does.
+     *
+     *          Parse-time scratch only — empty once reading finishes.
+     */
+    std::vector<std::pair<std::string, std::string>> deferred_section_rows;
 
     // =========================================================================
     // Error / warning tracking
@@ -1133,6 +1181,31 @@ struct SimulationContext {
     } routing_stats;
 
     // =========================================================================
+    // Virtual-junction diagnostics (refactored engine only)
+    // =========================================================================
+
+    /**
+     * @brief Per-virtual-junction momentum-residual accumulators.
+     *
+     * @details Populated by DWSolver after each converged routing step; the
+     *          residual is the discrete momentum-flux imbalance across the
+     *          pair interface (see VIRTUAL_JUNCTION_IMPLEMENTATION_PLAN.md
+     *          §3.2). Reported in the .rpt Virtual Junction Summary.
+     */
+    struct VJDiag {
+        std::vector<int>       node_idx;   ///< virtual junction node index
+        std::vector<int>       up_link;    ///< upstream conduit (through orientation, -1 sag/peak)
+        std::vector<int>       dn_link;    ///< downstream conduit (-1 sag/peak)
+        std::vector<double>    resid_max;  ///< max |R_j| over the run (cfs·ft/s)
+        std::vector<double>    resid_sum;  ///< Σ|R_j| for mean reporting
+        std::vector<long long> resid_n;    ///< number of accumulated steps
+        void clear() {
+            node_idx.clear(); up_link.clear(); dn_link.clear();
+            resid_max.clear(); resid_sum.clear(); resid_n.clear();
+        }
+    } vj_diag;
+
+    // =========================================================================
     // Control action log — Gap #67
     // Populated by ControlEngine::applyPendingActions() when rpt_controls is on.
     // =========================================================================
@@ -1239,6 +1312,7 @@ struct SimulationContext {
         warnings.clear();
         errors.clear();
         title_notes.clear();
+        deferred_section_rows.clear();
 
         // Clear SoA stores
         nodes      = NodeData{};
@@ -1254,10 +1328,12 @@ struct SimulationContext {
         subcatch_names.clear();
         gage_names.clear();
         pollutant_names.clear();
-        table_names.clear();
 
         // Clear inflow-related stores that aren't reset by their owning solvers
         rdii_decay = RDIIDecayData{};
+
+        // Virtual-junction diagnostics
+        vj_diag.clear();
 
         // Clear daily climate state (re-initialized by SWMMEngine on next run)
         climate_state = climate::ClimateState{};
@@ -1404,7 +1480,40 @@ struct SimulationContext {
     int n_landuses()   const noexcept { return landuse_names.size(); }
 
     /** @brief Number of tables (time series + curves). */
-    int n_tables()     const noexcept { return table_names.size(); }
+    int n_tables()     const noexcept { return static_cast<int>(tables.count()); }
+
+    // =========================================================================
+    // Kind-aware table lookups (case-insensitive, legacy hash.c parity).
+    // Legacy keeps TSERIES and CURVE in separate hash tables, so the same
+    // name may denote both a curve and a timeseries; every consumer knows
+    // which kind it wants.
+    // =========================================================================
+
+    /**
+     * @brief Find a timeseries table by name; -1 if none.
+     * @details O(1) via TableData::by_name. Returns the lowest matching index,
+     *          exactly as the previous linear scan did.
+     */
+    int find_timeseries(std::string_view name) const noexcept {
+        return tables.find_by_kind(name, /*want_timeseries=*/true);
+    }
+
+    /** @brief Find a curve table (any CURVE_* type) by name; -1 if none. */
+    int find_curve(std::string_view name) const noexcept {
+        return tables.find_by_kind(name, /*want_timeseries=*/false);
+    }
+
+    /**
+     * @brief Find a table of either kind by name; -1 if none.
+     * @details Timeseries win ties with a same-named curve (row order breaks
+     *          exact ties). Only for callers with no kind context (e.g. the
+     *          generic swmm_table_index C API).
+     */
+    int find_table_any(std::string_view name) const noexcept {
+        const int ts = find_timeseries(name);
+        if (ts >= 0) return ts;
+        return find_curve(name);
+    }
 };
 
 } /* namespace openswmm */

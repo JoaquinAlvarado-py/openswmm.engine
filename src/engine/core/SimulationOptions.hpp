@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file SimulationOptions.hpp
  * @brief Simulation options parsed from the [OPTIONS] section.
@@ -18,7 +34,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_SIMULATION_OPTIONS_HPP
@@ -28,6 +44,8 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+
+#include "../hydraulics/fv/FvOptions.hpp"
 #include <cstdint>
 #include <cmath>
 
@@ -57,7 +75,8 @@ enum class FlowUnits : int {
 enum class RoutingModel : int {
     STEADY   = 0,  ///< Steady-state (no routing)
     KINWAVE  = 1,  ///< Kinematic wave approximation
-    DYNWAVE  = 2   ///< Dynamic wave (full Saint-Venant)
+    DYNWAVE  = 2,  ///< Dynamic wave (full Saint-Venant, implicit Picard)
+    FV       = 3   ///< Explicit conservative finite volume (Godunov, HLL/HLLC)
 };
 
 /**
@@ -192,6 +211,18 @@ struct SimulationOptions {
     /** @brief Routing method. Legacy default: DYNWAVE. */
     RoutingModel routing_model = RoutingModel::DYNWAVE;
 
+    /**
+     * @brief Knobs for FLOW_ROUTING FV, grouped rather than spread across this
+     *        struct (plan §4.2 — first-class [OPTIONS] keys, no new section).
+     *
+     * @details Length-dimensioned members are stored here in the PROJECT's
+     *          display units exactly as parsed; Router::init converts them to
+     *          internal feet, the same treatment HEAD_TOLERANCE gets. FV_* keys
+     *          are accepted and inert under any other routing model, so
+     *          switching FLOW_ROUTING never invalidates a file.
+     */
+    fv::FvOptions fv;
+
     /** @brief Infiltration method for subcatchments. */
     InfiltrationModel infiltration = InfiltrationModel::HORTON;
 
@@ -232,6 +263,22 @@ struct SimulationOptions {
 
     /** @brief Node continuity formulation for depth update. Default: EXPLICIT (legacy). */
     NodeContinuity node_continuity = NodeContinuity::EXPLICIT;
+
+    /** @brief Virtual-junction momentum treatment. Always 0 (BASIC).
+     *  @details BASIC applies zero storage, the shared junction sigma and
+     *           cross-junction upwinding of area/hydraulic radius; it
+     *           transmits no cross-junction convective momentum. FULL, which
+     *           added the dq4_j correction, is RETIRED (2026-08-14): the term
+     *           was sign-inverted relative to the per-link convective term and
+     *           applied to both adjacent links, destroying 224-325 % of the
+     *           routed volume on SWASHES macdonald-periodic. The keyword is
+     *           still parsed, warns, and is treated as BASIC; the field is
+     *           kept only so existing writers/readers keep their layout.
+     *  @code
+     *  VIRTUAL_JUNCTION_MOMENTUM  BASIC  ;; default; FULL warns and maps here
+     *  @endcode
+     */
+    int virtual_junction_momentum = 0;
 
     /** @brief Enable Anderson acceleration for Picard iteration convergence.
      *  @details When true, uses depth-2 Anderson mixing to accelerate node

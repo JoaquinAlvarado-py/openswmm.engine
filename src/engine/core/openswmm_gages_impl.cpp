@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_gages_impl.cpp
  * @brief C API implementation — rain gage identity, creation, properties, state, bulk.
@@ -7,7 +23,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "openswmm_api_common.hpp"
@@ -98,7 +114,7 @@ SWMM_ENGINE_API int swmm_gage_set_timeseries(SWMM_Engine engine, int idx, const 
     auto& ctx = to_engine(engine)->context();
     CHECK_GEOMETRY(ctx);
     CHECK_INDEX(idx >= 0 && idx < ctx.n_gages());
-    int ts_idx = ctx.table_names.find(ts_id);
+    int ts_idx = ctx.find_timeseries(ts_id);
     if (ts_idx < 0) return SWMM_ERR_BADPARAM;
     ctx.gages.ts_index[static_cast<std::size_t>(idx)] = ts_idx;
     ctx.gages.source[static_cast<std::size_t>(idx)] = openswmm::RainSource::TIMESERIES;
@@ -226,8 +242,8 @@ SWMM_ENGINE_API int swmm_gage_get_timeseries(SWMM_Engine engine, int idx, char* 
     CHECK_INDEX(idx >= 0 && idx < ctx.n_gages());
     const int ts = ctx.gages.ts_index[static_cast<std::size_t>(idx)];
     std::string id;
-    if (ts >= 0 && ts < static_cast<int>(ctx.table_names.size()))
-        id = ctx.table_names.name_of(ts);
+    if (ts >= 0 && ts < ctx.n_tables())
+        id = ctx.tables[ts].id;
     else
         id = ctx.gages.ts_name[static_cast<std::size_t>(idx)];  // unresolved name, if any
     gage_fill_buf(buf, buflen, id);

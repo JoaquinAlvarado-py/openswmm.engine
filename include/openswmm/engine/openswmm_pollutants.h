@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_pollutants.h
  * @brief OpenSWMM Engine — Pollutant / Water Quality C API.
@@ -10,7 +26,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_POLLUTANTS_H
@@ -61,6 +77,21 @@ SWMM_ENGINE_API const char* swmm_pollutant_id(SWMM_Engine engine, int idx);
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_pollutant_add(SWMM_Engine engine, const char* id, int units);
+
+/**
+ * @brief Rename a pollutant in place.
+ *
+ * @details Updates the name registry and every name-stored reference:
+ *          [INFLOWS]/[DWF] rows keyed by constituent name follow the new
+ *          name. Index-stored references (co-pollutant, LID removals,
+ *          buildup/washoff columns) are positional and unaffected.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Zero-based pollutant index.
+ * @param new_id  New unique name (non-empty).
+ * @returns SWMM_OK, or SWMM_ERR_BADPARAM on empty/duplicate name.
+ */
+SWMM_ENGINE_API int swmm_pollutant_rename(SWMM_Engine engine, int idx, const char* new_id);
 
 /* =========================================================================
  * Property setters (BUILDING or OPENED)

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file Inflow.cpp
  * @brief External/DWF inflows — batch SoA, numerically identical to legacy.
@@ -5,7 +21,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "Inflow.hpp"
@@ -85,16 +101,11 @@ void InflowSolver::init(SimulationContext& ctx) {
     // Lookups are case-INSENSITIVE to match legacy: SWMM's symbol table
     // upper-cases every character (hash.c UCHAR macro), so a [DWF] row that
     // references "Kurve4" resolves to a [PATTERNS] entry named "kurve4".
-    // A case-sensitive std::unordered_map silently missed these, leaving the
-    // inflow with no time pattern (a flat factor of 1.0).
-    auto upper = [](std::string s) {
-        for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        return s;
-    };
-    std::unordered_map<std::string, int> pattern_map;
+    // CiHash/CiEqual give that fold directly on the original-case names.
+    std::unordered_map<std::string, int, CiHash, CiEqual> pattern_map;
     int np = ctx.patterns.count();
     for (int i = 0; i < np; ++i) {
-        pattern_map[upper(ctx.patterns.names[static_cast<std::size_t>(i)])] = i;
+        pattern_map[ctx.patterns.names[static_cast<std::size_t>(i)]] = i;
     }
 
     // ---- Copy patterns into runtime structures ----
@@ -126,7 +137,7 @@ void InflowSolver::init(SimulationContext& ctx) {
         // Resolve timeseries name → table index
         const auto& ts_name = ctx.ext_inflows.ts_name[ui];
         if (!ts_name.empty()) {
-            ext_inflows_.ts_idx[ui] = ctx.table_names.find(ts_name);
+            ext_inflows_.ts_idx[ui] = ctx.find_timeseries(ts_name);
         } else {
             ext_inflows_.ts_idx[ui] = -1;
         }
@@ -134,7 +145,7 @@ void InflowSolver::init(SimulationContext& ctx) {
         // Resolve baseline pattern name → pattern index
         const auto& pat_name = ctx.ext_inflows.pattern_name[ui];
         if (!pat_name.empty()) {
-            auto pit = pattern_map.find(upper(pat_name));
+            auto pit = pattern_map.find(pat_name);
             ext_inflows_.base_pat_idx[ui] = (pit != pattern_map.end()) ? pit->second : -1;
         } else {
             ext_inflows_.base_pat_idx[ui] = -1;
@@ -174,7 +185,7 @@ void InflowSolver::init(SimulationContext& ctx) {
 
         for (int p = 0; p < 4; ++p) {
             if (pat_fields[p]->empty()) continue;
-            auto pit = pattern_map.find(upper(*pat_fields[p]));
+            auto pit = pattern_map.find(*pat_fields[p]);
             if (pit == pattern_map.end()) continue;
             int pat_idx = pit->second;
             // Sort into correct position by pattern type

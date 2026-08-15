@@ -197,6 +197,7 @@ static void apply_option_2d(SimulationContext& ctx, const std::string& key,
     else if (key == "2D_H_MOVE")        o->h_move       = std::stod(val);
     else if (key == "2D_LTS_TIERS")     o->lts_tiers    = std::stoi(val);
     else if (key == "2D_FROUDE_MAX")    o->froude_max   = std::stod(val);
+    else if (key == "2D_ADVECTION")     o->advection = (val == "YES");
     else if (key == "2D_COUPLING_AREA") o->coupling_area_auto = (val == "AUTO");
     else if (key == "2D_REPORT_2D")     o->report_2d = (val == "YES");
     // HDF5 results path — restoring it lets SWMMEngine::open re-create the
@@ -313,10 +314,21 @@ static bool column_exists(sqlite3* db, const std::string& table,
 static void read_nodes(sqlite3* db, SimulationContext& ctx, const std::string& sim_id) {
     // --- base nodes (common columns + discriminator + geometry) ---
     {
+        // is_virtual / rim_depth were appended after the schema shipped; an
+        // older .gpkg does not have the columns at all (SELECTing them fails
+        // outright, and the db is opened READONLY so we cannot ALTER it), so
+        // probe first. Absent means "no virtual junctions", which is exactly
+        // how such a file behaved before.
+        const bool has_virtual = column_exists(db, "nodes", "is_virtual") &&
+                                 column_exists(db, "nodes", "rim_depth");
         auto stmt = prepare(db,
-            "SELECT node_id, node_type, geom, invert_elev, max_depth, init_depth, "
-            "surcharge_depth, ponded_area, tag "
-            "FROM nodes WHERE simulation_id = ? ORDER BY fid");
+            has_virtual
+                ? "SELECT node_id, node_type, geom, invert_elev, max_depth, init_depth, "
+                  "surcharge_depth, ponded_area, tag, is_virtual, rim_depth "
+                  "FROM nodes WHERE simulation_id = ? ORDER BY fid"
+                : "SELECT node_id, node_type, geom, invert_elev, max_depth, init_depth, "
+                  "surcharge_depth, ponded_area, tag "
+                  "FROM nodes WHERE simulation_id = ? ORDER BY fid");
         bind_text(stmt.get(), 1, sim_id);
         while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
             std::string name = column_text(stmt.get(), 0);
@@ -340,6 +352,13 @@ static void read_nodes(sqlite3* db, SimulationContext& ctx, const std::string& s
                 const auto u = static_cast<std::size_t>(idx);
                 if (u >= ctx.nodes.tags.size()) ctx.nodes.tags.resize(u + 1);
                 ctx.nodes.tags[u] = column_text(stmt.get(), 8);
+            }
+            if (has_virtual) {
+                const auto u = static_cast<std::size_t>(idx);
+                ctx.nodes.is_virtual[u] =
+                    (!column_is_null(stmt.get(), 9) && column_int(stmt.get(), 9) != 0) ? 1 : 0;
+                if (!column_is_null(stmt.get(), 10))
+                    ctx.nodes.rim_depth[u] = column_double(stmt.get(), 10);
             }
         }
     }
@@ -571,7 +590,7 @@ static void read_links(sqlite3* db, SimulationContext& ctx, const std::string& s
                 ctx.links.pump_curve_name[idx] = ref_name;
                 ctx.links.xsect_curve[idx] = -1;
             } else {
-                ctx.links.xsect_curve[idx] = ctx.table_names.find(ref_name);
+                ctx.links.xsect_curve[idx] = ctx.find_curve(ref_name);
             }
         }
         ctx.links.has_flap_gate[idx] = column_int(stmt.get(), 16) != 0;
@@ -818,7 +837,7 @@ static void read_rain_gages(sqlite3* db, SimulationContext& ctx, const std::stri
             // timeseries: gages are read before [TIMESERIES], so find() here is
             // -1 until the deferred re-resolution runs against ts_name.
             ctx.gages.ts_name[static_cast<size_t>(idx)] = src;
-            ctx.gages.ts_index[idx] = ctx.table_names.find(src);
+            ctx.gages.ts_index[idx] = ctx.find_timeseries(src);
         }
     }
 }
@@ -834,13 +853,12 @@ static void read_curves(sqlite3* db, SimulationContext& ctx, const std::string& 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         std::string name = column_text(stmt.get(), 0);
         if (name != prev_name) {
-            idx = ctx.table_names.find(name);
+            idx = ctx.find_curve(name);
             if (idx < 0) {
                 // Determine the curve type from the stored integer
                 int ctype_int = std::stoi(column_text(stmt.get(), 1));
                 TableType ttype = static_cast<TableType>(ctype_int);
-                idx = ctx.table_names.add(name);
-                ctx.tables.add(name, ttype);
+                idx = ctx.tables.add(name, ttype);
             }
             prev_name = name;
         }
@@ -862,10 +880,9 @@ static void read_timeseries(sqlite3* db, SimulationContext& ctx, const std::stri
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         std::string name = column_text(stmt.get(), 0);
         if (name != prev_name) {
-            idx = ctx.table_names.find(name);
+            idx = ctx.find_timeseries(name);
             if (idx < 0) {
-                idx = ctx.table_names.add(name);
-                ctx.tables.add(name, TableType::TIMESERIES);
+                idx = ctx.tables.add(name, TableType::TIMESERIES);
             }
             prev_name = name;
         }
@@ -876,11 +893,26 @@ static void read_timeseries(sqlite3* db, SimulationContext& ctx, const std::stri
     }
 }
 
+// Backward-compat helpers (defined below, used by the quality readers).
+static bool table_exists(sqlite3* db, const std::string& name);
+static bool column_exists(sqlite3* db, const std::string& table,
+                          const std::string& column);
+
 static void read_pollutants(sqlite3* db, SimulationContext& ctx, const std::string& sim_id) {
-    auto stmt = prepare(db,
+    // ii_conc has been declared since the original schema but never bound;
+    // dwf_conc/init_conc are iteration-4 columns — all three read via the
+    // column_exists fallback so pre-existing .gpkg files still open.
+    const bool hasIi   = column_exists(db, "pollutants", "ii_conc");
+    const bool hasDwf  = column_exists(db, "pollutants", "dwf_conc");
+    const bool hasInit = column_exists(db, "pollutants", "init_conc");
+    std::string sql =
         "SELECT pollutant_id, units, rain_conc, gw_conc, decay_coeff, "
-        "snow_only, co_pollutant, co_fraction "
-        "FROM pollutants WHERE simulation_id = ?");
+        "snow_only, co_pollutant, co_fraction";
+    if (hasIi)   sql += ", ii_conc";
+    if (hasDwf)  sql += ", dwf_conc";
+    if (hasInit) sql += ", init_conc";
+    sql += " FROM pollutants WHERE simulation_id = ?";
+    auto stmt = prepare(db, sql);
     bind_text(stmt.get(), 1, sim_id);
 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -893,6 +925,9 @@ static void read_pollutants(sqlite3* db, SimulationContext& ctx, const std::stri
         grow(ctx.pollutants.units);
         grow(ctx.pollutants.c_rain);
         grow(ctx.pollutants.c_gw);
+        grow(ctx.pollutants.c_rdii);
+        grow(ctx.pollutants.c_dwf);
+        grow(ctx.pollutants.init_conc);
         grow(ctx.pollutants.k_decay);
         grow(ctx.pollutants.snow_only);
         grow(ctx.pollutants.co_pollut);
@@ -909,6 +944,170 @@ static void read_pollutants(sqlite3* db, SimulationContext& ctx, const std::stri
             ctx.pollutants.co_pollut[idx] = ctx.pollutant_names.find(co);
         }
         ctx.pollutants.co_frac[idx] = column_double(stmt.get(), 7);
+
+        int c = 8;
+        if (hasIi)   ctx.pollutants.c_rdii[idx]    = column_double(stmt.get(), c++);
+        if (hasDwf)  ctx.pollutants.c_dwf[idx]     = column_double(stmt.get(), c++);
+        if (hasInit) ctx.pollutants.init_conc[idx] = column_double(stmt.get(), c++);
+    }
+}
+
+// ============================================================================
+// Quality read functions (iteration 4) — landuses / buildup / washoff /
+// coverages / loadings. All table_exists-guarded: older .gpkg files simply
+// have none of these tables.
+// ============================================================================
+
+static void read_landuses(sqlite3* db, SimulationContext& ctx, const std::string& sim_id) {
+    if (!table_exists(db, "landuses")) return;
+    auto stmt = prepare(db,
+        "SELECT landuse_id, sweep_interval, sweep_removal, last_swept, comment "
+        "FROM landuses WHERE simulation_id = ? ORDER BY fid");
+    bind_text(stmt.get(), 1, sim_id);
+
+    // Two passes: LanduseData::resize() is assign-and-wipe, so collect all
+    // rows first, size once, then fill.
+    struct Row { std::string name; double si, sr, ls; std::string comment; };
+    std::vector<Row> rows;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        Row r;
+        r.name = column_text(stmt.get(), 0);
+        r.si   = column_double(stmt.get(), 1);
+        r.sr   = column_double(stmt.get(), 2);
+        r.ls   = column_double(stmt.get(), 3);
+        if (!column_is_null(stmt.get(), 4))
+            r.comment = column_text(stmt.get(), 4);
+        rows.push_back(std::move(r));
+    }
+    for (const auto& r : rows)
+        if (ctx.landuse_names.find(r.name) < 0)
+            ctx.landuse_names.add(r.name);
+    ctx.landuses.resize(ctx.landuse_names.size());
+    for (const auto& r : rows) {
+        const int idx = ctx.landuse_names.find(r.name);
+        if (idx < 0) continue;
+        auto u = static_cast<size_t>(idx);
+        ctx.landuses.sweep_interval[u] = r.si;
+        ctx.landuses.sweep_removal[u]  = r.sr;
+        ctx.landuses.last_swept[u]     = r.ls;
+        if (u < ctx.landuses.comments.size())
+            ctx.landuses.comments[u] = r.comment;
+    }
+
+    // Size the (landuse x pollutant) and (subcatch x landuse) matrices now
+    // that the land use count is known — mirrors swmm_landuse_add.
+    const int nLu = ctx.landuse_names.size();
+    if (nLu > 0) {
+        if (ctx.pollutant_names.size() > 0) {
+            ctx.buildup.resize(nLu, ctx.pollutant_names.size());
+            ctx.washoff.resize(nLu, ctx.pollutant_names.size());
+        }
+        if (ctx.subcatch_names.size() > 0)
+            ctx.subcatches.resize_coverage(ctx.subcatch_names.size(), nLu);
+    }
+}
+
+static void read_buildup_washoff(sqlite3* db, SimulationContext& ctx, const std::string& sim_id) {
+    const int nLu = ctx.landuse_names.size();
+    const int np  = ctx.pollutant_names.size();
+    if (nLu <= 0 || np <= 0) return;
+
+    if (table_exists(db, "buildup")) {
+        auto stmt = prepare(db,
+            "SELECT landuse_id, pollutant_id, func_type, coeff1, coeff2, "
+            "coeff3, normalizer FROM buildup WHERE simulation_id = ?");
+        bind_text(stmt.get(), 1, sim_id);
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            const int lu = ctx.landuse_names.find(column_text(stmt.get(), 0));
+            const int p  = ctx.pollutant_names.find(column_text(stmt.get(), 1));
+            if (lu < 0 || p < 0) continue;
+            const std::string ft = column_text(stmt.get(), 2);
+            int t = 0;
+            if      (ft == "POW") t = 1;
+            else if (ft == "EXP") t = 2;
+            else if (ft == "SAT") t = 3;
+            else if (ft == "EXT") t = 4;
+            auto idx = static_cast<size_t>(lu * np + p);
+            if (idx >= ctx.buildup.func_type.size()) continue;
+            ctx.buildup.func_type[idx] = t;
+            ctx.buildup.coeff1[idx] = column_double(stmt.get(), 3);
+            ctx.buildup.coeff2[idx] = column_double(stmt.get(), 4);
+            ctx.buildup.coeff3[idx] = column_double(stmt.get(), 5);
+            const std::string norm = column_text(stmt.get(), 6);
+            ctx.buildup.normalizer[idx] = (norm == "CURB") ? 1 : 0;
+        }
+    }
+    if (table_exists(db, "washoff")) {
+        auto stmt = prepare(db,
+            "SELECT landuse_id, pollutant_id, func_type, coeff, expon, "
+            "sweep_effic, bmp_effic FROM washoff WHERE simulation_id = ?");
+        bind_text(stmt.get(), 1, sim_id);
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            const int lu = ctx.landuse_names.find(column_text(stmt.get(), 0));
+            const int p  = ctx.pollutant_names.find(column_text(stmt.get(), 1));
+            if (lu < 0 || p < 0) continue;
+            const std::string ft = column_text(stmt.get(), 2);
+            int t = 0;
+            if      (ft == "EXP") t = 1;
+            else if (ft == "RC")  t = 2;
+            else if (ft == "EMC") t = 3;
+            auto idx = static_cast<size_t>(lu * np + p);
+            if (idx >= ctx.washoff.func_type.size()) continue;
+            ctx.washoff.func_type[idx] = t;
+            ctx.washoff.coeff[idx]       = column_double(stmt.get(), 3);
+            ctx.washoff.expon[idx]       = column_double(stmt.get(), 4);
+            ctx.washoff.sweep_effic[idx] = column_double(stmt.get(), 5);
+            ctx.washoff.bmp_effic[idx]   = column_double(stmt.get(), 6);
+        }
+    }
+}
+
+static void read_subcatch_coverages(sqlite3* db, SimulationContext& ctx, const std::string& sim_id) {
+    if (!table_exists(db, "subcatch_coverages")) return;
+    const int nLu = ctx.landuse_names.size();
+    const int nSc = ctx.subcatch_names.size();
+    if (nLu <= 0 || nSc <= 0) return;
+    if (ctx.subcatches.coverage_n_landuses != nLu ||
+        static_cast<int>(ctx.subcatches.coverage.size()) != nSc * nLu)
+        ctx.subcatches.resize_coverage(nSc, nLu);
+
+    auto stmt = prepare(db,
+        "SELECT subcatch_id, landuse_id, percent, last_swept "
+        "FROM subcatch_coverages WHERE simulation_id = ?");
+    bind_text(stmt.get(), 1, sim_id);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        const int s  = ctx.subcatch_names.find(column_text(stmt.get(), 0));
+        const int lu = ctx.landuse_names.find(column_text(stmt.get(), 1));
+        if (s < 0 || lu < 0) continue;
+        auto idx = static_cast<size_t>(s) * static_cast<size_t>(nLu)
+                   + static_cast<size_t>(lu);
+        ctx.subcatches.coverage[idx] = column_double(stmt.get(), 2);
+        if (idx < ctx.subcatches.sweep_last_swept.size())
+            ctx.subcatches.sweep_last_swept[idx] = column_double(stmt.get(), 3);
+    }
+}
+
+static void read_subcatch_loadings(sqlite3* db, SimulationContext& ctx, const std::string& sim_id) {
+    if (!table_exists(db, "subcatch_loadings")) return;
+    const int np  = ctx.pollutant_names.size();
+    const int nSc = ctx.subcatch_names.size();
+    if (np <= 0 || nSc <= 0) return;
+    if (ctx.subcatches.conc_n_pollutants != np ||
+        static_cast<int>(ctx.subcatches.conc.size()) != nSc * np)
+        ctx.subcatches.resize_quality(np);
+
+    auto stmt = prepare(db,
+        "SELECT subcatch_id, pollutant_id, init_buildup "
+        "FROM subcatch_loadings WHERE simulation_id = ?");
+    bind_text(stmt.get(), 1, sim_id);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        const int s = ctx.subcatch_names.find(column_text(stmt.get(), 0));
+        const int p = ctx.pollutant_names.find(column_text(stmt.get(), 1));
+        if (s < 0 || p < 0) continue;
+        auto idx = static_cast<size_t>(s) * static_cast<size_t>(np)
+                   + static_cast<size_t>(p);
+        if (idx < ctx.subcatches.conc.size())
+            ctx.subcatches.conc[idx] = column_double(stmt.get(), 2);
     }
 }
 
@@ -923,11 +1122,8 @@ static void read_patterns(sqlite3* db, SimulationContext& ctx, const std::string
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         std::string name = column_text(stmt.get(), 0);
         if (name != prev_name) {
-            // Search for existing pattern by name
-            idx = -1;
-            for (int k = 0; k < static_cast<int>(ctx.patterns.names.size()); ++k) {
-                if (ctx.patterns.names[k] == name) { idx = k; break; }
-            }
+            // Search for existing pattern by name (case-insensitive)
+            idx = ctx.patterns.find(name);
             if (idx < 0) {
                 idx = static_cast<int>(ctx.patterns.names.size());
                 ctx.patterns.names.push_back(name);
@@ -1154,7 +1350,7 @@ static void read_adjustments(sqlite3* db, SimulationContext& ctx,
             std::string pat_name = column_text(stmt.get(), 2);
 
             int si = ctx.subcatch_names.find(sc_name);
-            int pi = ctx.table_names.find(pat_name);
+            int pi = ctx.find_table_any(pat_name);
             if (si < 0 || pi < 0) continue;
 
             auto usi = static_cast<size_t>(si);
@@ -1586,9 +1782,14 @@ static void read_mesh_2d(sqlite3* db, SimulationContext& ctx,
                             "contiguous [0, n)");
         mesh.resize_triangles(n);
 
-        auto stmt = prepare(db,
-            "SELECT tri_idx, v0, v1, v2, mannings_n, tag FROM mesh_2d_triangles "
-            "WHERE simulation_id = ? ORDER BY tri_idx");
+        // init_depth was added 2026-08 (default 0 = dry); older files lack it.
+        const bool has_init_depth =
+            column_exists(db, "mesh_2d_triangles", "init_depth");
+        auto stmt = prepare(db, has_init_depth
+            ? "SELECT tri_idx, v0, v1, v2, mannings_n, tag, init_depth "
+              "FROM mesh_2d_triangles WHERE simulation_id = ? ORDER BY tri_idx"
+            : "SELECT tri_idx, v0, v1, v2, mannings_n, tag "
+              "FROM mesh_2d_triangles WHERE simulation_id = ? ORDER BY tri_idx");
         bind_text(stmt.get(), 1, sim_id);
         while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
             const int t = column_int(stmt.get(), 0);
@@ -1598,6 +1799,8 @@ static void read_mesh_2d(sqlite3* db, SimulationContext& ctx,
             mesh.tri_v2[t]      = column_int(stmt.get(), 3);
             mesh.mannings_n[t]  = column_double(stmt.get(), 4);
             mesh.tri_tag[t]     = column_text(stmt.get(), 5);
+            if (has_init_depth)
+                mesh.tri_init_depth[t] = column_double(stmt.get(), 6);
         }
     }
 
@@ -1719,6 +1922,12 @@ int read_model(sqlite3* db, SimulationContext& ctx,
         read_curves(db, ctx, simulation_id);
         read_timeseries(db, ctx, simulation_id);
         read_pollutants(db, ctx, simulation_id);
+        // Iteration 4 — quality tables (table_exists-guarded for old files).
+        // After pollutants + subcatchments so the matrices size correctly.
+        read_landuses(db, ctx, simulation_id);
+        read_buildup_washoff(db, ctx, simulation_id);
+        read_subcatch_coverages(db, ctx, simulation_id);
+        read_subcatch_loadings(db, ctx, simulation_id);
         read_patterns(db, ctx, simulation_id);
         read_evaporation(db, ctx, simulation_id);
         read_climate_settings(db, ctx, simulation_id);

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file RDII.hpp
  * @brief RDII — rainfall-dependent infiltration/inflow via unit hydrograph.
@@ -14,7 +30,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_RDII_HPP
@@ -24,6 +40,8 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+
+#include "../core/StringCase.hpp"
 
 namespace openswmm {
 
@@ -141,8 +159,11 @@ public:
      */
     int findUnitHyd(const std::string& name) const;
 
+    /// UH name → index map type; case-insensitive (legacy hash.c parity).
+    using UhNameMap = std::unordered_map<std::string, int, CiHash, CiEqual>;
+
     /// Read-only access to the UH name → index map (for validation).
-    const std::unordered_map<std::string, int>& uhNameIndex() const { return uh_name_to_idx_; }
+    const UhNameMap& uhNameIndex() const { return uh_name_to_idx_; }
 
     /**
      * @brief Compute RDII inflows for all groups (buffered, not added to lat_flow).
@@ -185,7 +206,7 @@ public:
 
 private:
     RDIIGroupSoA groups_;
-    std::unordered_map<std::string, int> uh_name_to_idx_;
+    UhNameMap uh_name_to_idx_;  ///< UH group name → index (case-insensitive)
     std::vector<double> node_rdii_flow_;  ///< Buffered per-node RDII flow (CFS)
 
     /// Compute UH ordinate at time t for response k, month m.

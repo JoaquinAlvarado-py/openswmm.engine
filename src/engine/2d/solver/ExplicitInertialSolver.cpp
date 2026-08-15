@@ -64,7 +64,9 @@ void ExplicitInertialSolver::initialize(MeshData& mesh, SurfaceStateData& state,
     facc_L_.assign(ne, 0.0);
     facc_R_.assign(ne, 0.0);
     face_tier_.assign(ne, 0);
-    if (opts.theta < 1.0) {
+    // The Perot cell vectors serve the θ-blend AND the convective term, so
+    // ADVECTION forces them on even at θ = 1.
+    if (opts.theta < 1.0 || opts.advection) {
         qcx_.assign(static_cast<std::size_t>(nt), 0.0);
         qcy_.assign(static_cast<std::size_t>(nt), 0.0);
     }
@@ -95,6 +97,7 @@ void ExplicitInertialSolver::initialize(MeshData& mesh, SurfaceStateData& state,
         }
     }
     bc_accum_.assign(bc_cell_.size(), 0.0);
+    bc_q_.assign(bc_cell_.size(), 0.0);
 
     // Live junction exchange (windowless coupling): one ∫Q dt accumulator per
     // point; spill budget tracked per 1D node. Their cells pin to tier 0 (the
@@ -109,6 +112,47 @@ void ExplicitInertialSolver::initialize(MeshData& mesh, SurfaceStateData& state,
                 pin_t0_[static_cast<std::size_t>(cp.cell_idx)] = 1;
 
     reconstructAll();
+
+    // Seed face momentum from the optional [2D_INITIAL_VELOCITY] rows: per
+    // interior face, q_e = mean of the two incident cells' (h·u, h·v)
+    // projected onto the face normal (depth from the volume-primary IC the
+    // router seeded before this call). t = 0 only — reinitialize() (hotstart
+    // / external state edits) still zeroes face momentum. Without this a
+    // depth-only IC cannot represent solutions with v(t=0) ≠ 0 (e.g. the
+    // SWASHES Thacker planar oscillation).
+    {
+        bool any_uv = false;
+        for (int i = 0; i < nt && !any_uv; ++i)
+            any_uv = mesh.tri_init_u[i] != 0.0 || mesh.tri_init_v[i] != 0.0;
+        if (any_uv) {
+            for (int e = 0; e < edges_.ne; ++e) {
+                const int a = edges_.cL[e], b = edges_.cR[e];
+                const double qax = state.depth[a] * mesh.tri_init_u[a];
+                const double qay = state.depth[a] * mesh.tri_init_v[a];
+                const double qbx = state.depth[b] * mesh.tri_init_u[b];
+                const double qby = state.depth[b] * mesh.tri_init_v[b];
+                q_[e] = 0.5 * ((qax + qbx) * edges_.nx[e] +
+                               (qay + qby) * edges_.ny[e]);
+            }
+            // Perot gather so the θ-blend and CFL speed see the seeded
+            // momentum from the very first firing (same stencil as fireCells).
+            if (!qcx_.empty()) {
+                const auto& ed = edges_;
+                for (int i = 0; i < nt; ++i) {
+                    double sx = 0.0, sy = 0.0;
+                    for (int p = ed.cell_ptr[i]; p < ed.cell_ptr[i + 1]; ++p) {
+                        const int    e = ed.cell_edge[p];
+                        const double fq = ed.cell_sign[p] * q_[e] * ed.xi[e];
+                        sx += fq * (ed.mx[e] - mesh.tri_cx[i]);
+                        sy += fq * (ed.my[e] - mesh.tri_cy[i]);
+                    }
+                    const double inv_a = 1.0 / mesh.tri_area[i];
+                    qcx_[i] = sx * inv_a;
+                    qcy_[i] = sy * inv_a;
+                }
+            }
+        }
+    }
     t_last_sync_ = 0.0;
     substeps_run_ = face_passes_ = last_steps_ = 0;
     last_dt_ = 0.0;
@@ -199,8 +243,14 @@ void ExplicitInertialSolver::syncAndRebuild(double t) {
     //    cells stay until h_off), plus concentrated sources (held coupling)
     //    and non-wall boundary cells. Rain alone does NOT activate — that is
     //    the point of the lazy tier.
-    const double h_on  = opts_->h_move + 0.001;
-    const double h_off = std::max(0.0, opts_->h_move - 0.001);
+    //    The hysteresis band scales with H_MOVE (capped at the historical
+    //    ±1 mm): a fixed ±1 mm band made H_MOVE 1e-4 require 1.1 mm to
+    //    activate — 10× the requested threshold — freezing wetting/drying
+    //    fronts on shallow benchmarks (Thacker). Bit-identical at the
+    //    default h_move = 0.003 (band = 1 mm either way).
+    const double band  = std::min(0.001, 0.5 * opts_->h_move);
+    const double h_on  = opts_->h_move + band;
+    const double h_off = std::max(0.0, opts_->h_move - band);
     std::vector<uint8_t> next(static_cast<std::size_t>(nt), 0);
 #pragma omp parallel for schedule(static) num_threads(opts_->num_threads)
     for (int i = 0; i < nt; ++i) {
@@ -281,19 +331,62 @@ void ExplicitInertialSolver::syncAndRebuild(double t) {
     telemetry_.emplace_back(t, static_cast<int>(active_cells_.size()));
 }
 
+void ExplicitInertialSolver::refreshDt0() {
+    // Between rebuilds the tier lists are frozen and depths keep evolving, so
+    // a dt0_ computed up to kRebuildEveryCycles macro cycles ago can realize
+    // an effective CFL well above the configured bound (measured: the
+    // union-jack closed-lake seiche grows at CFL_NUMBER 0.7 with dt frozen
+    // for 32 base substeps). Tightening mid-flight is unconditionally safe —
+    // every tier still satisfies dt_cell ≥ 2^k·dt0 — while GROWING dt0 must
+    // wait for syncAndRebuild, which reassigns the tiers.
+    const int na = static_cast<int>(active_cells_.size());
+    if (na == 0) return;
+    double fresh = 1.0e30;
+#pragma omp parallel num_threads(opts_->num_threads)
+    {
+        // Manual min-reduction: MSVC's default /openmp is OpenMP 2.0, which
+        // lacks reduction(min:).
+        double local = 1.0e30;
+#pragma omp for schedule(static) nowait
+        for (int k = 0; k < na; ++k) {
+            const int i = active_cells_[static_cast<std::size_t>(k)];
+            const double h = state_->depth[i];
+            if (h <= opts_->dry_depth) continue;
+            double speed = 0.0;
+            if (!qcx_.empty() && h > 1.0e-6)
+                speed = std::hypot(qcx_[i], qcy_[i]) / h;
+            const double dt = inertial::cellCflDt(opts_->cfl_number,
+                                                  edges_.cell_lchar[i], h, speed);
+            if (dt < local) local = dt;
+        }
+#pragma omp critical
+        {
+            if (local < fresh) fresh = local;
+        }
+    }
+    if (fresh < dt0_) dt0_ = fresh;
+}
+
 void ExplicitInertialSolver::fireFaces(const std::vector<int>& faces,
                                        double dt_f) {
     const auto& ed = edges_;
     const int   na = static_cast<int>(faces.size());
     const double theta = opts_->theta;
     const double beta_share = opts_->exchange_beta / 3.0;
+    // VFR_FACE: block/convey at the shared edge's TRUE crest via the B&S
+    // Eq. 14 wetted-edge depth; MEAN keeps the centroid zface bit-identical.
+    const bool vfr_face =
+        (opts_->face_reconstruction == FaceDepth2D::VFR_FACE);
 
 #pragma omp parallel for schedule(static) num_threads(opts_->num_threads)
     for (int k = 0; k < na; ++k) {
         const int e = faces[static_cast<std::size_t>(k)];
         const int a = ed.cL[e], b = ed.cR[e];
-        const double hf = inertial::faceFlowDepth(state_->head[a],
-                                                  state_->head[b], ed.zface[e]);
+        const double hf = vfr_face
+            ? inertial::faceFlowDepthVfr(state_->head[a], state_->head[b],
+                                         ed.ze_lo[e], ed.ze_hi[e])
+            : inertial::faceFlowDepth(state_->head[a],
+                                      state_->head[b], ed.zface[e]);
         if (hf <= opts_->dry_depth) {
             q_[e] = 0.0;
             continue;
@@ -313,8 +406,21 @@ void ExplicitInertialSolver::fireFaces(const std::vector<int>& faces,
         double deta = state_->head[b] - state_->head[a];
         if (std::fabs(deta) < inertial::kEtaDeadband) deta = 0.0;
         const double slope = deta * ed.inv_dx_normal[e];
+        // Convective momentum flux (ADVECTION, opt-in): both cells must be
+        // wet — a wet/dry front keeps the pure local-inertial law, whose
+        // robustness there is the reason this scheme exists.
+        double adv = 0.0;
+        if (opts_->advection && !qcx_.empty()) {
+            const double hL = state_->depth[a], hR = state_->depth[b];
+            if (hL > opts_->dry_depth && hR > opts_->dry_depth) {
+                const double unL = (qcx_[a] * ed.nx[e] + qcy_[a] * ed.ny[e]) / hL;
+                const double unR = (qcx_[b] * ed.nx[e] + qcy_[b] * ed.ny[e]) / hR;
+                adv = inertial::inertialAdvection(q_[e], unL, hL, unR, hR,
+                                                  ed.inv_dx_normal[e]);
+            }
+        }
         double qn1 = inertial::inertialFaceUpdate(q_[e], qhat, hf, dt_f, slope,
-                                                 ed.n2_face[e], q_mag);
+                                                 ed.n2_face[e], q_mag, adv);
         qn1 = inertial::froudeCap(qn1, hf, opts_->froude_max);
 
         // Positivity at face cadence: this face may take at most a β/3 share
@@ -398,40 +504,113 @@ void ExplicitInertialSolver::fireCells(const std::vector<int>& cells,
     }
 
     // Boundary edges owned by cells of this firing (serial: perimeter-sized).
+    const bool vfr_face_bc =
+        (opts_->face_reconstruction == FaceDepth2D::VFR_FACE);
     for (std::size_t k = 0; k < bc_cell_.size(); ++k) {
         const int i = bc_cell_[k];
         if (tier_[i] != 0 || !cell_active_[i]) continue;
         // BC cells are pinned to tier 0, so they fire with every tier-0 list;
         // guard against double-firing when called for other tiers.
         if (&cells != &cells_by_tier_[0]) continue;
-        double f = computeBoundaryEdgeFlux(*mesh_, *state_, *opts_,
-                                           opts_->flux_dh_eps, i, bc_slot_[k]);
-        if (f == 0.0) continue;
+        const int    idx = bc_slot_[k];
+        const auto   bt  = static_cast<BoundaryType>(
+            state_->boundary->edge_bc_type[idx]);
+        const double L = mesh_->edge_length[idx];
+        double f;
+        if (bt == BoundaryType::SPECIFIED_STAGE && L > 1.0e-12) {
+            // Inertial stage boundary: the SAME momentum law as an interior
+            // face, integrated against a ghost held at the prescribed stage
+            // (η = η_bc, zero-gradient q → the θ-blend collapses to the
+            // face's own bc_q_). The former collapsed-Manning flux was a
+            // diffusive-wave law alien to the inertial interior: its
+            // conductance saturated the equilibrium clamp into a Dirichlet
+            // cell and every BC-driven steady case floated one head-jump
+            // (~v²/2g scale) above the prescribed stage across the single
+            // interior edge feeding the BC cell.
+            const double eta_bc = state_->boundary->edge_bc_head[idx];
+            double hf;
+            if (vfr_face_bc) {
+                // B&S Eq. 14 depth of the driving surface over the edge's
+                // TRUE endpoint beds (same endpoint rule as the interior
+                // VFR_FACE path: edge e is opposite vertex e).
+                const int vv[3] = {mesh_->tri_v0[i], mesh_->tri_v1[i],
+                                   mesh_->tri_v2[i]};
+                const int    e_l = idx % 3;
+                const double za  = mesh_->vz[vv[(e_l + 1) % 3]];
+                const double zb  = mesh_->vz[vv[(e_l + 2) % 3]];
+                hf = inertial::faceDepthFromEta(
+                    std::max(state_->head[i], eta_bc),
+                    std::min(za, zb), std::max(za, zb));
+            } else {
+                hf = inertial::faceFlowDepth(state_->head[i], eta_bc,
+                                             mesh_->tri_cz[i]);
+            }
+            if (hf <= opts_->dry_depth) {
+                bc_q_[k] = 0.0;
+                continue;
+            }
+            double deta = state_->head[i] - eta_bc;
+            if (std::fabs(deta) < inertial::kEtaDeadband) deta = 0.0;
+            // The ghost sits across the boundary edge at the centroid→edge
+            // distance 2A/(3L) (triangle centroid is 1/3 of the height up).
+            const double slope = deta * (3.0 * L) / (2.0 * mesh_->tri_area[i]);
+            const double n     = mesh_->mannings_n[i];
+            double qn1 = inertial::inertialFaceUpdate(
+                bc_q_[k], bc_q_[k], hf, dt_c, slope, n * n,
+                std::fabs(bc_q_[k]));
+            qn1 = inertial::froudeCap(qn1, hf, opts_->froude_max);
+            f = qn1 * L;   // inflow-positive
+        } else {
+            f = computeBoundaryEdgeFlux(*mesh_, *state_, *opts_,
+                                        opts_->flux_dh_eps, i, idx);
+        }
+        if (f == 0.0) {
+            bc_q_[k] = 0.0;
+            continue;
+        }
         // Clamp the exchange in VOLUME space and re-derive the booked flux
         // from the applied change, so booking matches application exactly
         // (no −1 ulp volume dust from the flux-space clamp).
         const double v_old = state_->volume[i];
         double v_new = v_old + dt_c * f;
-        const BoundaryData* b = state_->boundary;
-        if (static_cast<BoundaryType>(b->edge_bc_type[bc_slot_[k]])
-                == BoundaryType::SPECIFIED_STAGE) {
-            // Equilibrium clamp: one substep moves the cell AT MOST to the
-            // prescribed stage. The collapsed-Manning conductance of a
-            // boundary edge dwarfs a single cell's storage over dt_c, so an
-            // unclamped explicit exchange overshoots η = h_bc every substep
-            // and rings (bang-bang limit cycle) instead of settling.
+        if (bt == BoundaryType::SPECIFIED_STAGE) {
+            // Equilibrium clamp, kept as the tiny-cell / overshoot backstop:
+            // one substep moves the cell AT MOST to the prescribed stage. At
+            // the inertial law's gravity-scale takes it almost never binds.
             const double v_eq = inertial::cellVolumeFromEta(
-                *mesh_, *opts_, i, b->edge_bc_head[bc_slot_[k]]);
+                *mesh_, *opts_, i, state_->boundary->edge_bc_head[idx]);
             if (f < 0.0) v_new = std::max(v_new, std::min(v_old, v_eq));
             else         v_new = std::min(v_new, std::max(v_old, v_eq));
         }
         if (v_new < 0.0) v_new = 0.0;   // availability clamp (exact floor)
         f = (v_new - v_old) / dt_c;
-        if (f == 0.0) continue;
-        state_->volume[i] = v_new;
-        bc_accum_[k] += dt_c * f;
-        inertial::cellEtaDepth(*mesh_, *opts_, i, state_->volume[i],
-                               state_->head[i], state_->depth[i]);
+        // Momentum matches applied mass (mirrors the interior positivity-cap
+        // rescale of qn1) — the prescribed-flux types record theirs here too.
+        bc_q_[k] = (L > 1.0e-12) ? f / L : 0.0;
+        if (f != 0.0) {
+            state_->volume[i] = v_new;
+            bc_accum_[k] += dt_c * f;
+            inertial::cellEtaDepth(*mesh_, *opts_, i, state_->volume[i],
+                                   state_->head[i], state_->depth[i]);
+        }
+        // Perot completion: the parallel pass above rebuilt this tier-0
+        // cell's discharge vector from INTERIOR edges only, so a cell fed
+        // through its boundary carried a systematic (1−θ) drag on every
+        // face (the SPECIFIED_FLOW entrance jump). Add the boundary edge's
+        // own contribution in the interior gather's outward-flux convention.
+        if (!qcx_.empty() && bc_q_[k] != 0.0) {
+            const int vv[3] = {mesh_->tri_v0[i], mesh_->tri_v1[i],
+                               mesh_->tri_v2[i]};
+            const int    e_l = idx % 3;
+            const int    va  = vv[(e_l + 1) % 3];
+            const int    vb  = vv[(e_l + 2) % 3];
+            const double mxb = 0.5 * (mesh_->vx[va] + mesh_->vx[vb]);
+            const double myb = 0.5 * (mesh_->vy[va] + mesh_->vy[vb]);
+            const double fo    = -f;   // outward volumetric flux (m³/s)
+            const double inv_a = 1.0 / mesh_->tri_area[i];
+            qcx_[i] += fo * (mxb - mesh_->tri_cx[i]) * inv_a;
+            qcy_[i] += fo * (myb - mesh_->tri_cy[i]) * inv_a;
+        }
     }
 
     // Live junction exchange at tier-0 cadence (windowless coupling): the
@@ -551,6 +730,8 @@ double ExplicitInertialSolver::advance(double t_current, double t_target) {
         if (cycles_since_rebuild >= kRebuildEveryCycles) {
             syncAndRebuild(t);
             cycles_since_rebuild = 0;
+        } else {
+            refreshDt0();
         }
         const int K = static_cast<int>(cells_by_tier_.size());
         const int nsub_full = 1 << (K - 1);
@@ -617,10 +798,16 @@ double ExplicitInertialSolver::advance(double t_current, double t_target) {
     // depths). Boundary slots carry the WINDOW-MEAN applied flux so the
     // router's −flux·dt_done booking recovers the exact ∫F_applied dt.
     std::fill(state_->edge_flux.begin(), state_->edge_flux.end(), 0.0);
+    const bool vfr_face =
+        (opts_->face_reconstruction == FaceDepth2D::VFR_FACE);
     for (int e = 0; e < edges_.ne; ++e) {
-        const double hf = inertial::faceFlowDepth(state_->head[edges_.cL[e]],
-                                                  state_->head[edges_.cR[e]],
-                                                  edges_.zface[e]);
+        const double hf = vfr_face
+            ? inertial::faceFlowDepthVfr(state_->head[edges_.cL[e]],
+                                         state_->head[edges_.cR[e]],
+                                         edges_.ze_lo[e], edges_.ze_hi[e])
+            : inertial::faceFlowDepth(state_->head[edges_.cL[e]],
+                                      state_->head[edges_.cR[e]],
+                                      edges_.zface[e]);
         double qp = 0.0;
         if (hf > opts_->dry_depth)
             qp = inertial::froudeCap(q_[e], hf, opts_->froude_max);
@@ -641,6 +828,7 @@ void ExplicitInertialSolver::reinitialize(double /*t0*/) {
     // External state edit (hot start / breach redo): volumes are authoritative;
     // face momentum and pending transfers are stale — drop them.
     std::fill(q_.begin(), q_.end(), 0.0);
+    std::fill(bc_q_.begin(), bc_q_.end(), 0.0);
     std::fill(facc_L_.begin(), facc_L_.end(), 0.0);
     std::fill(facc_R_.begin(), facc_R_.end(), 0.0);
     reconstructAll();
@@ -669,7 +857,7 @@ void ExplicitInertialSolver::finalize() {
     cell_active_.clear(); active_cells_.clear();
     tier_.clear(); face_tier_.clear();
     cells_by_tier_.clear(); edges_by_tier_.clear();
-    bc_cell_.clear(); bc_slot_.clear(); bc_accum_.clear();
+    bc_cell_.clear(); bc_slot_.clear(); bc_accum_.clear(); bc_q_.clear();
     telemetry_.clear();
     initialized_ = false;
 }

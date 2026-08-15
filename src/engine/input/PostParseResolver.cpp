@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file PostParseResolver.cpp
  * @brief Post-parse cross-reference resolution.
@@ -6,13 +22,14 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "PostParseResolver.hpp"
 #include "../core/Constants.hpp"
 #include "../core/ErrorCodes.hpp"
 #include "../core/PathResolver.hpp"
+#include "../core/PerfTimers.hpp"
 #include "../core/SimulationContext.hpp"
 #include "../core/DateTime.hpp"
 #include "../core/UnitConversion.hpp"
@@ -21,11 +38,16 @@
 #include "../hydraulics/Link.hpp"
 #include "../hydraulics/Street.hpp"
 #include "../hydraulics/ForceMain.hpp"
+#include "../edit/VirtualJunctionOps.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <map>
 #include <string>
+#include <system_error>
+#include <unordered_map>
 #include <utility>
 
 namespace openswmm::input {
@@ -138,9 +160,22 @@ static void load_external_timeseries_files(SimulationContext& ctx, const std::st
             if (!fp) continue; // Skip silently — legacy also reports ERROR 361
         }
 
-        // Reserve estimated capacity (large files can be millions of lines)
-        tbl.x.reserve(100000);
-        tbl.y.reserve(100000);
+        // Reserve from the file's actual size rather than a flat 100k rows.
+        // The old constant committed 1.6 MB per FILE-backed series before
+        // reading a byte — on a model with hundreds of small rain files that
+        // is hundreds of megabytes of untouched pages, and on a genuinely
+        // large file it was too small anyway. ~24 bytes per "date time value"
+        // row is a deliberate under-estimate: geometric growth handles the
+        // remainder, whereas over-reserving cannot be given back.
+        {
+            std::error_code ec;
+            const auto bytes = std::filesystem::file_size(file_path, ec);
+            std::size_t rows = ec ? std::size_t{1024}
+                                  : static_cast<std::size_t>(bytes) / 24u + 16u;
+            rows = std::min<std::size_t>(rows, 2000000u);
+            tbl.x.reserve(rows);
+            tbl.y.reserve(rows);
+        }
 
         char line[256];
         while (std::fgets(line, sizeof(line), fp)) {
@@ -218,7 +253,21 @@ static void load_external_rain_files(SimulationContext& ctx) {
         FILE* fp = std::fopen(path.c_str(), "r");
         if (!fp) {
             fp = std::fopen(ctx.gages.file_path[ug].c_str(), "r");
-            if (!fp) continue; // legacy reports ERROR 361; mirror the TS loader
+            if (!fp) {
+                // A gage that declares FILE but whose file cannot be opened is
+                // FATAL, exactly as in legacy (ERROR 317). Skipping it silently
+                // leaves the series empty, which reads as 0.0 at every lookup —
+                // indistinguishable from "it wasn't raining". The run then
+                // completes, continuity closes, and the .rpt even prints a
+                // Rainfall File Summary, so a model whose rain file was moved,
+                // renamed, or left behind by a save-to-another-folder produces a
+                // clean-looking result with no precipitation anywhere. Collect
+                // and continue so every unopenable gage is named, then let the
+                // open-time gate in SWMMEngine fail the load.
+                ctx.errors.push_back(
+                    format_error(openswmm::ERR_RAIN_FILE_OPEN, path));
+                continue;
+            }
         }
 
         // PARITY: legacy pipes external rain files through a binary "rain
@@ -357,7 +406,10 @@ void recompute_conduit_flow_properties(SimulationContext& ctx, int j) {
     //   if (RouteModel == DW && xsect.type == FORCE_MAIN)
     //       roughness = forcemain_getEquivN(j, k);
     bool is_force_main = (ctx.links.xsect_shape[uj] == XsectShape::FORCE_MAIN);
-    bool is_dw = (ctx.options.routing_model == RoutingModel::DYNWAVE);
+    // ==DYNWAVE audit (plan §4.1): FV solves the same momentum equation, so
+    // the force-main equivalent-n substitution applies to it identically.
+    bool is_dw = (ctx.options.routing_model == RoutingModel::DYNWAVE ||
+                  ctx.options.routing_model == RoutingModel::FV);
     if (is_dw && is_force_main) {
         auto fm = static_cast<forcemain::FrictionModel>(ctx.options.force_main_eqn);
         double r_bot  = ctx.links.xsect_r_bot[uj];
@@ -424,6 +476,32 @@ static void convert_inputs_to_internal(SimulationContext& ctx,
                                        int n_nodes, int n_links, int n_subcatch) {
     const int us = ucf::getUnitSystem(static_cast<int>(ctx.options.flow_units));
     const auto usz = static_cast<std::size_t>(us);
+
+    // Rainfall-dimensioned inputs convert in BOTH unit systems, so they must be
+    // handled before the US early-out below.
+    //
+    // That early-out is keyed on the LENGTH factor being 1, which is the right
+    // test for lengths, areas and flows: US input arrives in feet and cfs, which
+    // are already the internal units. It is the WRONG test for [LOSSES] seepage,
+    // which arrives in in/hr in both systems while the solver consumes ft/s —
+    // UCF(RAINFALL) is 43200 for US, not 1. Skipping it left the rate 43200×
+    // too large, and the loss then saturated at the availability cap: measured
+    // −67 % routing continuity on a model whose only seepage was one conduit at
+    // 0.20 in/hr. Legacy converts it unconditionally (link.c conduit_validate,
+    // `seepRate /= UCF(RAINFALL)`), which is what this restores.
+    {
+        const double rain0 = ucf::Ucf[ucf::RAINFALL][usz];
+        if (rain0 != 1.0) {
+            auto& CD = ctx.link_subtypes.conduits;
+            for (int j = 0; j < n_links; ++j) {
+                if (ctx.links.type[static_cast<std::size_t>(j)] != LinkType::CONDUIT)
+                    continue;
+                const int cr = ctx.link_subtypes.conduit_row(j);
+                if (cr >= 0) CD.seep_rate[static_cast<std::size_t>(cr)] /= rain0;
+            }
+        }
+    }
+
     const double inv_len = ucf::Ucf_inv[ucf::LENGTH][usz];
     if (inv_len == 1.0) return;  // US units: input already in internal units.
 
@@ -450,6 +528,7 @@ static void convert_inputs_to_internal(SimulationContext& ctx,
         ctx.nodes.init_depth[ui]  /= len;
         ctx.nodes.sur_depth[ui]   /= len;
         ctx.nodes.ponded_area[ui] /= len2;
+        ctx.nodes.rim_depth[ui]   /= len;   // display-only, but still a length
         if (ctx.nodes.type[ui] == NodeType::OUTFALL) {
             const int r = ctx.node_subtypes.outfall_row(i);
             if (r >= 0 && ctx.node_subtypes.outfalls.bc_type[static_cast<std::size_t>(r)]
@@ -498,7 +577,6 @@ static void convert_inputs_to_internal(SimulationContext& ctx,
                 ctx.link_subtypes.conduits.length[ucr] /= len;
             ctx.links.q0[uj]        /= qcf;
             ctx.links.q_limit[uj]   /= qcf;
-            if (cr >= 0) ctx.link_subtypes.conduits.seep_rate[ucr] /= rain;  // legacy /UCF(RAINFALL)
         }
         // Offsets are length-dimension; crest lives on the weir/outlet row.
         ctx.links.offset1[uj]      /= len;
@@ -531,6 +609,22 @@ static void convert_inputs_to_internal(SimulationContext& ctx,
 void convert_internal_to_display(SimulationContext& ctx) {
     const int us = ucf::getUnitSystem(static_cast<int>(ctx.options.flow_units));
     const auto usz = static_cast<std::size_t>(us);
+
+    // Mirror of the hoist in convert_inputs_to_internal: seepage is in/hr in
+    // both unit systems, so it converts even when lengths do not.
+    {
+        const double rain0 = ucf::Ucf[ucf::RAINFALL][usz];
+        if (rain0 != 1.0) {
+            auto& CD = ctx.link_subtypes.conduits;
+            for (int j = 0; j < ctx.n_links(); ++j) {
+                if (ctx.links.type[static_cast<std::size_t>(j)] != LinkType::CONDUIT)
+                    continue;
+                const int cr = ctx.link_subtypes.conduit_row(j);
+                if (cr >= 0) CD.seep_rate[static_cast<std::size_t>(cr)] *= rain0;
+            }
+        }
+    }
+
     const double len = ucf::Ucf[ucf::LENGTH][usz];
     if (len == 1.0) return;  // US units: internal already equals display.
 
@@ -550,6 +644,7 @@ void convert_internal_to_display(SimulationContext& ctx) {
         ctx.nodes.init_depth[ui]  *= len;
         ctx.nodes.sur_depth[ui]   *= len;
         ctx.nodes.ponded_area[ui] *= area;
+        ctx.nodes.rim_depth[ui]   *= len;   // display-only, but still a length
         if (ctx.nodes.type[ui] == NodeType::OUTFALL) {
             const int r = ctx.node_subtypes.outfall_row(i);
             if (r >= 0 && ctx.node_subtypes.outfalls.bc_type[static_cast<std::size_t>(r)]
@@ -586,7 +681,6 @@ void convert_internal_to_display(SimulationContext& ctx) {
                 ctx.link_subtypes.conduits.length[ucr] *= len;
             ctx.links.q0[uj]        *= flow;
             ctx.links.q_limit[uj]   *= flow;
-            if (cr >= 0) ctx.link_subtypes.conduits.seep_rate[ucr] *= rain;
         }
         ctx.links.offset1[uj]      *= len;
         ctx.links.offset2[uj]      *= len;
@@ -613,6 +707,53 @@ void convert_internal_to_display(SimulationContext& ctx) {
     // --- Subcatchments ---
     for (int s = 0; s < n_subcatch; ++s)
         ctx.subcatches.width[static_cast<std::size_t>(s)] *= len;
+}
+
+// ============================================================================
+// validate_virtual_junctions()
+// ============================================================================
+// Refactored engine only — see plans/VIRTUAL_JUNCTION_IMPLEMENTATION_PLAN.md §6.
+// Runs after conduit slope computation and adverse-slope reversal so the
+// attachment orientation observed here is final. The per-node rules live in
+// edit::vj_rule_violation (shared with the C API set-virtual/split/fuse
+// operations); each violated rule produces its own error code so callers can
+// render actionable messages.
+static void validate_virtual_junctions(SimulationContext& ctx) {
+    const int n_nodes = ctx.nodes.count();
+
+    bool any = false;
+    for (int i = 0; i < n_nodes; ++i) {
+        if (ctx.nodes.is_virtual[static_cast<std::size_t>(i)]) { any = true; break; }
+    }
+    if (!any) return;
+
+    // Rule 8 (model-level): only meaningful under dynamic-wave routing.
+    // ==DYNWAVE audit: virtual junctions are meaningful under DW and are
+    // EXACT under FV (they become plain interior faces), so FV joins DW here.
+    if (ctx.options.routing_model != RoutingModel::DYNWAVE &&
+        ctx.options.routing_model != RoutingModel::FV) {
+        for (int i = 0; i < n_nodes; ++i) {
+            if (ctx.nodes.is_virtual[static_cast<std::size_t>(i)]) {
+                ctx.errors.push_back(format_error(ERR_VJ_ROUTING_MODEL,
+                                                  ctx.node_names.name_of(i)));
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < n_nodes; ++i) {
+        const auto ui = static_cast<std::size_t>(i);
+        if (!ctx.nodes.is_virtual[ui]) continue;
+        const int code = edit::vj_rule_violation(ctx, i);
+        if (code != 0) {
+            ctx.errors.push_back(format_error(code, ctx.node_names.name_of(i)));
+            continue;
+        }
+        // Derived geometry: full depth = shared pipe crown, no surcharge
+        // depth, no ponding. The JUNCTION-only full-depth raise below is
+        // skipped for virtual nodes (exact by construction).
+        edit::vj_apply_derived_geometry(ctx, i);
+    }
 }
 
 void resolve_cross_references(SimulationContext& ctx) {
@@ -642,7 +783,14 @@ void resolve_cross_references(SimulationContext& ctx) {
             ctx.pollutants.resize_pollutants(n_polluts);
         ctx.nodes.resize_quality(n_polluts);
         ctx.links.resize_quality(n_polluts);
-        ctx.subcatches.resize_quality(n_polluts);
+        // Guarded (iteration 4): resize_quality() zero-fills, and the
+        // subcatchment conc array already carries the [LOADINGS] initial
+        // buildup parsed by handle_loadings — an unconditional call here
+        // wiped it. Same rationale as the pollutant-definition guard above.
+        if (ctx.subcatches.conc_n_pollutants != n_polluts ||
+            static_cast<int>(ctx.subcatches.conc.size()) !=
+                n_subcatch * n_polluts)
+            ctx.subcatches.resize_quality(n_polluts);
         ctx.nodes.resize_loads(n_polluts);
         ctx.links.resize_loads(n_polluts);
     }
@@ -694,6 +842,7 @@ void resolve_cross_references(SimulationContext& ctx) {
     // -------------------------------------------------------------------------
     // Timeseries with FILE references (e.g., rainfall .dat files) need to be
     // loaded into memory before any date offset or gage resolution.
+    const auto _pt_extfiles0 = perf::now();
     load_external_timeseries_files(ctx, inp_dir);
 
     // -------------------------------------------------------------------------
@@ -702,6 +851,7 @@ void resolve_cross_references(SimulationContext& ctx) {
     // options parsing (needs the simulation window to bound retained records).
     // -------------------------------------------------------------------------
     load_external_rain_files(ctx);
+    perf::sec_res_extfiles += perf::since(_pt_extfiles0);
 
     // -------------------------------------------------------------------------
     // Timeseries date offset resolution
@@ -728,6 +878,10 @@ void resolve_cross_references(SimulationContext& ctx) {
     // -------------------------------------------------------------------------
     // Gage timeseries re-resolution
     // -------------------------------------------------------------------------
+    // Start of the name-binding region: gage/co-gage, subcatchment outlet and
+    // gage, storage and outfall and pump curves, external-inflow series. These
+    // are the find_timeseries/find_curve callers.
+    const auto _pt_tables0 = perf::now();
     // If RAINGAGES section appeared before TIMESERIES, ts_index will be -1.
     // Re-resolve using the stored ts_name.
     for (int g = 0; g < n_gages; ++g) {
@@ -735,7 +889,7 @@ void resolve_cross_references(SimulationContext& ctx) {
         if (ctx.gages.ts_index[ug] < 0 &&
             ctx.gages.source[ug] == RainSource::TIMESERIES &&
             !ctx.gages.ts_name[ug].empty()) {
-            ctx.gages.ts_index[ug] = ctx.table_names.find(ctx.gages.ts_name[ug]);
+            ctx.gages.ts_index[ug] = ctx.find_timeseries(ctx.gages.ts_name[ug]);
         }
     }
 
@@ -745,19 +899,21 @@ void resolve_cross_references(SimulationContext& ctx) {
     // When two or more gages share the same TIMESERIES source and ts_index, the
     // secondary gages should copy rainfall from the primary (lowest-index gage)
     // rather than querying the timeseries independently.  Matches legacy coGage.
-    for (int gj = 0; gj < n_gages; ++gj) {
-        auto ugj = static_cast<std::size_t>(gj);
-        ctx.gages.co_gage_index[ugj] = -1;
-        if (ctx.gages.source[ugj] != RainSource::TIMESERIES) continue;
-        int ts_j = ctx.gages.ts_index[ugj];
-        if (ts_j < 0) continue;
-        for (int gi = 0; gi < gj; ++gi) {
-            auto ugi = static_cast<std::size_t>(gi);
-            if (ctx.gages.source[ugi] == RainSource::TIMESERIES &&
-                ctx.gages.ts_index[ugi] == ts_j) {
-                ctx.gages.co_gage_index[ugj] = gi;
-                break;
-            }
+    // Single pass: remember the first gage seen on each timeseries and point
+    // every later one at it. The inner scan this replaces was O(n_gages^2) and
+    // broke at its first hit, i.e. the LOWEST-indexed earlier gage — which is
+    // exactly the value first_on_ts holds, so the assignment is unchanged.
+    {
+        std::unordered_map<int, int> first_on_ts;   // ts index -> first gage
+        first_on_ts.reserve(static_cast<std::size_t>(n_gages));
+        for (int gj = 0; gj < n_gages; ++gj) {
+            auto ugj = static_cast<std::size_t>(gj);
+            ctx.gages.co_gage_index[ugj] = -1;
+            if (ctx.gages.source[ugj] != RainSource::TIMESERIES) continue;
+            const int ts_j = ctx.gages.ts_index[ugj];
+            if (ts_j < 0) continue;
+            const auto ins = first_on_ts.emplace(ts_j, gj);
+            if (!ins.second) ctx.gages.co_gage_index[ugj] = ins.first->second;
         }
     }
 
@@ -854,7 +1010,7 @@ void resolve_cross_references(SimulationContext& ctx) {
         auto& S = ctx.node_subtypes.storages;
         const auto ur = static_cast<std::size_t>(r);
         if (S.curve[ur] < 0 && !S.curve_name[ur].empty()) {
-            S.curve[ur] = ctx.table_names.find(S.curve_name[ur]);
+            S.curve[ur] = ctx.find_curve(S.curve_name[ur]);
             if (S.curve[ur] < 0)
                 ctx.errors.push_back(format_error(ERR_NAME, S.curve_name[ur]));
         }
@@ -880,7 +1036,9 @@ void resolve_cross_references(SimulationContext& ctx) {
         if (O.param[ur] >= 0.0) continue;              // already resolved (e.g. via API)
 
         const std::string& nm = O.param_name[ur];
-        const int t = nm.empty() ? -1 : ctx.table_names.find(nm);
+        const int t = nm.empty() ? -1
+                                 : (is_tidal ? ctx.find_curve(nm)
+                                             : ctx.find_timeseries(nm));
         if (t < 0) {
             ctx.errors.push_back(format_error(ERR_NAME, nm));
             continue;
@@ -906,8 +1064,12 @@ void resolve_cross_references(SimulationContext& ctx) {
         if (pr < 0) continue;
         const auto upr = static_cast<std::size_t>(pr);
         if (ctx.link_subtypes.pumps.curve[upr] >= 0) continue; // already resolved
-        if (ctx.links.pump_curve_name[uj].empty()) continue;
-        ctx.link_subtypes.pumps.curve[upr] = ctx.table_names.find(ctx.links.pump_curve_name[uj]);
+        // Empty or "*" means no curve — an IDEAL pump (legacy link.c:1437).
+        // "*" can still arrive here from the GeoPackage reader / API, which
+        // store the raw name.
+        if (ctx.links.pump_curve_name[uj].empty() ||
+            ctx.links.pump_curve_name[uj] == "*") continue;
+        ctx.link_subtypes.pumps.curve[upr] = ctx.find_curve(ctx.links.pump_curve_name[uj]);
         if (ctx.link_subtypes.pumps.curve[upr] < 0)
             ctx.errors.push_back(format_error(ERR_NAME, ctx.links.pump_curve_name[uj]));
     }
@@ -924,7 +1086,7 @@ void resolve_cross_references(SimulationContext& ctx) {
         if (outlet_type < 2) continue; // FUNCTIONAL — no curve needed
         if (ctx.link_subtypes.outlets.curve[uolr] >= 0) continue; // already resolved
         if (ctx.links.pump_curve_name[uj].empty()) continue;
-        ctx.link_subtypes.outlets.curve[uolr] = ctx.table_names.find(ctx.links.pump_curve_name[uj]);
+        ctx.link_subtypes.outlets.curve[uolr] = ctx.find_curve(ctx.links.pump_curve_name[uj]);
         if (ctx.link_subtypes.outlets.curve[uolr] < 0)
             ctx.errors.push_back(format_error(ERR_NAME, ctx.links.pump_curve_name[uj]));
     }
@@ -963,19 +1125,11 @@ void resolve_cross_references(SimulationContext& ctx) {
         ctx.nodes.depth[i] = ctx.nodes.init_depth[i];
     }
 
-    // -------------------------------------------------------------------------
-    // External inflow timeseries resolution
-    // -------------------------------------------------------------------------
-    // Resolve timeseries name → table index for all external inflows
-    for (int i = 0; i < ctx.ext_inflows.count(); ++i) {
-        auto ui = static_cast<std::size_t>(i);
-        if (!ctx.ext_inflows.ts_name[ui].empty()) {
-            int ts_idx = ctx.table_names.find(ctx.ext_inflows.ts_name[ui]);
-            // Store resolved index - the inflow solver uses ts_name for lookup,
-            // but we can cache the index for performance
-            (void)ts_idx; // ts_name is used directly by InflowSolver
-        }
-    }
+    // No external-inflow timeseries resolution here: ExtInflowData carries no
+    // index field, only ts_name, and InflowSolver::init resolves the name
+    // itself (hydrology/Inflow.cpp). This used to run find_timeseries() once
+    // per external inflow and discard the result.
+    perf::sec_res_tables += perf::since(_pt_tables0);
 
     // -------------------------------------------------------------------------
     // [INFLOWS] / [DWF] / [RDII] node re-resolution
@@ -1056,7 +1210,7 @@ void resolve_cross_references(SimulationContext& ctx) {
 
         // Re-resolve diversion curve name → index (TABULAR dividers)
         if (D.curve[ur] < 0 && !D.curve_name[ur].empty())
-            D.curve[ur] = ctx.table_names.find(D.curve_name[ur]);
+            D.curve[ur] = ctx.find_curve(D.curve_name[ur]);
     }
 
     // -------------------------------------------------------------------------
@@ -1080,10 +1234,9 @@ void resolve_cross_references(SimulationContext& ctx) {
     // -------------------------------------------------------------------------
     // Evaporation timeseries resolution
     // -------------------------------------------------------------------------
-    if (ctx.options.evap_type == 2 && !ctx.options.evap_ts_name.empty()) {
-        int ts_idx = ctx.table_names.find(ctx.options.evap_ts_name);
-        (void)ts_idx; // stored by name, resolved at runtime
-    }
+    // Nothing to do: SWMMEngine::initHydrology resolves evap_ts_name into
+    // climate_state.evap_ts_index. The lookup that used to sit here discarded
+    // its result.
 
     // -------------------------------------------------------------------------
     // Link cross-section derived properties
@@ -1161,7 +1314,8 @@ void resolve_cross_references(SimulationContext& ctx) {
         double inv1 = ctx.nodes.invert_elev[static_cast<std::size_t>(n1)];
         double inv2 = ctx.nodes.invert_elev[static_cast<std::size_t>(n2)];
         if (inv1 + *off < inv2) {
-            if (ctx.options.routing_model == RoutingModel::DYNWAVE) {
+            if (ctx.options.routing_model == RoutingModel::DYNWAVE ||
+                ctx.options.routing_model == RoutingModel::FV) {
                 *off = inv2 - inv1;   // legacy link.c:434-435 (bit-exact form)
             }
             ctx.warnings.push_back(format_warning(WARN_REGULATOR_CREST_LOW, ctx.link_names.name_of(j)));
@@ -1171,6 +1325,7 @@ void resolve_cross_references(SimulationContext& ctx) {
     // Build transect geometry tables for IRREGULAR cross-sections.
     // Each TransectStore entry → TransectData with precomputed area/width/hrad tables.
     {
+        perf::ScopedTimer _pt_transects(perf::sec_res_transects);
         int nt = ctx.transects.count();
         ctx.transect_tables.resize(static_cast<std::size_t>(nt));
         for (int t = 0; t < nt; ++t) {
@@ -1210,19 +1365,24 @@ void resolve_cross_references(SimulationContext& ctx) {
             td.x_right_bank = (ctx.transects.x_right_bank[ut] / t_ucf) * xFactor;
             transect::buildTables(td);
         }
-        // Resolve IRREGULAR link transect names → indices, then set properties
+        // Resolve IRREGULAR link transect names → indices, then set properties.
+        // The name→index map replaces a linear ieq scan per IRREGULAR link.
+        // emplace keeps the FIRST index for a duplicated name, which is what
+        // the scan returned (it broke at its first hit).
+        std::unordered_map<std::string, int, CiHash, CiEqual> transect_by_name;
+        transect_by_name.reserve(static_cast<std::size_t>(nt));
+        for (int t = 0; t < nt; ++t)
+            transect_by_name.emplace(ctx.transects.names[static_cast<std::size_t>(t)], t);
+
         for (int j = 0; j < n_links; ++j) {
             auto uj = static_cast<std::size_t>(j);
             if (ctx.links.xsect_shape[uj] != XsectShape::IRREGULAR) continue;
             // Resolve transect name (stored in pump_curve_name as temp field)
             const auto& tname = ctx.links.pump_curve_name[uj];
             if (!tname.empty()) {
-                for (int t = 0; t < nt; ++t) {
-                    if (ctx.transects.names[static_cast<std::size_t>(t)] == tname) {
-                        ctx.links.xsect_curve[uj] = t;
-                        break;
-                    }
-                }
+                const auto hit = transect_by_name.find(tname);
+                if (hit != transect_by_name.end())
+                    ctx.links.xsect_curve[uj] = hit->second;
             }
             int ci = ctx.links.xsect_curve[uj];
             if (ci >= 0 && ci < nt) {
@@ -1240,10 +1400,21 @@ void resolve_cross_references(SimulationContext& ctx) {
         }
     }
 
+    // Per-link named cross-section resolution (CUSTOM shape curves, then
+    // STREET) followed by the full-flow xsect parameter loop. This is the
+    // region the per-link linear scans and per-link TransectData builds live
+    // in — see plan items 1.3 and 1.4.
+    const auto _pt_xsect0 = perf::now();
+
     // Resolve CUSTOM shape curves — these use [CURVES] Shape type entries
     // that define normalized (depth/yFull, width/wMax) relationships.
     {
         int n_tables = static_cast<int>(ctx.tables.tables.size());
+        // A CUSTOM table is fully determined by (shape curve, y_full): every
+        // link sharing both gets a byte-identical ~1.2 KB TransectData. Build
+        // one per distinct pair instead of one per link. Exact double equality
+        // is the right test here — identical inputs, identical tabulation.
+        std::map<std::pair<int, double>, int> custom_memo;
         for (int j = 0; j < n_links; ++j) {
             auto uj = static_cast<std::size_t>(j);
             if (ctx.links.xsect_shape[uj] != XsectShape::CUSTOM) continue;
@@ -1252,7 +1423,7 @@ void resolve_cross_references(SimulationContext& ctx) {
             if (cname.empty()) continue;
 
             // Find curve by name in tables
-            int ci = ctx.table_names.find(cname);
+            int ci = ctx.find_curve(cname);
             if (ci >= 0 && ci < n_tables) {
                 ctx.links.xsect_curve[uj] = ci;
 
@@ -1263,6 +1434,21 @@ void resolve_cross_references(SimulationContext& ctx) {
                 const auto& tbl = ctx.tables.tables[static_cast<std::size_t>(ci)];
                 double y_full = ctx.links.xsect_y_full[uj];
                 if (y_full <= 0.0 || tbl.x.size() < 2) continue;
+
+                // Already built for this (curve, y_full)? Point at it and skip
+                // the tabulation entirely.
+                {
+                    const auto memo = custom_memo.find({ci, y_full});
+                    if (memo != custom_memo.end()) {
+                        const auto& shared = ctx.transect_tables[
+                            static_cast<std::size_t>(memo->second)];
+                        ctx.links.xsect_a_full[uj] = shared.a_full;
+                        ctx.links.xsect_r_full[uj] = shared.r_full;
+                        ctx.links.xsect_w_max[uj]  = shared.w_max;
+                        ctx.links.xsect_curve[uj]  = memo->second;
+                        continue;
+                    }
+                }
 
                 // Find max width from curve (typically at y_norm ~0.5)
                 double w_max_norm = 0.0;
@@ -1300,6 +1486,7 @@ void resolve_cross_references(SimulationContext& ctx) {
                 int custom_idx = static_cast<int>(ctx.transect_tables.size());
                 ctx.transect_tables.push_back(std::move(ctd));
                 ctx.links.xsect_curve[uj] = custom_idx;
+                custom_memo.emplace(std::pair<int, double>{ci, y_full}, custom_idx);
             }
         }
     }
@@ -1311,6 +1498,23 @@ void resolve_cross_references(SimulationContext& ctx) {
     {
         const int us = ucf::getUnitSystem(static_cast<int>(ctx.options.flow_units));
         const double inv_len = ucf::Ucf_inv[ucf::LENGTH][static_cast<std::size_t>(us)];
+        // StreetParams derives entirely from the street index (inv_len is
+        // constant across links), so every link on a street produces the same
+        // ~1.2 KB table. N links over S streets used to allocate and tabulate
+        // N of them; now it is S. TransectData::name is write-only for these
+        // entries — nothing reads it back — so sharing one is safe even when
+        // two links spell the street name with different case.
+        std::unordered_map<int, int> street_memo;
+        // Same treatment as transects: one map instead of a linear ieq scan
+        // per STREET link, first index wins on a duplicated name. Also hoists
+        // the ctx.streets.count() that the old inner loop re-read every pass.
+        std::unordered_map<std::string, int, CiHash, CiEqual> street_by_name;
+        {
+            const int n_streets = ctx.streets.count();
+            street_by_name.reserve(static_cast<std::size_t>(n_streets));
+            for (int s = 0; s < n_streets; ++s)
+                street_by_name.emplace(ctx.streets.names[static_cast<std::size_t>(s)], s);
+        }
         for (int j = 0; j < n_links; ++j) {
             auto uj = static_cast<std::size_t>(j);
             if (ctx.links.xsect_shape[uj] != XsectShape::STREET_XSECT) continue;
@@ -1318,11 +1522,23 @@ void resolve_cross_references(SimulationContext& ctx) {
             if (sname.empty()) continue;
 
             int si = -1;
-            for (int s = 0; s < ctx.streets.count(); ++s) {
-                if (ctx.streets.names[static_cast<std::size_t>(s)] == sname) { si = s; break; }
-            }
+            if (const auto hit = street_by_name.find(sname);
+                hit != street_by_name.end())
+                si = hit->second;
             if (si < 0) continue;
             auto su = static_cast<std::size_t>(si);
+
+            if (const auto memo = street_memo.find(si);
+                memo != street_memo.end()) {
+                const auto& shared = ctx.transect_tables[
+                    static_cast<std::size_t>(memo->second)];
+                ctx.links.xsect_curve[uj]  = memo->second;
+                ctx.links.xsect_y_full[uj] = shared.y_full;
+                ctx.links.xsect_a_full[uj] = shared.a_full;
+                ctx.links.xsect_r_full[uj] = shared.r_full;
+                ctx.links.xsect_w_max[uj]  = shared.w_max;
+                continue;
+            }
 
             street::StreetParams sp;
             sp.width             = ctx.streets.t_crown[su]       * inv_len;
@@ -1342,6 +1558,7 @@ void resolve_cross_references(SimulationContext& ctx) {
 
             int idx_tbl = static_cast<int>(ctx.transect_tables.size());
             ctx.transect_tables.push_back(std::move(td));
+            street_memo.emplace(si, idx_tbl);
             const auto& built = ctx.transect_tables[static_cast<std::size_t>(idx_tbl)];
             ctx.links.xsect_curve[uj]  = idx_tbl;
             ctx.links.xsect_y_full[uj] = built.y_full;
@@ -1492,6 +1709,8 @@ void resolve_cross_references(SimulationContext& ctx) {
         ctx.links.xsect_yw_max[uj] = yw_max;
     }
 
+    perf::sec_res_xsect += perf::since(_pt_xsect0);
+
     // -------------------------------------------------------------------------
     // Conduit slope computation (matches legacy conduit_getSlope in link.c)
     // -------------------------------------------------------------------------
@@ -1559,7 +1778,12 @@ void resolve_cross_references(SimulationContext& ctx) {
         // positive slope at the original parse, so this never fires for a gpkg
         // load; the reversed `direction` is restored from the persisted column
         // in read_links instead (it is not derivable from the now-positive slope).
-        if (ctx.options.routing_model == RoutingModel::DYNWAVE &&
+        // ==DYNWAVE audit: FV handles adverse slopes natively and does NOT
+        // need this reversal — but it is kept so the same .inp preprocesses
+        // identically under both models and the virtual-junction pair tables
+        // stay orientation-consistent between them.
+        if ((ctx.options.routing_model == RoutingModel::DYNWAVE ||
+             ctx.options.routing_model == RoutingModel::FV) &&
             slope < 0.0 &&
             ctx.links.xsect_shape[uj] != XsectShape::DUMMY) {
 
@@ -1583,6 +1807,12 @@ void resolve_cross_references(SimulationContext& ctx) {
     }
 
     // -------------------------------------------------------------------------
+    // Virtual junction validation + derived geometry (after slope computation
+    // and adverse-slope reversal so orientation is final)
+    // -------------------------------------------------------------------------
+    validate_virtual_junctions(ctx);
+
+    // -------------------------------------------------------------------------
     // Node fullDepth adjustment from connected link crowns
     // (matches legacy link_validate → node fullDepth adjustment)
     // -------------------------------------------------------------------------
@@ -1595,9 +1825,11 @@ void resolve_cross_references(SimulationContext& ctx) {
         int n1 = ctx.links.node1[uj];
         int n2 = ctx.links.node2[uj];
 
-        // Upstream node: crown = offset1 + y_full (JUNCTION only, matches legacy Warning 02)
+        // Upstream node: crown = offset1 + y_full (JUNCTION only, matches legacy Warning 02;
+        // virtual junctions skipped — their full depth is exact by construction)
         if (n1 >= 0 && n1 < n_nodes &&
-            ctx.nodes.type[static_cast<std::size_t>(n1)] == NodeType::JUNCTION) {
+            ctx.nodes.type[static_cast<std::size_t>(n1)] == NodeType::JUNCTION &&
+            !ctx.nodes.is_virtual[static_cast<std::size_t>(n1)]) {
             double crown = ctx.links.offset1[uj] + y_full;
             if (crown > ctx.nodes.full_depth[n1]) {
                 ctx.nodes.full_depth[n1] = crown;
@@ -1607,9 +1839,11 @@ void resolve_cross_references(SimulationContext& ctx) {
                 }
             }
         }
-        // Downstream node: crown = offset2 + y_full (JUNCTION only, matches legacy Warning 02)
+        // Downstream node: crown = offset2 + y_full (JUNCTION only, matches legacy Warning 02;
+        // virtual junctions skipped — their full depth is exact by construction)
         if (n2 >= 0 && n2 < n_nodes &&
-            ctx.nodes.type[static_cast<std::size_t>(n2)] == NodeType::JUNCTION) {
+            ctx.nodes.type[static_cast<std::size_t>(n2)] == NodeType::JUNCTION &&
+            !ctx.nodes.is_virtual[static_cast<std::size_t>(n2)]) {
             double crown = ctx.links.offset2[uj] + y_full;
             if (crown > ctx.nodes.full_depth[n2]) {
                 ctx.nodes.full_depth[n2] = crown;
@@ -1683,7 +1917,10 @@ void resolve_cross_references(SimulationContext& ctx) {
     // -------------------------------------------------------------------------
     // Release excess vector capacity accumulated during parsing
     // -------------------------------------------------------------------------
-    ctx.shrink_all_to_fit();
+    {
+        perf::ScopedTimer _pt(perf::sec_res_shrink);
+        ctx.shrink_all_to_fit();
+    }
 
     // Relational refactor (Phase 4): the side-table rows were populated directly
     // by the parse/resolution writers above; this only re-derives the base→row

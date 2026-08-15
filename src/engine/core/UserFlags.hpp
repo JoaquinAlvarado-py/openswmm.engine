@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file UserFlags.hpp
  * @brief User-defined model flags (InfoWorks ICM-style, two-section design).
@@ -37,7 +53,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_USER_FLAGS_HPP
@@ -49,6 +65,8 @@
 #include <variant>
 #include <optional>
 #include <stdexcept>
+
+#include "StringCase.hpp"
 
 namespace openswmm {
 
@@ -262,10 +280,16 @@ public:
         return it->second;
     }
 
+    /// Composite-key value map; case-insensitive so object-name lookups match
+    /// the engine's legacy-parity name semantics, while the stored key keeps
+    /// the first-seen spelling for faithful [USER_FLAG_VALUES] round-trips.
+    using ValueMap =
+        std::unordered_map<std::string, UserFlagValue, CiHash, CiEqual>;
+
     /**
      * @brief All per-object value assignments, keyed by composite string.
      */
-    const std::unordered_map<std::string, UserFlagValue>& all_values() const noexcept {
+    const ValueMap& all_values() const noexcept {
         return values_;
     }
 
@@ -293,9 +317,9 @@ public:
 
     /**
      * @brief Build the composite lookup key "OBJECTTYPE:OBJECTNAME:FLAGNAME".
-     * @details All components are used as-is (no case normalization).
-     *          Callers are responsible for uppercasing @p object_type and
-     *          @p flag_name before storage if case-insensitive lookup is desired.
+     * @details All components are used as-is; the value map itself compares
+     *          keys case-insensitively (CiHash/CiEqual), so no component needs
+     *          pre-normalization and the first-seen spelling is preserved.
      */
     static std::string make_key(const std::string& object_type,
                                 const std::string& object_name,
@@ -316,7 +340,7 @@ private:
     std::unordered_map<std::string, std::size_t> def_index_;  ///< name → defs_ index
 
     // Per-object values
-    std::unordered_map<std::string, UserFlagValue> values_;   ///< composite key → value
+    ValueMap values_;   ///< composite key → value (case-insensitive)
 };
 
 } /* namespace openswmm */

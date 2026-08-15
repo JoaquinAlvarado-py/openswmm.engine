@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file InpWriter.cpp
  * @brief Comprehensive .inp serialisation — round-trip identical output.
@@ -13,7 +29,8 @@
  *   RAINGAGES, SUBCATCHMENTS, SUBAREAS, INFILTRATION,
  *   JUNCTIONS, OUTFALLS, DIVIDERS, STORAGE, CONDUITS, PUMPS, ORIFICES,
  *   WEIRS, OUTLETS, XSECTIONS, LOSSES, TRANSECTS, STREETS, INLETS,
- *   CONTROLS, REPORT, POLLUTANTS, LANDUSES, BUILDUP, WASHOFF, TREATMENT,
+ *   CONTROLS, REPORT, POLLUTANTS, LANDUSES, COVERAGES, BUILDUP, WASHOFF,
+ *   LOADINGS, TREATMENT,
  *   INFLOWS, DWF, RDII, PATTERNS, TIMESERIES, CURVES,
  *   MAP, COORDINATES, VERTICES, Polygons, SYMBOLS,
  *   USER_FLAGS, USER_FLAG_VALUES, PLUGINS,
@@ -25,7 +42,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "InpWriter.hpp"
@@ -141,7 +158,7 @@ static const char* gN(const SimulationContext& c, int i) {
     return (i>=0 && i<c.n_gages()) ? c.gage_names.name_of(i).c_str() : "*";
 }
 static const char* tN(const SimulationContext& c, int i) {
-    return (i>=0 && i<static_cast<int>(c.table_names.size())) ? c.table_names.name_of(i).c_str() : "*";
+    return (i>=0 && i<c.n_tables()) ? c.tables[i].id.c_str() : "*";
 }
 static const char* spN(const SimulationContext& c, int i) {
     return (i>=0 && i<static_cast<int>(c.snowpack_names.size())) ? c.snowpack_names.name_of(i).c_str() : "*";
@@ -168,6 +185,27 @@ static const char* ofName(OutfallType t) {
 }
 static bool hasNT(const SimulationContext& c, NodeType t) {
     for(int j=0;j<c.n_nodes();++j) if(c.nodes.type[static_cast<size_t>(j)]==t) return true; return false;
+}
+// Virtual junctions are JUNCTION-typed but emit into [VIRTUAL_JUNCTIONS], not [JUNCTIONS].
+static bool isVirtualNode(const SimulationContext& c, size_t u) {
+    return u < c.nodes.is_virtual.size() && c.nodes.is_virtual[u] != 0;
+}
+static bool hasRegularJunction(const SimulationContext& c) {
+    for(int j=0;j<c.n_nodes();++j){auto u=static_cast<size_t>(j);
+        if(c.nodes.type[u]==NodeType::JUNCTION && !isVirtualNode(c,u)) return true;}
+    return false;
+}
+static bool hasVirtualJunction(const SimulationContext& c) {
+    for(int j=0;j<c.n_nodes();++j) if(isVirtualNode(c,static_cast<size_t>(j))) return true;
+    return false;
+}
+// True when any virtual junction carries a rendering rim depth, which is what
+// widens [VIRTUAL_JUNCTIONS] to its optional third column. Models without one
+// keep writing the two-column section byte-for-byte.
+static bool hasVirtualJunctionRim(const SimulationContext& c) {
+    for(int j=0;j<c.n_nodes();++j){auto u=static_cast<size_t>(j);
+        if(isVirtualNode(c,u) && u<c.nodes.rim_depth.size() && c.nodes.rim_depth[u]>0.0) return true;}
+    return false;
 }
 static bool hasLT(const SimulationContext& c, LinkType t) {
     for(int j=0;j<c.n_links();++j) if(c.links.type[static_cast<size_t>(j)]==t) return true; return false;
@@ -309,6 +347,8 @@ static void write2DSections(FILE* f, const SimulationContext& ctx,
     std::fprintf(f, "%-22s %.12g\n", "H_MOVE",            o.h_move);
     std::fprintf(f, "%-22s %d\n",    "LTS_TIERS",         o.lts_tiers);
     std::fprintf(f, "%-22s %.12g\n", "FROUDE_MAX",        o.froude_max);
+    std::fprintf(f, "%-22s %s\n",    "ADVECTION",
+                 o.advection ? "YES" : "NO");
     std::fprintf(f, "%-22s %s\n",    "COUPLING_AREA",
                  o.coupling_area_auto ? "AUTO" : "DEFAULT");
     if (!o.output_file.empty())
@@ -381,15 +421,51 @@ static void emit2DMeshSections(FILE* f, const SimulationContext& ctx) {
     }
 
     // ---- [2D_TRIANGLES] -------------------------------------------------------
+    // Optional INIT_DEPTH (mesh length units — see the UNITS header above;
+    // default 0 = dry) precedes TAG. The column is
+    // emitted for EVERY row whenever any triangle has a nonzero initial depth
+    // or a tag, so TAG's position stays unambiguous on re-read (a numeric
+    // 5th token always means INIT_DEPTH).
+    bool any_init_depth = false, any_tag = false;
+    for (int t = 0; t < nt; ++t) {
+        if (mesh.tri_init_depth[t] != 0.0) any_init_depth = true;
+        if (!mesh.tri_tag[t].empty()) any_tag = true;
+    }
+    const bool write_depth_col = any_init_depth || any_tag;
     sec(f, "2D_TRIANGLES");
-    std::fprintf(f, ";;%-6s %-8s %-8s %-12s %s\n", "V1", "V2", "V3",
-                 "MANNINGS_N", "TAG");
+    if (write_depth_col)
+        std::fprintf(f, ";;%-6s %-8s %-8s %-12s %-12s %s\n", "V1", "V2", "V3",
+                     "MANNINGS_N", "INIT_DEPTH", "TAG");
+    else
+        std::fprintf(f, ";;%-6s %-8s %-8s %-12s %s\n", "V1", "V2", "V3",
+                     "MANNINGS_N", "TAG");
     for (int t = 0; t < nt; ++t) {
         std::fprintf(f, "%-8d %-8d %-8d %-12.6g", mesh.tri_v0[t],
                      mesh.tri_v1[t], mesh.tri_v2[t], mesh.mannings_n[t]);
+        if (write_depth_col)
+            std::fprintf(f, " %-12.6g", mesh.tri_init_depth[t]);
         if (!mesh.tri_tag[t].empty())
             std::fprintf(f, " %s", mesh.tri_tag[t].c_str());
         std::fprintf(f, "\n");
+    }
+
+    // ---- [2D_INITIAL_VELOCITY] ------------------------------------------------
+    // Sparse: only triangles with a nonzero initial velocity get a row.
+    // Emitted after [2D_TRIANGLES] — rows validate against loaded triangles.
+    {
+        bool any_uv = false;
+        for (int t = 0; t < nt && !any_uv; ++t)
+            any_uv = mesh.tri_init_u[t] != 0.0 || mesh.tri_init_v[t] != 0.0;
+        if (any_uv) {
+            sec(f, "2D_INITIAL_VELOCITY");
+            std::fprintf(f, ";;%-6s %-12s %s\n", "TRI", "U", "V");
+            for (int t = 0; t < nt; ++t) {
+                if (mesh.tri_init_u[t] == 0.0 && mesh.tri_init_v[t] == 0.0)
+                    continue;
+                std::fprintf(f, "%-8d %-12.6g %.6g\n", t, mesh.tri_init_u[t],
+                             mesh.tri_init_v[t]);
+            }
+        }
     }
 
     // Coupled-node name: prefer the authored name, fall back to the
@@ -555,7 +631,7 @@ int writeInpFile(const SimulationContext& ctx_internal,
 
     static const char* sFlowUnits[]  = {"CFS","GPM","MGD","CMS","LPS","MLD"};
     static const char* sInfilt[]     = {"HORTON","MODIFIED_HORTON","GREEN_AMPT","MODIFIED_GREEN_AMPT","CURVE_NUMBER"};
-    static const char* sRouting[]    = {"STEADY","KINWAVE","DYNWAVE"};
+    static const char* sRouting[]    = {"STEADY","KINWAVE","DYNWAVE","FV"};
     static const char* sInertial[]   = {"NONE","PARTIAL","FULL"};
     static const char* sNormFlow[]   = {"SLOPE","FROUDE","BOTH","NEITHER"};
     static const char* sSurcharge[]  = {"EXTRAN","SLOT","DYNAMIC_SLOT"};
@@ -571,7 +647,7 @@ int writeInpFile(const SimulationContext& ctx_internal,
     // --- Group 1: Core process options (FLOW_UNITS .. SKIP_STEADY_STATE) ---
     std::fprintf(f,"%-20s %s\n",  "FLOW_UNITS",       (fu>=0&&fu<=5)?sFlowUnits[fu]:"CFS");
     std::fprintf(f,"%-20s %s\n",  "INFILTRATION",     (inf>=0&&inf<=4)?sInfilt[inf]:"HORTON");
-    std::fprintf(f,"%-20s %s\n",  "FLOW_ROUTING",     (rm>=0&&rm<=2)?sRouting[rm]:"DYNWAVE");
+    std::fprintf(f,"%-20s %s\n",  "FLOW_ROUTING",     (rm>=0&&rm<=3)?sRouting[rm]:"DYNWAVE");
     std::fprintf(f,"%-20s %s\n",  "LINK_OFFSETS",     o.link_offsets==1?"ELEVATION":"DEPTH");
     std::fprintf(f,"%-20s %g\n",  "MIN_SLOPE",        o.min_slope);
     std::fprintf(f,"%-20s %s\n",  "ALLOW_PONDING",    o.allow_ponding?"YES":"NO");
@@ -651,6 +727,52 @@ int writeInpFile(const SimulationContext& ctx_internal,
         std::fprintf(f,"%-20s %s\n",  "NODE_CONTINUITY","SEMI_IMPLICIT");
     if (o.anderson_accel)
         std::fprintf(f,"%-20s %s\n",  "ANDERSON_ACCEL", "YES");
+    // VIRTUAL_JUNCTION_MOMENTUM is not emitted: FULL is retired (see
+    // SimulationOptions.hpp) and virtual_junction_momentum is now always 0,
+    // so writing the key could only ever re-emit the retired value.
+
+    // Explicit finite-volume solver knobs. Emitted only under FLOW_ROUTING FV
+    // so a DW model's [OPTIONS] block stays legacy-clean; the keys are inert
+    // under other routing models, so a round-trip that changes FLOW_ROUTING
+    // does not lose a user's FV configuration mid-session — it is simply not
+    // written until FV is selected again.
+    if (o.routing_model == RoutingModel::FV) {
+        static const char* sRiemann[] = {"HLL","HLLC"};
+        static const char* sLimiter[] = {"MINMOD","VANLEER","SUPERBEE"};
+        static const char* sScalar[]  = {"UPWIND","MUSCL","QUICKEST_ULTIMATE"};
+        static const char* sTime[]    = {"EULER","RK2"};
+        static const char* sBackend[] = {"CPU","AUTO","OMP","CUDA","HIP","SYCL"};
+        const auto& fvo = o.fv;
+        std::fprintf(f,"%-20s %g\n", "FV_CELL_LENGTH",  fvo.cell_length);
+        std::fprintf(f,"%-20s %d\n", "FV_MIN_CELLS",    fvo.min_cells);
+        std::fprintf(f,"%-20s %g\n", "FV_CFL",          fvo.cfl);
+        std::fprintf(f,"%-20s %s\n", "FV_RIEMANN",      sRiemann[static_cast<int>(fvo.riemann)]);
+        std::fprintf(f,"%-20s %d\n", "FV_ORDER",        fvo.order);
+        std::fprintf(f,"%-20s %s\n", "FV_LIMITER",      sLimiter[static_cast<int>(fvo.limiter)]);
+        std::fprintf(f,"%-20s %s\n", "FV_SCALAR_SCHEME",sScalar[static_cast<int>(fvo.scalar_scheme)]);
+        std::fprintf(f,"%-20s %s\n", "FV_TIME_INTEGRATION",
+                     sTime[static_cast<int>(fvo.time_integration)]);
+        std::fprintf(f,"%-20s %g\n", "FV_SLOT_CELERITY", fvo.slot_celerity);
+        if (fvo.dispersion > 0.0)
+            std::fprintf(f,"%-20s %g\n", "FV_DISPERSION", fvo.dispersion);
+        if (fvo.structure_coupling != fv::StructureCoupling::SUBSTEP)
+            std::fprintf(f,"%-20s %s\n", "FV_STRUCTURE_COUPLING", "ROUTING_STEP");
+        if (fvo.node_coupling != fv::NodeCoupling::SEMI_IMPLICIT)
+            std::fprintf(f,"%-20s %s\n", "FV_NODE_COUPLING", "EXPLICIT");
+        if (fvo.node_dt_limit != fv::NodeDtLimit::STABILITY)
+            std::fprintf(f,"%-20s %s\n", "FV_NODE_DT", "NONE");
+        if (fvo.node_picard_sweeps != 1)
+            std::fprintf(f,"%-20s %d\n", "FV_NODE_PICARD", fvo.node_picard_sweeps);
+        if (!fvo.compaction)
+            std::fprintf(f,"%-20s %s\n", "FV_COMPACTION", "NO");
+        std::fprintf(f,"%-20s %s\n", "FV_BACKEND",      sBackend[static_cast<int>(fvo.backend)]);
+        std::fprintf(f,"%-20s %ld\n","FV_MIN_PARALLEL_CELLS", fvo.min_parallel_cells);
+        if (!fvo.lts)
+            std::fprintf(f,"%-20s %s\n", "FV_LTS", "NO");
+        std::fprintf(f,"%-20s %d\n", "FV_LTS_MAX_TIERS", fvo.lts_max_tiers);
+        if (fvo.cfl_census_interval != 1)
+            std::fprintf(f,"%-20s %d\n","FV_CFL_CENSUS_INTERVAL", fvo.cfl_census_interval);
+    }
     if (!o.crs.empty())
         std::fprintf(f,"%-20s %s\n",  "CRS",            o.crs.c_str());
     if (o.write_absolute_paths)
@@ -1096,12 +1218,33 @@ int writeInpFile(const SimulationContext& ctx_internal,
     }
 
     // [JUNCTIONS]
-    if(hasNT(ctx,NodeType::JUNCTION)){sec(f,"JUNCTIONS");
+    if(hasRegularJunction(ctx)){sec(f,"JUNCTIONS");
     std::fprintf(f,";;%-16s %-12s %-12s %-12s %-12s %-12s\n","Name","Elev","MaxDepth","InitDepth","SurDepth","Aponded");
     std::fprintf(f,";;%-16s %-12s %-12s %-12s %-12s %-12s\n","----------------","------------","------------","------------","------------","------------");
-    for(int j=0;j<ctx.n_nodes();++j){auto u=static_cast<size_t>(j);if(ctx.nodes.type[u]!=NodeType::JUNCTION)continue;
+    for(int j=0;j<ctx.n_nodes();++j){auto u=static_cast<size_t>(j);if(ctx.nodes.type[u]!=NodeType::JUNCTION||isVirtualNode(ctx,u))continue;
     write_obj_comment(f, ctx.nodes.comments, u);
     std::fprintf(f,"%-16s %12.4f %12.4f %12.4f %12.4f %12.4f\n",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u],ctx.nodes.full_depth[u],ctx.nodes.init_depth[u],ctx.nodes.sur_depth[u],ctx.nodes.ponded_area[u]);
+    }}
+
+    // [VIRTUAL_JUNCTIONS] — name + invert elevation, plus an optional MaxDepth
+    // that is used ONLY to draw the ground surface. All solver geometry is
+    // derived from the attached conduits at load time (refactored engine only).
+    if(hasVirtualJunction(ctx)){sec(f,"VIRTUAL_JUNCTIONS");
+    const bool anyRim = hasVirtualJunctionRim(ctx);
+    if(anyRim){
+        std::fprintf(f,";;%-16s %-12s %-12s\n","Name","Elev","MaxDepth");
+        std::fprintf(f,";;%-16s %-12s %-12s\n","----------------","------------","------------");
+    } else {
+        std::fprintf(f,";;%-16s %-12s\n","Name","Elev");
+        std::fprintf(f,";;%-16s %-12s\n","----------------","------------");
+    }
+    for(int j=0;j<ctx.n_nodes();++j){auto u=static_cast<size_t>(j);if(!isVirtualNode(ctx,u))continue;
+    write_obj_comment(f, ctx.nodes.comments, u);
+    const double rim = (u<ctx.nodes.rim_depth.size()) ? ctx.nodes.rim_depth[u] : 0.0;
+    if(rim>0.0)
+        std::fprintf(f,"%-16s %12.4f %12.4f\n",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u],rim);
+    else
+        std::fprintf(f,"%-16s %12.4f\n",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u]);
     }}
 
     // [OUTFALLS]
@@ -1128,7 +1271,7 @@ int writeInpFile(const SimulationContext& ctx_internal,
     } else if(otype==OutfallType::TIDAL||otype==OutfallType::TIMESERIES){
         const int t = static_cast<int>(oparam);
         if(t>=0 && t<static_cast<int>(ctx.tables.tables.size()))
-            std::snprintf(stage,sizeof(stage),"%s",ctx.table_names.name_of(t).c_str());
+            std::snprintf(stage,sizeof(stage),"%s",ctx.tables[t].id.c_str());
     }
 
     std::fprintf(f,"%-16s %12.4f %-12s",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u],ofName(otype));
@@ -1177,8 +1320,8 @@ int writeInpFile(const SimulationContext& ctx_internal,
         std::string cnStr;
         int ci = (drow>=0) ? D.curve[static_cast<size_t>(drow)]
                            : -1;
-        if(ci >= 0 && ci < ctx.table_names.size()) {
-            cnStr = ctx.table_names.name_of(ci); curveName = cnStr.c_str();
+        if(ci >= 0 && ci < ctx.n_tables()) {
+            cnStr = ctx.tables[ci].id; curveName = cnStr.c_str();
         } else if(drow>=0 && !D.curve_name[static_cast<size_t>(drow)].empty()) {
             curveName = D.curve_name[static_cast<size_t>(drow)].c_str();
         }
@@ -1486,6 +1629,28 @@ int writeInpFile(const SimulationContext& ctx_internal,
         ctx.landuses.sweep_interval[u],ctx.landuses.sweep_removal[u],ctx.landuses.last_swept[u]);
     }}
 
+    // [COVERAGES] — percent of each subcatchment covered by each land use
+    // (stored verbatim in percent, matching handle_coverages). Zero rows
+    // are skipped: absent coverage rows parse back to 0.
+    if(ctx.subcatches.coverage_n_landuses>0&&ctx.n_subcatches()>0){
+    const int nLu=ctx.subcatches.coverage_n_landuses;
+    bool any=false;
+    for(std::size_t i=0;i<ctx.subcatches.coverage.size()&&!any;++i)
+        if(ctx.subcatches.coverage[i]!=0.0)any=true;
+    if(any){sec(f,"COVERAGES");
+    std::fprintf(f,";;%-16s %-16s %-10s\n","Subcatchment","LandUse","Percent");
+    std::fprintf(f,";;%-16s %-16s %-10s\n","----------------","----------------","----------");
+    for(int s=0;s<ctx.n_subcatches();++s){
+    for(int lu=0;lu<nLu;++lu){
+    auto idx=static_cast<size_t>(s)*static_cast<size_t>(nLu)+static_cast<size_t>(lu);
+    if(idx>=ctx.subcatches.coverage.size())break;
+    const double pct=ctx.subcatches.coverage[idx];
+    if(pct==0.0)continue;
+    std::fprintf(f,"%-16s %-16s %10.4f\n",
+        ctx.subcatch_names.name_of(s).c_str(),
+        ctx.landuse_names.name_of(lu).c_str(),pct);
+    }}}}
+
     // [BUILDUP]
     if(ctx.buildup.n_landuses>0&&ctx.buildup.n_pollutants>0){sec(f,"BUILDUP");
     std::fprintf(f,";;%-16s %-16s %-10s %-10s %-10s %-10s %-8s\n","LandUse","Pollutant","FuncType","Coeff1","Coeff2","Coeff3","PerUnit");
@@ -1519,6 +1684,27 @@ int writeInpFile(const SimulationContext& ctx_internal,
         ctx.washoff.coeff[idx],ctx.washoff.expon[idx],
         ctx.washoff.sweep_effic[idx],ctx.washoff.bmp_effic[idx]);
     }}}
+
+    // [LOADINGS] — initial pollutant buildup per subcatchment (stored in
+    // ctx.subcatches.conc by handle_loadings; see also the object-deletion
+    // re-pack tests). Zero rows are skipped: absent rows parse back to 0.
+    if(ctx.subcatches.conc_n_pollutants>0&&ctx.n_subcatches()>0&&ctx.n_pollutants()>0){
+    const int np=ctx.subcatches.conc_n_pollutants;
+    bool any=false;
+    for(std::size_t i=0;i<ctx.subcatches.conc.size()&&!any;++i)
+        if(ctx.subcatches.conc[i]!=0.0)any=true;
+    if(any){sec(f,"LOADINGS");
+    std::fprintf(f,";;%-16s %-16s %-10s\n","Subcatchment","Pollutant","Buildup");
+    std::fprintf(f,";;%-16s %-16s %-10s\n","----------------","----------------","----------");
+    for(int s=0;s<ctx.n_subcatches();++s){
+    for(int p=0;p<np&&p<ctx.n_pollutants();++p){
+    auto idx=static_cast<size_t>(s)*static_cast<size_t>(np)+static_cast<size_t>(p);
+    if(idx>=ctx.subcatches.conc.size())break;
+    const double w=ctx.subcatches.conc[idx];
+    if(w==0.0)continue;
+    std::fprintf(f,"%-16s %-16s %10.4f\n",
+        ctx.subcatch_names.name_of(s).c_str(),pN(ctx,p),w);
+    }}}}
 
     // [TREATMENT]
     if(ctx.treatment.hasAny()){sec(f,"TREATMENT");

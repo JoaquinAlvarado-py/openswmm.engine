@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file Controls.hpp
  * @brief Rule-based control engine — full legacy parity.
@@ -15,7 +31,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_CONTROLS_HPP
@@ -25,6 +41,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include "../core/StringCase.hpp"
 #include "../math/MathExpr.hpp"
 
 namespace openswmm {
@@ -282,7 +299,8 @@ private:
     std::vector<PIDState>    pid_states_;
     std::vector<NamedVariable> named_vars_;
     std::vector<mathexpr::Expression> expressions_;
-    std::unordered_map<std::string, int> expr_index_;
+    /// EXPRESSION name → index; case-insensitive (legacy-parity name match)
+    std::unordered_map<std::string, int, CiHash, CiEqual> expr_index_;
     ParseError               last_parse_error_;  ///< Set on parseRuleText() reject
 
     // SoA premise groups (one per variable type that has premises)

@@ -1,10 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Caleb Buahin
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Model Editing — Object Deletion and Type Conversion
 ======================================================
 
 :author: Caleb Buahin
 :copyright: Copyright (c) 2026 Caleb Buahin
-:license: MIT
+:license: Apache-2.0
 
 Type stubs for :mod:`openswmm.engine._edit`.
 """
@@ -409,6 +425,56 @@ class ModelEditor:
         @raise KeyError: If C{id_or_idx} is a name and the link is not found.
         @raise EngineError: On C API failure.
         @see: L{openswmm.engine.LinkType}
+        """
+        ...
+
+    # =========================================================================
+    # Virtual junctions — split / fuse / flag (refactored engine only)
+    # =========================================================================
+
+    def set_node_virtual(self, id_or_idx: int | str, make_virtual: bool = True) -> None:
+        """Set or clear a node's virtual-junction flag (validated).
+
+        @param id_or_idx: Node name or zero-based index.
+        @type id_or_idx: int or str
+        @param make_virtual: C{True} to set, C{False} to clear.
+        @type make_virtual: bool
+        @raise KeyError: If C{id_or_idx} is a name and the node is not found.
+        @raise EngineError: On a violated usage rule or C API failure.
+        """
+        ...
+
+    def split_conduit(self, id_or_idx: int | str, t: float, new_node_name: str,
+                      new_link_name: str, make_virtual: bool = False) -> tuple[int, int]:
+        """Split a conduit at normalized position C{t}, inserting a new node.
+
+        @param id_or_idx: Conduit name or zero-based index.
+        @type id_or_idx: int or str
+        @param t: Normalized split position, exclusive (0, 1).
+        @type t: float
+        @param new_node_name: Unique name for the inserted node.
+        @type new_node_name: str
+        @param new_link_name: Unique name for the new downstream conduit.
+        @type new_link_name: str
+        @param make_virtual: Flag the inserted node as a virtual junction.
+        @type make_virtual: bool
+        @return: C{(new_node_index, new_link_index)}.
+        @rtype: tuple[int, int]
+        @raise KeyError: If C{id_or_idx} is a name and the link is not found.
+        @raise EngineError: On invalid parameters or a rule failure.
+        """
+        ...
+
+    def fuse_virtual_junction(self, id_or_idx: int | str) -> int:
+        """Re-fuse the two conduits of a virtual junction into one.
+
+        @param id_or_idx: Node name or zero-based index.
+        @type id_or_idx: int or str
+        @return: Index of the surviving conduit AFTER deletions renumber.
+        @rtype: int
+        @raise KeyError: If C{id_or_idx} is a name and the node is not found.
+        @raise EngineError: If the node is not a two-conduit through virtual
+            junction, or on C API failure.
         """
         ...
 

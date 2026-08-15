@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file RDII.cpp
  * @brief RDII unit hydrograph convolution — matching legacy rdii.c.
@@ -5,7 +21,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "RDII.hpp"
@@ -241,7 +257,9 @@ void RDIISolver::init(SimulationContext& ctx) {
 
     // Build UH name → gage index mapping from parsed [HYDROGRAPHS] gage lines.
     // Legacy: each UnitHyd[j] has a rainGage field set during parsing.
-    std::unordered_map<std::string, int> uh_gage_map;
+    // Case-insensitive so gage-assignment lines match UH groups spelled in a
+    // different case (legacy hash.c parity).
+    std::unordered_map<std::string, int, CiHash, CiEqual> uh_gage_map;
     for (size_t gi = 0; gi < ctx.unit_hyds.gage_assignments.size(); ++gi) {
         const auto& uh_name = ctx.unit_hyds.gage_assignments[gi];
         const auto& gage_name = ctx.unit_hyds.gage_names[gi];

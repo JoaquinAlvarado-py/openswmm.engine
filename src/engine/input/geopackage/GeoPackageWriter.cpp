@@ -304,8 +304,9 @@ static void write_nodes(sqlite3* db, const SimulationContext& ctx,
     // node_id); the base row is inserted first each iteration so the FK resolves.
     auto stmt = prepare(db,
         "INSERT INTO nodes (simulation_id, node_id, node_type, geom, "
-        "invert_elev, max_depth, init_depth, surcharge_depth, ponded_area, tag) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)");
+        "invert_elev, max_depth, init_depth, surcharge_depth, ponded_area, tag, "
+        "is_virtual, rim_depth) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
     auto st_stmt = prepare(db,
         "INSERT INTO storages (simulation_id, node_id, curve_name, shape, a, b, c, "
         "p1, p2, p3, seep_rate, evap_frac, exfil_suction, exfil_ksat, exfil_imd) "
@@ -352,6 +353,13 @@ static void write_nodes(sqlite3* db, const SimulationContext& ctx,
             bind_text(stmt.get(), 10, ctx.nodes.tags[utag]);
         else
             bind_null(stmt.get(), 10);
+
+        // Virtual-junction flag + its rendering-only rim depth. node_type says
+        // JUNCTION for both kinds, so without these two the round-trip loses
+        // the virtual junction entirely.
+        bind_int(stmt.get(), 11,
+                 (utag < ctx.nodes.is_virtual.size() && ctx.nodes.is_virtual[utag]) ? 1 : 0);
+        bind_double(stmt.get(), 12, safe_dbl(ctx.nodes.rim_depth, i));
 
         sqlite3_step(stmt.get());
 
@@ -693,8 +701,8 @@ static void write_rain_gages(sqlite3* db, const SimulationContext& ctx,
         bind_int(stmt.get(), 7, static_cast<int>(safe_get(ctx.gages.source, (size_t)i, RainSource::TIMESERIES)));
 
         int ts = safe_int(ctx.gages.ts_index, i);
-        if (ts >= 0 && ts < ctx.table_names.size())
-            bind_text(stmt.get(), 8, ctx.table_names.name_of(ts));
+        if (ts >= 0 && ts < ctx.n_tables())
+            bind_text(stmt.get(), 8, ctx.tables[ts].id);
         else
             bind_null(stmt.get(), 8);
 
@@ -764,13 +772,12 @@ static void write_curves(sqlite3* db, const SimulationContext& ctx,
         "INSERT INTO curves (simulation_id, curve_id, curve_type, x_value, y_value, ordinal) "
         "VALUES (?,?,?,?,?,?)");
 
-    int n = ctx.table_names.size();
+    int n = ctx.n_tables();
     for (int i = 0; i < n; ++i) {
-        if (i >= (int)ctx.tables.count()) break;
         const auto& tbl = ctx.tables[i];
         if (tbl.type == TableType::TIMESERIES) continue;
 
-        const auto& name = ctx.table_names.name_of(i);
+        const auto& name = tbl.id;
         std::string ctype = std::to_string(static_cast<int>(tbl.type));
 
         for (int j = 0; j < (int)tbl.x.size(); ++j) {
@@ -793,13 +800,12 @@ static void write_timeseries(sqlite3* db, const SimulationContext& ctx,
         "INSERT INTO input_timeseries (simulation_id, series_id, timestamp, value, ordinal) "
         "VALUES (?,?,?,?,?)");
 
-    int n = ctx.table_names.size();
+    int n = ctx.n_tables();
     for (int i = 0; i < n; ++i) {
-        if (i >= (int)ctx.tables.count()) break;
         const auto& tbl = ctx.tables[i];
         if (tbl.type != TableType::TIMESERIES) continue;
 
-        const auto& name = ctx.table_names.name_of(i);
+        const auto& name = tbl.id;
 
         for (int j = 0; j < (int)tbl.x.size(); ++j) {
             sqlite3_reset(stmt.get());
@@ -992,7 +998,7 @@ static void write_adjustments(sqlite3* db, const SimulationContext& ctx,
                 bind_text(stmt.get(), 1, sim_id);
                 bind_text(stmt.get(), 2, ctx.subcatch_names.name_of(static_cast<int>(i)));
                 bind_text(stmt.get(), 3, atype);
-                bind_text(stmt.get(), 4, ctx.table_names.name_of(pats[i]));
+                bind_text(stmt.get(), 4, ctx.tables[pats[i]].id);
                 sqlite3_step(stmt.get());
             }
         };
@@ -1005,10 +1011,12 @@ static void write_adjustments(sqlite3* db, const SimulationContext& ctx,
 
 static void write_pollutants(sqlite3* db, const SimulationContext& ctx,
                              const std::string& sim_id) {
+    // ii_conc/dwf_conc/init_conc (iteration 4): the previously-dropped
+    // Crdii/Cdwf/Cinit fields now round-trip.
     auto stmt = prepare(db,
         "INSERT INTO pollutants (simulation_id, pollutant_id, units, rain_conc, gw_conc, "
-        "decay_coeff, snow_only, co_pollutant, co_fraction) "
-        "VALUES (?,?,?,?,?,?,?,?,?)");
+        "decay_coeff, snow_only, co_pollutant, co_fraction, ii_conc, dwf_conc, init_conc) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
 
     int n = ctx.pollutant_names.size();
     for (int i = 0; i < n; ++i) {
@@ -1027,7 +1035,143 @@ static void write_pollutants(sqlite3* db, const SimulationContext& ctx,
         else
             bind_null(stmt.get(), 8);
         bind_double(stmt.get(), 9, safe_dbl(ctx.pollutants.co_frac, i));
+        bind_double(stmt.get(), 10, safe_dbl(ctx.pollutants.c_rdii, i));
+        bind_double(stmt.get(), 11, safe_dbl(ctx.pollutants.c_dwf, i));
+        bind_double(stmt.get(), 12, safe_dbl(ctx.pollutants.init_conc, i));
         sqlite3_step(stmt.get());
+    }
+}
+
+// Iteration 4 — quality tables: landuses / buildup / washoff / coverages /
+// loadings (previously .gpkg-lossy; see the matching handlers in
+// QualityHandler.cpp for the .inp-side conventions).
+
+static void write_landuses(sqlite3* db, const SimulationContext& ctx,
+                           const std::string& sim_id) {
+    if (ctx.n_landuses() <= 0) return;
+    auto stmt = prepare(db,
+        "INSERT INTO landuses (simulation_id, landuse_id, sweep_interval, "
+        "sweep_removal, last_swept, comment) VALUES (?,?,?,?,?,?)");
+    for (int j = 0; j < ctx.n_landuses(); ++j) {
+        auto u = static_cast<size_t>(j);
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        bind_text(stmt.get(), 1, sim_id);
+        bind_text(stmt.get(), 2, ctx.landuse_names.name_of(j));
+        bind_double(stmt.get(), 3, safe_dbl(ctx.landuses.sweep_interval, u));
+        bind_double(stmt.get(), 4, safe_dbl(ctx.landuses.sweep_removal, u));
+        bind_double(stmt.get(), 5, safe_dbl(ctx.landuses.last_swept, u));
+        const std::string comment =
+            (u < ctx.landuses.comments.size()) ? ctx.landuses.comments[u]
+                                               : std::string{};
+        if (comment.empty()) bind_null(stmt.get(), 6);
+        else                 bind_text(stmt.get(), 6, comment);
+        sqlite3_step(stmt.get());
+    }
+}
+
+static void write_buildup_washoff(sqlite3* db, const SimulationContext& ctx,
+                                  const std::string& sim_id) {
+    if (ctx.buildup.n_landuses > 0 && ctx.buildup.n_pollutants > 0) {
+        static const char* buNames[] = {"NONE", "POW", "EXP", "SAT", "EXT"};
+        auto stmt = prepare(db,
+            "INSERT INTO buildup (simulation_id, landuse_id, pollutant_id, "
+            "func_type, coeff1, coeff2, coeff3, normalizer) VALUES (?,?,?,?,?,?,?,?)");
+        for (int lu = 0; lu < ctx.buildup.n_landuses; ++lu) {
+            for (int p = 0; p < ctx.buildup.n_pollutants; ++p) {
+                auto idx = static_cast<size_t>(lu * ctx.buildup.n_pollutants + p);
+                const int ft = safe_int(ctx.buildup.func_type, idx);
+                if (ft == 0) continue;
+                sqlite3_reset(stmt.get());
+                sqlite3_clear_bindings(stmt.get());
+                bind_text(stmt.get(), 1, sim_id);
+                bind_text(stmt.get(), 2, ctx.landuse_names.name_of(lu));
+                bind_text(stmt.get(), 3, ctx.pollutant_names.name_of(p));
+                bind_text(stmt.get(), 4, (ft >= 0 && ft <= 4) ? buNames[ft] : "NONE");
+                bind_double(stmt.get(), 5, safe_dbl(ctx.buildup.coeff1, idx));
+                bind_double(stmt.get(), 6, safe_dbl(ctx.buildup.coeff2, idx));
+                bind_double(stmt.get(), 7, safe_dbl(ctx.buildup.coeff3, idx));
+                bind_text(stmt.get(), 8,
+                           safe_int(ctx.buildup.normalizer, idx) == 0 ? "AREA" : "CURB");
+                sqlite3_step(stmt.get());
+            }
+        }
+    }
+    if (ctx.washoff.n_landuses > 0 && ctx.washoff.n_pollutants > 0) {
+        static const char* woNames[] = {"NONE", "EXP", "RC", "EMC"};
+        auto stmt = prepare(db,
+            "INSERT INTO washoff (simulation_id, landuse_id, pollutant_id, "
+            "func_type, coeff, expon, sweep_effic, bmp_effic) VALUES (?,?,?,?,?,?,?,?)");
+        for (int lu = 0; lu < ctx.washoff.n_landuses; ++lu) {
+            for (int p = 0; p < ctx.washoff.n_pollutants; ++p) {
+                auto idx = static_cast<size_t>(lu * ctx.washoff.n_pollutants + p);
+                const int ft = safe_int(ctx.washoff.func_type, idx);
+                if (ft == 0) continue;
+                sqlite3_reset(stmt.get());
+                sqlite3_clear_bindings(stmt.get());
+                bind_text(stmt.get(), 1, sim_id);
+                bind_text(stmt.get(), 2, ctx.landuse_names.name_of(lu));
+                bind_text(stmt.get(), 3, ctx.pollutant_names.name_of(p));
+                bind_text(stmt.get(), 4, (ft >= 0 && ft <= 3) ? woNames[ft] : "NONE");
+                bind_double(stmt.get(), 5, safe_dbl(ctx.washoff.coeff, idx));
+                bind_double(stmt.get(), 6, safe_dbl(ctx.washoff.expon, idx));
+                bind_double(stmt.get(), 7, safe_dbl(ctx.washoff.sweep_effic, idx));
+                bind_double(stmt.get(), 8, safe_dbl(ctx.washoff.bmp_effic, idx));
+                sqlite3_step(stmt.get());
+            }
+        }
+    }
+}
+
+static void write_subcatch_coverages(sqlite3* db, const SimulationContext& ctx,
+                                     const std::string& sim_id) {
+    const int nLu = ctx.subcatches.coverage_n_landuses;
+    if (nLu <= 0 || ctx.n_subcatches() <= 0) return;
+    auto stmt = prepare(db,
+        "INSERT INTO subcatch_coverages (simulation_id, subcatch_id, "
+        "landuse_id, percent, last_swept) VALUES (?,?,?,?,?)");
+    for (int s = 0; s < ctx.n_subcatches(); ++s) {
+        for (int lu = 0; lu < nLu; ++lu) {
+            auto idx = static_cast<size_t>(s) * static_cast<size_t>(nLu)
+                       + static_cast<size_t>(lu);
+            if (idx >= ctx.subcatches.coverage.size()) break;
+            const double pct = ctx.subcatches.coverage[idx];
+            if (pct == 0.0) continue;
+            sqlite3_reset(stmt.get());
+            sqlite3_clear_bindings(stmt.get());
+            bind_text(stmt.get(), 1, sim_id);
+            bind_text(stmt.get(), 2, ctx.subcatch_names.name_of(s));
+            bind_text(stmt.get(), 3, ctx.landuse_names.name_of(lu));
+            bind_double(stmt.get(), 4, pct);
+            bind_double(stmt.get(), 5,
+                        safe_dbl(ctx.subcatches.sweep_last_swept, idx));
+            sqlite3_step(stmt.get());
+        }
+    }
+}
+
+static void write_subcatch_loadings(sqlite3* db, const SimulationContext& ctx,
+                                    const std::string& sim_id) {
+    const int np = ctx.subcatches.conc_n_pollutants;
+    if (np <= 0 || ctx.n_subcatches() <= 0 || ctx.n_pollutants() <= 0) return;
+    auto stmt = prepare(db,
+        "INSERT INTO subcatch_loadings (simulation_id, subcatch_id, "
+        "pollutant_id, init_buildup) VALUES (?,?,?,?)");
+    for (int s = 0; s < ctx.n_subcatches(); ++s) {
+        for (int p = 0; p < np && p < ctx.n_pollutants(); ++p) {
+            auto idx = static_cast<size_t>(s) * static_cast<size_t>(np)
+                       + static_cast<size_t>(p);
+            if (idx >= ctx.subcatches.conc.size()) break;
+            const double w = ctx.subcatches.conc[idx];
+            if (w == 0.0) continue;
+            sqlite3_reset(stmt.get());
+            sqlite3_clear_bindings(stmt.get());
+            bind_text(stmt.get(), 1, sim_id);
+            bind_text(stmt.get(), 2, ctx.subcatch_names.name_of(s));
+            bind_text(stmt.get(), 3, ctx.pollutant_names.name_of(p));
+            bind_double(stmt.get(), 4, w);
+            sqlite3_step(stmt.get());
+        }
     }
 }
 
@@ -1485,6 +1629,7 @@ static void write_options_2d(sqlite3* db, const SimulationContext& ctx,
     insert("2D_H_MOVE",            fmt_g17(o.h_move));
     insert("2D_LTS_TIERS",         std::to_string(o.lts_tiers));
     insert("2D_FROUDE_MAX",        fmt_g17(o.froude_max));
+    insert("2D_ADVECTION",         o.advection ? "YES" : "NO");
     insert("2D_COUPLING_AREA",     o.coupling_area_auto ? "AUTO" : "DEFAULT");
     insert("2D_REPORT_2D",         o.report_2d ? "YES" : "NO");
     // HDF5 results path — 2D outputs always go to HDF5, never gpkg tables.
@@ -1572,8 +1717,8 @@ static void write_mesh_2d(sqlite3* db, const SimulationContext& ctx,
         auto stmt = prepare(db,
             "INSERT INTO mesh_2d_triangles "
             "(simulation_id, tri_idx, geom, v0, v1, v2, mannings_n, tag, "
-            "bed_elev, coupled_node) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)");
+            "bed_elev, coupled_node, init_depth) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)");
         std::vector<double> xs(3), ys(3);
         for (int t = 0; t < nt; ++t) {
             sqlite3_reset(stmt.get());
@@ -1605,6 +1750,7 @@ static void write_mesh_2d(sqlite3* db, const SimulationContext& ctx,
                                                  mesh.tri_coupled_node[t]);
             if (!cn.empty()) bind_text(stmt.get(), 10, cn);
             else             bind_null(stmt.get(), 10);
+            bind_double(stmt.get(), 11, mesh.tri_init_depth[t]);
             step_or_throw(db, stmt.get(), "mesh_2d_triangles insert failed");
         }
     }
@@ -1786,6 +1932,11 @@ void write_model(sqlite3* db, const SimulationContext& ctx,
     write_curves(db, ctx, simulation_id);
     write_timeseries(db, ctx, simulation_id);
     write_pollutants(db, ctx, simulation_id);
+    // Iteration 4 — quality tables (previously .gpkg-lossy).
+    write_landuses(db, ctx, simulation_id);
+    write_buildup_washoff(db, ctx, simulation_id);
+    write_subcatch_coverages(db, ctx, simulation_id);
+    write_subcatch_loadings(db, ctx, simulation_id);
     write_patterns(db, ctx, simulation_id);
     write_evaporation(db, ctx, simulation_id);
     write_climate_settings(db, ctx, simulation_id);

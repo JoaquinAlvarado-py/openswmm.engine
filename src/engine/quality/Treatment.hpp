@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file Treatment.hpp
  * @brief Treatment expression evaluator for water quality.
@@ -26,7 +42,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_TREATMENT_HPP
@@ -132,6 +148,24 @@ int parse(const std::string& expr_str, TreatExpr& result);
  */
 int parse(const std::string& expr_str, TreatExpr& result,
           int (*pollut_lookup)(const std::string& name));
+
+/**
+ * @brief Validate a treatment expression without touching engine state.
+ *
+ * @details Diagnostic peer of parse() for editors: same grammar, but
+ *          reports a human-readable message and character position on
+ *          failure. Stricter than parse() in one deliberate way — unknown
+ *          characters are an error here, where the tokenizer silently
+ *          skips them. Ends with a parse() cross-check so the verdict can
+ *          never drift ahead of what the engine accepts.
+ *
+ * @param expr_str  Full expression string ("R = ..." / "C = ...").
+ * @param[out] msg  Failure diagnostic (empty on success).
+ * @param[out] col  0-based character offset of the error, or -1 when the
+ *                  position is not attributable.
+ * @returns 0 when valid, -1 otherwise.
+ */
+int validate(const std::string& expr_str, std::string& msg, int& col);
 
 /**
  * @brief Evaluate a treatment expression with given variable values.

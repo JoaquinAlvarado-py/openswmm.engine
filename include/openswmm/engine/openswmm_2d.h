@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_2d.h
  * @brief Optional 2D surface routing module — C API.
@@ -16,7 +32,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_2D_H
@@ -143,6 +159,38 @@ SWMM_ENGINE_API int swmm_2d_triangle_get_mannings(SWMM_Engine engine, int idx,
  *  @ingroup engine_2d */
 SWMM_ENGINE_API int swmm_2d_set_triangle_mannings(SWMM_Engine engine, int idx,
                                                     double n);
+
+/** @brief Get triangle initial water depth (`[2D_TRIANGLES]` INIT_DEPTH
+ *         column, default 0 = dry). Value is in MESH length units — feet on a
+ *         US-FLOW_UNITS project, metres on SI or on a mesh file that declared
+ *         `;; UNITS: SI (m)` — the same convention as the vertex Z column.
+ *         @ingroup engine_2d */
+SWMM_ENGINE_API int swmm_2d_triangle_get_init_depth(SWMM_Engine engine,
+                                                    int idx, double* d);
+
+/** @brief Set triangle initial water depth (mesh length units, >= 0;
+ *         SWMM_ERR_BADPARAM otherwise — see the getter for the unit
+ *         convention). Converted to SI and applied to the solver state when
+ *         the 2D surface initializes, and persisted in the `INIT_DEPTH` column
+ *         of `[2D_TRIANGLES]` on save (written before TAG). @ingroup engine_2d */
+SWMM_ENGINE_API int swmm_2d_set_triangle_init_depth(SWMM_Engine engine,
+                                                    int idx, double d);
+
+/** @brief Get triangle initial velocity (u, v in m/s; `[2D_INITIAL_VELOCITY]`
+ *         rows, default 0,0). @ingroup engine_2d */
+SWMM_ENGINE_API int swmm_2d_triangle_get_init_velocity(SWMM_Engine engine,
+                                                       int idx, double* u,
+                                                       double* v);
+
+/** @brief Set triangle initial velocity (u, v in m/s; finite values;
+ *         SWMM_ERR_BADPARAM otherwise). Projected onto the explicit
+ *         marcher's face normals as (h*u, h*v) when the 2D surface
+ *         initializes (t = 0 only — hotstart/reinitialize still zeroes face
+ *         momentum), and persisted as sparse `[2D_INITIAL_VELOCITY]` rows on
+ *         save. @ingroup engine_2d */
+SWMM_ENGINE_API int swmm_2d_set_triangle_init_velocity(SWMM_Engine engine,
+                                                       int idx, double u,
+                                                       double v);
 
 /** @brief Set the descriptive tag of a vertex (the `[2D_VERTICES]` TAG
  *         column). Distinct from the 1D<->2D coupling node. Empty / NULL

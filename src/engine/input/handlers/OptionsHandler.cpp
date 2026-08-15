@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file OptionsHandler.cpp
  * @brief [OPTIONS] section handler for the new engine.
@@ -55,7 +71,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "OptionsHandler.hpp"
@@ -143,6 +159,8 @@ void handle_options(SimulationContext& ctx, const std::vector<std::string>& line
                 opt.routing_model = RoutingModel::KINWAVE;
             else if (rv == "DYNWAVE"   || rv == "DYNAMIC_WAVE")
                 opt.routing_model = RoutingModel::DYNWAVE;
+            else if (rv == "FV" || rv == "FINITE_VOLUME")
+                opt.routing_model = RoutingModel::FV;
             // Legacy FLOW_ROUTING NONE maps to the NO_ROUTING method and forces
             // IgnoreRouting = TRUE (project.c:504). The refactored RoutingModel
             // enum has no NONE value, so realize the same effect by setting the
@@ -313,10 +331,141 @@ void handle_options(SimulationContext& ctx, const std::vector<std::string>& line
         } else if (key == "DPS_DECAY_TIME") {
             opt.dps_decay_time = to_double(val);
 
+        // -----------------------------------------------------------------
+        // Explicit finite-volume solver (FLOW_ROUTING FV).
+        //
+        // First-class [OPTIONS] keys rather than a separate section (plan
+        // §4.2). They are ACCEPTED AND INERT under any other routing model —
+        // no warning, just unused — so switching FLOW_ROUTING back and forth
+        // never invalidates a file. Length-dimensioned values stay in project
+        // display units here; Router::init converts, exactly as it does for
+        // HEAD_TOLERANCE.
+        // -----------------------------------------------------------------
+        } else if (key == "FV_CELL_LENGTH") {
+            opt.fv.cell_length = to_double(val);
+
+        } else if (key == "FV_MIN_CELLS") {
+            opt.fv.min_cells = std::max(1, static_cast<int>(to_double(val)));
+
+        } else if (key == "FV_CFL") {
+            opt.fv.cfl = to_double(val);
+
+        } else if (key == "FV_RIEMANN") {
+            const std::string rv2 = norm(val);
+            if      (rv2 == "HLL")  opt.fv.riemann = fv::RiemannSolver::HLL;
+            else if (rv2 == "HLLC") opt.fv.riemann = fv::RiemannSolver::HLLC;
+
+        } else if (key == "FV_ORDER") {
+            opt.fv.order = static_cast<int>(to_double(val));
+
+        } else if (key == "FV_LIMITER") {
+            const std::string lv = norm(val);
+            if      (lv == "MINMOD")   opt.fv.limiter = fv::Limiter::MINMOD;
+            else if (lv == "VANLEER")  opt.fv.limiter = fv::Limiter::VANLEER;
+            else if (lv == "SUPERBEE") opt.fv.limiter = fv::Limiter::SUPERBEE;
+
+        } else if (key == "FV_SCALAR_SCHEME") {
+            const std::string sv2 = norm(val);
+            if      (sv2 == "UPWIND") opt.fv.scalar_scheme = fv::ScalarScheme::UPWIND;
+            else if (sv2 == "MUSCL")  opt.fv.scalar_scheme = fv::ScalarScheme::MUSCL;
+            else if (sv2 == "QUICKEST_ULTIMATE" || sv2 == "QUICKEST")
+                opt.fv.scalar_scheme = fv::ScalarScheme::QUICKEST_ULTIMATE;
+
+        } else if (key == "FV_TIME_INTEGRATION") {
+            const std::string tv = norm(val);
+            if      (tv == "EULER") opt.fv.time_integration = fv::TimeIntegration::EULER;
+            else if (tv == "RK2")   opt.fv.time_integration = fv::TimeIntegration::RK2;
+
+        } else if (key == "FV_SLOT_CELERITY") {
+            opt.fv.slot_celerity = to_double(val);
+
+        } else if (key == "FV_DISPERSION") {
+            opt.fv.dispersion = to_double(val);
+
+        } else if (key == "FV_STRUCTURE_COUPLING") {
+            const std::string cv = norm(val);
+            if      (cv == "SUBSTEP")
+                opt.fv.structure_coupling = fv::StructureCoupling::SUBSTEP;
+            else if (cv == "ROUTING_STEP")
+                opt.fv.structure_coupling = fv::StructureCoupling::ROUTING_STEP;
+
+        } else if (key == "FV_NODE_COUPLING") {
+            const std::string nv = norm(val);
+            if      (nv == "EXPLICIT")
+                opt.fv.node_coupling = fv::NodeCoupling::EXPLICIT;
+            else if (nv == "SEMI_IMPLICIT")
+                opt.fv.node_coupling = fv::NodeCoupling::SEMI_IMPLICIT;
+
+        } else if (key == "FV_COMPACTION") {
+            const std::string bv = norm(val);
+            opt.fv.compaction = !(bv == "NO" || bv == "FALSE" || bv == "0" || bv == "OFF");
+
+        } else if (key == "FV_BACKEND") {
+            const std::string bv = norm(val);
+            if      (bv == "CPU")  opt.fv.backend = fv::Backend::CPU;
+            else if (bv == "AUTO") opt.fv.backend = fv::Backend::AUTO;
+            else if (bv == "OMP")  opt.fv.backend = fv::Backend::OMP;
+            else if (bv == "CUDA") opt.fv.backend = fv::Backend::CUDA;
+            else if (bv == "HIP")  opt.fv.backend = fv::Backend::HIP;
+            else if (bv == "SYCL") opt.fv.backend = fv::Backend::SYCL;
+
+        } else if (key == "FV_MIN_PARALLEL_CELLS") {
+            opt.fv.min_parallel_cells = static_cast<long>(to_double(val));
+
+        } else if (key == "FV_LTS") {
+            const std::string bv = norm(val);
+            opt.fv.lts = !(bv == "NO" || bv == "FALSE" || bv == "0" || bv == "OFF");
+
+        } else if (key == "FV_LTS_MAX_TIERS") {
+            opt.fv.lts_max_tiers = std::max(1, static_cast<int>(to_double(val)));
+
+        } else if (key == "FV_CFL_CENSUS_INTERVAL") {
+            opt.fv.cfl_census_interval = std::max(1, static_cast<int>(to_double(val)));
+
+        } else if (key == "FV_NODE_DT") {
+            const std::string nd = norm(val);
+            if      (nd == "STABILITY") opt.fv.node_dt_limit = fv::NodeDtLimit::STABILITY;
+            else if (nd == "NONE")      opt.fv.node_dt_limit = fv::NodeDtLimit::NONE;
+
+        } else if (key == "FV_NODE_PICARD") {
+            opt.fv.node_picard_sweeps = std::max(1, static_cast<int>(to_double(val)));
+
+        } else if (key == "FV_NODE_CELL_COUPLING" ||
+                   key == "FV_JUNCTION_MODEL") {
+            // Retired options, accepted and ignored so existing project files
+            // still parse: junctions are always algebraic interfaces now (the
+            // BUCKET model and the coupled-star correction were superseded by
+            // the pass-through interface treatment).
+
         } else if (key == "NODE_CONTINUITY") {
             const std::string nc = norm(val);
             if      (nc == "EXPLICIT")      opt.node_continuity = NodeContinuity::EXPLICIT;
             else if (nc == "SEMI_IMPLICIT") opt.node_continuity = NodeContinuity::SEMI_IMPLICIT;
+
+        } else if (key == "VIRTUAL_JUNCTION_MOMENTUM") {
+            // RETIRED 2026-08-14. FULL is accepted and warned for one release,
+            // then the keyword goes the way of FV_NODE_CELL_COUPLING above.
+            // It was measured to be defective, not merely inaccurate: its
+            // cross-junction term dq4j is sign-inverted with respect to the
+            // per-link convective term it supplements (at constant Q,
+            // Δ(v²A) = −v²ΔA), and it is applied to BOTH adjacent links on top
+            // of each link's own full-length dq4. On SWASHES macdonald-periodic
+            // it destroyed 224-325 % of the routed volume; negating the term
+            // restores mass conservation but still leaves l1 5.24 % against
+            // BASIC's 0.163 % and plain DW's 0.141 %, so there is no
+            // term-level correction worth keeping. Evidence:
+            // epaswmm5_qa suites/swashes plans/VJ_MOMENTUM_SCOPE.md Phase 3.
+            const std::string vm = norm(val);
+            opt.virtual_junction_momentum = 0;
+            if (vm == "FULL") {
+                ctx.warnings.push_back(
+                    "WARNING: VIRTUAL_JUNCTION_MOMENTUM FULL is retired and "
+                    "will be treated as BASIC - the cross-junction momentum "
+                    "term was not mass conserving.");
+                if (ctx.warning_code == 0) {
+                    ctx.warning_code = 101;  // SWMM_WARN_UNKNOWN_OPTION
+                }
+            }
 
         } else if (key == "ANDERSON_ACCEL") {
             const std::string av = norm(val);

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file QualityHandler.cpp
  * @brief Section handlers for [POLLUTANTS], [LANDUSES], [COVERAGES],
@@ -51,7 +67,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "QualityHandler.hpp"
@@ -82,9 +98,9 @@ void handle_pollutants(SimulationContext& ctx, const std::vector<std::string>& l
         if (tok.size() < 2) continue;
 
         const std::string& name = tok[0];
-        if (ctx.pollutant_names.find(name) < 0) {
-            ctx.pollutant_names.add(name);
-        }
+        add_unique(ctx.pollutant_names, name, ctx.errors);
+        // duplicate ID (any case spelling) pushes ERR 207 and is skipped;
+        // the second pass keys by find(), so it repopulates the original.
     }
 
     // Resize pollutant arrays to accommodate all pollutants
@@ -154,8 +170,8 @@ void handle_landuses(SimulationContext& ctx, const std::vector<std::string>& lin
         // Name  [SweepInterval]  [SweepRemoval]  [SweepDays0]
 
         const std::string& name = tok[0];
-        int idx = ctx.landuse_names.find(name);
-        if (idx < 0) idx = ctx.landuse_names.add(name);
+        int idx = add_unique(ctx.landuse_names, name, ctx.errors);
+        if (idx < 0) continue;  // duplicate ID (ERR 207, legacy input.c parity)
 
         // Ensure capacity
         const auto n = static_cast<std::size_t>(idx + 1);
@@ -249,7 +265,7 @@ void handle_buildup(SimulationContext& ctx, const std::vector<std::string>& line
             // Gap #35: EXT buildup uses a time series name in tok[5], not a number.
             // Resolve to table index; other types store a numeric exponent.
             if (ctx.buildup.func_type[flat] == 4) {  // EXTERNAL
-                int ts_idx = ctx.table_names.find(tok[5]);
+                int ts_idx = ctx.find_timeseries(tok[5]);
                 ctx.buildup.coeff3[flat] = static_cast<double>(ts_idx);
             } else {
                 ctx.buildup.coeff3[flat] = to_double(tok[5]);
@@ -350,6 +366,16 @@ void handle_treatment(SimulationContext& ctx, const std::vector<std::string>& li
 void handle_loadings(SimulationContext& ctx, const std::vector<std::string>& lines) {
     const int n_pollutants = ctx.pollutant_names.size();
     if (n_pollutants <= 0) return;
+
+    // Size the quality arrays now (iteration 4): they used to be sized only
+    // by PostParseResolver AFTER the handlers ran, so the `flat < size()`
+    // guard below silently dropped every [LOADINGS] row.
+    const int n_sub = ctx.subcatch_names.size();
+    if (n_sub > 0 &&
+        (ctx.subcatches.conc_n_pollutants != n_pollutants ||
+         static_cast<int>(ctx.subcatches.conc.size()) != n_sub * n_pollutants)) {
+        ctx.subcatches.resize_quality(n_pollutants);
+    }
 
     for (const auto& line : lines) {
         auto tok = Tokenizer::tokenize(line);

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file test_geopackage_external_content_reader.cpp
  * @brief Slice IO-8 — round-trip: write Part D content via IO-7, re-open
@@ -16,7 +32,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include <gtest/gtest.h>
@@ -119,8 +135,7 @@ TEST(GpkgExternalContentReader, TimeseriesRoundTripMaterialisesScratchFile) {
     // Write phase.
     {
         SimulationContext wctx;
-        int t = wctx.table_names.add("RAIN_X");
-        wctx.tables.add("RAIN_X", TableType::TIMESERIES);
+        int t = wctx.tables.add("RAIN_X", TableType::TIMESERIES);
         wctx.tables[t].file_path = src.string();
         ASSERT_NO_THROW(write_external_content(db.get(), wctx, sim));
     }
@@ -131,8 +146,8 @@ TEST(GpkgExternalContentReader, TimeseriesRoundTripMaterialisesScratchFile) {
     const std::string scratch = scratchDirFor(dbPathFor(stem));
     ASSERT_NO_THROW(read_external_content(db.get(), rctx, sim, scratch));
 
-    int t = rctx.table_names.find("RAIN_X");
-    ASSERT_GE(t, 0) << "reader did not register RAIN_X in table_names";
+    int t = rctx.find_timeseries("RAIN_X");
+    ASSERT_GE(t, 0) << "reader did not register RAIN_X as a timeseries";
     const auto& slot = rctx.tables[t].file_path;
     EXPECT_FALSE(slot.absolute.empty());
     EXPECT_NE(slot.original.find("<gpkg:input_timeseries:RAIN_X>"),

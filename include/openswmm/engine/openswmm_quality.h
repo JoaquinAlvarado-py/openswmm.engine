@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_quality.h
  * @brief OpenSWMM Engine — Water Quality (Landuse / Buildup / Washoff / Treatment) C API.
@@ -11,7 +27,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_QUALITY_H
@@ -38,6 +54,20 @@ SWMM_ENGINE_API const char* swmm_landuse_id   (SWMM_Engine engine, int idx);
 
 /** @brief Add a new land use (BUILDING state only). */
 SWMM_ENGINE_API int swmm_landuse_add(SWMM_Engine engine, const char* id);
+
+/**
+ * @brief Rename a land use in place.
+ *
+ * @details Land uses are referenced positionally (matrix dimensions), so
+ *          the rename only touches the name registry — buildup/washoff
+ *          rows and subcatchment coverages follow automatically.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Land use index.
+ * @param new_id  New unique name (non-empty).
+ * @returns SWMM_OK, or SWMM_ERR_BADPARAM on empty/duplicate name.
+ */
+SWMM_ENGINE_API int swmm_landuse_rename(SWMM_Engine engine, int idx, const char* new_id);
 
 /** @brief Set sweep interval (days between street sweeps). */
 SWMM_ENGINE_API int swmm_landuse_set_sweep_interval(SWMM_Engine engine, int idx, double days);
@@ -161,6 +191,33 @@ SWMM_ENGINE_API int swmm_treatment_get(SWMM_Engine engine, int node_idx, int pol
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_treatment_clear(SWMM_Engine engine, int node_idx, int pollut_idx);
+
+/**
+ * @brief Validate a treatment expression WITHOUT modifying engine state.
+ *
+ * @details Editor-support peer of swmm_control_validate_rule: parses
+ *          \p expr through the production treatment grammar and reports a
+ *          human-readable diagnostic plus the 0-based character offset of
+ *          the error. Unlike swmm_treatment_set (which recompiles the
+ *          node's treatment on success), this call never mutates the
+ *          engine, so it is safe to invoke per keystroke. Note the
+ *          validator is deliberately stricter than the tokenizer in one
+ *          way: unknown characters are an error rather than silently
+ *          skipped. Co-pollutant references (R_name/C_name) are reported
+ *          as unsupported.
+ *
+ * @param engine        Engine handle (grammar only; no model data is read).
+ * @param expr          Expression string ("R = ..." or "C = ...").
+ * @param[out] errbuf   Receives the diagnostic on failure ("" on success).
+ *                      May be NULL.
+ * @param buflen        Size of errbuf in bytes.
+ * @param[out] col_out  Receives the 0-based character offset of the error,
+ *                      or -1 when not attributable. May be NULL.
+ * @returns SWMM_OK when the expression is valid, SWMM_ERR_BADPARAM when
+ *          invalid (diagnostic in errbuf/col_out) or on NULL expr.
+ */
+SWMM_ENGINE_API int swmm_treatment_validate_expression(SWMM_Engine engine, const char* expr,
+                                                        char* errbuf, int buflen, int* col_out);
 
 #ifdef __cplusplus
 } /* extern "C" */

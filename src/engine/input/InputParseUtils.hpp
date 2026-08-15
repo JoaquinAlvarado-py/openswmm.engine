@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file InputParseUtils.hpp
  * @brief Shared parsing utilities for input section handlers.
@@ -10,7 +26,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_INPUT_PARSE_UTILS_HPP
@@ -18,9 +34,12 @@
 
 #include <string_view>
 #include <string>
+#include <vector>
 #include <charconv>
 #include "../core/charconv_compat.hpp"
 #include "../core/DateTime.hpp"
+#include "../core/ErrorCodes.hpp"
+#include "../data/NameIndex.hpp"
 
 namespace openswmm::input {
 
@@ -155,6 +174,43 @@ inline double parse_time_day_fraction(std::string_view sv) {
  */
 inline double parse_datetime(std::string_view date_sv, std::string_view time_sv) {
     return parse_date(date_sv) + parse_time_day_fraction(time_sv);
+}
+
+// ============================================================================
+// Object registration
+// ============================================================================
+
+/**
+ * @brief Register a new object definition, rejecting duplicates like legacy.
+ *
+ * @details Legacy input.c addObject() emits ERR_DUP_NAME (207) when an object
+ *          class that defines one object per line sees a second definition of
+ *          the same name — and its hash table is case-insensitive, so names
+ *          differing only in case collide too. Multi-line object classes
+ *          (timeseries, curves, patterns, snowpacks, LID controls, inlets,
+ *          unit hydrographs) legitimately repeat their name across lines and
+ *          must keep using find-then-add instead of this helper.
+ *
+ * @param reg     Name registry for the object class.
+ * @param name    Name from the definition line (stored spelling).
+ * @param errors  ctx.errors sink for the ERR_DUP_NAME message.
+ * @returns       New index, or -1 if the name was already registered (the
+ *                error has been pushed; caller should skip the line).
+ */
+inline int add_unique(NameIndex& reg, const std::string& name,
+                      std::vector<std::string>& errors) {
+    const int idx = reg.try_add(name);
+    if (idx < 0) {
+        const std::string* canon = reg.canonical(name);
+        if (canon != nullptr && *canon != name) {
+            errors.push_back(format_error(ERR_DUP_NAME, name,
+                "(matches existing ID '" + *canon +
+                "'; names are case-insensitive)"));
+        } else {
+            errors.push_back(format_error(ERR_DUP_NAME, name));
+        }
+    }
+    return idx;
 }
 
 } /* namespace openswmm::input */

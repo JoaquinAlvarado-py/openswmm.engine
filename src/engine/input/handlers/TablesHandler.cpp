@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file TablesHandler.cpp
  * @brief Section handlers for [TIMESERIES] and [CURVES].
@@ -31,7 +47,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "TablesHandler.hpp"
@@ -71,13 +87,17 @@ void handle_timeseries(SimulationContext& ctx, const std::vector<std::string>& l
         // First column: name (non-empty) or continuation (empty — same name)
         const std::string& maybe_name = tok[0];
         bool is_new_table = false;
-        if (!maybe_name.empty()) {
+        // Standard SWMM repeats the series name on every row, so the common
+        // case is "same table as the previous row". Skipping the lookup then
+        // keeps the whole section at one lookup per DISTINCT series.
+        if (!maybe_name.empty() &&
+            !(current_idx >= 0 && ieq(maybe_name, current_name))) {
             current_name = maybe_name;
-            // Ensure table exists
-            current_idx = ctx.table_names.find(current_name);
+            // Ensure table exists (kind-scoped: a curve with the same name
+            // is a DIFFERENT object, matching legacy's separate hash tables)
+            current_idx = ctx.find_timeseries(current_name);
             if (current_idx < 0) {
-                current_idx = ctx.table_names.add(current_name);
-                ctx.tables.add(current_name, TableType::TIMESERIES);
+                current_idx = ctx.tables.add(current_name, TableType::TIMESERIES);
                 is_new_table = true;
             }
         }
@@ -214,11 +234,18 @@ void handle_curves(SimulationContext& ctx, const std::vector<std::string>& lines
 
         const std::string& maybe_name = tok[0];
         bool is_new_table = false;
-        if (!maybe_name.empty()) {
+        // As in [TIMESERIES]: curve rows repeat the curve name, so skip the
+        // lookup when this row names the table we are already on. Only the
+        // lookup is skipped — the data-column handling below still runs, and
+        // current_name's spelling never reaches output (it feeds only the
+        // lookup and the add).
+        if (!maybe_name.empty() &&
+            !(current_idx >= 0 && ieq(maybe_name, current_name))) {
             current_name = maybe_name;
-            current_idx = ctx.table_names.find(current_name);
+            // Kind-scoped: a timeseries with the same name is a DIFFERENT
+            // object, matching legacy's separate hash tables.
+            current_idx = ctx.find_curve(current_name);
             if (current_idx < 0) {
-                current_idx = ctx.table_names.add(current_name);
                 // Type may appear in tok[1] (first row only)
                 if (tok.size() > 1) {
                     auto it = CURVE_TYPE_MAP.find(Tokenizer::to_upper(tok[1]));
@@ -226,7 +253,7 @@ void handle_curves(SimulationContext& ctx, const std::vector<std::string>& lines
                         current_type = it->second;
                     }
                 }
-                ctx.tables.add(current_name, current_type);
+                current_idx = ctx.tables.add(current_name, current_type);
                 is_new_table = true;
             }
         }

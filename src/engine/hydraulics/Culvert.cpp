@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file Culvert.cpp
  * @brief Culvert inlet control — numerically identical to legacy culvert.c.
@@ -5,10 +21,11 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "Culvert.hpp"
+#include "HydClosureKernels.hpp"
 #include "../core/SimulationContext.hpp"
 #include <cmath>
 #include <algorithm>
@@ -142,58 +159,16 @@ CulvertCoeffs getCoeffs(int code) {
 
 double getInflow(double q_proposed, double head, double y_full,
                  double a_full, double slope, int code, double& dqdh) {
-    dqdh = 0.0;
-    if (head <= 0.0 || y_full <= 0.0 || a_full <= 0.0) return q_proposed;
-
-    auto cc = getCoeffs(code);
-    if (cc.K == 0.0) return q_proposed;
-
-    double AD = a_full * std::sqrt(y_full);
-    double y_norm = head / y_full;
-
-    // Slope correction factor: -7*slope for mitered inlets, +0.5*slope otherwise
-    // Mitered inlet codes: 5, 37, 46 (legacy culvert.c switch statement)
-    double scf;
-    if (code == 5 || code == 37 || code == 46)
-        scf = -7.0 * slope;
-    else
-        scf = 0.5 * slope;
-
-    // Regime thresholds
-    double y1_norm = 0.95;
-    double y2_norm = 16.0 * cc.C + cc.Y - scf;
-    if (y2_norm < y1_norm) y2_norm = y1_norm + 0.01;
-
-    double q_inlet;
-
-    if (y_norm <= y1_norm) {
-        // Unsubmerged: Q = AD * (h/yFull/K)^(1/M)
-        double arg = y_norm / cc.K;
-        if (arg <= 0.0) return q_proposed;
-        q_inlet = AD * std::pow(arg, 1.0 / cc.M);
-        dqdh = q_inlet / (head * cc.M);
-    }
-    else if (y_norm >= y2_norm) {
-        // Submerged: Q = AD * sqrt((h/yFull - Y + scf) / C)
-        double arg = (y_norm - cc.Y + scf) / cc.C;
-        if (arg <= 0.0) return q_proposed;
-        q_inlet = AD * std::sqrt(arg);
-        dqdh = 0.5 * q_inlet / (arg * y_full * cc.C);
-    }
-    else {
-        // Transition: linear interpolation
-        double arg1 = y1_norm / cc.K;
-        double q1 = AD * std::pow(arg1, 1.0 / cc.M);
-        double arg2 = (y2_norm - cc.Y + scf) / cc.C;
-        double q2 = (arg2 > 0.0) ? AD * std::sqrt(arg2) : q1;
-
-        double frac = (y_norm - y1_norm) / (y2_norm - y1_norm);
-        q_inlet = q1 + frac * (q2 - q1);
-        dqdh = (q2 - q1) / ((y2_norm - y1_norm) * y_full);
-    }
-
-    // Inlet controls only if q_inlet < q_proposed
-    return std::min(q_inlet, q_proposed);
+    // The curve itself lives in HydClosureKernels.hpp, portable to the device
+    // backend, which is where the FV solver applies it (as a cap on the flux
+    // crossing the culvert's upstream face). This entry point resolves the
+    // type code and hands over.
+    const CulvertCoeffs cc = getCoeffs(code);
+    const hydkernels::CulvertCurve curve{cc.K, cc.M, cc.C, cc.Y};
+    // Mitered inlet codes, per legacy culvert.c's switch.
+    const bool mitered = (code == 5 || code == 37 || code == 46);
+    return hydkernels::culvertInflow(q_proposed, head, y_full, a_full, slope,
+                                     curve, mitered, dqdh);
 }
 
 void batchComputeInletControl(const int* link_indices, int n,

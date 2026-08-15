@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file DynamicWave.cpp
  * @brief Dynamic wave routing -- batch-oriented St. Venant equations.
@@ -31,7 +47,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "DynamicWave.hpp"
@@ -70,6 +86,10 @@ static inline int omp_get_thread_num()  { return 0; }
 #endif
 
 namespace openswmm {
+
+// A3 parity tracing: routing-step serial defined in SWMMEngine.cpp, used to
+// step-gate the per-link term trace (SWMM_TRACE_LSTEP) below.
+extern long g_trace_rstep_sn;
 
 namespace dynwave {
 
@@ -501,6 +521,9 @@ void DWSolver::init(int n_nodes, int n_links, const XSectGroups& groups,
     // B2 threading: node→incident-conduit CSR for the parallel flow gather.
     buildConduitNodeCSR(ctx);
 
+    // Virtual-junction pair table (empty for models without [VIRTUAL_JUNCTIONS]).
+    buildVirtualJunctionPairs(ctx);
+
     // Anderson acceleration state arrays (allocated regardless; only used when enabled)
     aa_y_prev_.resize(un, 0.0);
     aa_g_prev_.resize(un, 0.0);
@@ -730,6 +753,222 @@ void DWSolver::buildConduitNodeCSR(const SimulationContext& ctx) {
 }
 
 // ============================================================================
+// buildVirtualJunctionPairs — vjunc_ pair table (built once at init, post-CSR)
+// ============================================================================
+//
+// One row per virtual junction. Orientation is recorded AFTER the adverse-
+// slope reversal in PostParseResolver, so up_link/dn_link reflect the actual
+// node1/node2 wiring. A pair with a through orientation (node2(up) == node ==
+// node1(dn)) gets the full §3.2 momentum coupling; sag/peak orientations
+// (both conduits pointing into or out of the node) still get zero-storage
+// continuity but skip the directional pair coupling.
+
+void DWSolver::buildVirtualJunctionPairs(const SimulationContext& ctx) {
+    const auto& links = ctx.links;
+    const auto& nodes = ctx.nodes;
+    const auto& CD = ctx.link_subtypes.conduits;
+
+    vjunc_.clear();
+    vj_pair_n1_.assign(static_cast<std::size_t>(n_links_), -1);
+    vj_pair_n2_.assign(static_cast<std::size_t>(n_links_), -1);
+
+    std::vector<int> row_of_node(static_cast<std::size_t>(n_nodes_), -1);
+    for (int i = 0; i < n_nodes_; ++i) {
+        if (i < static_cast<int>(nodes.is_virtual.size()) &&
+            nodes.is_virtual[static_cast<std::size_t>(i)]) {
+            row_of_node[static_cast<std::size_t>(i)] = static_cast<int>(vjunc_.size());
+            VJuncPair p;
+            p.node = i;
+            vjunc_.push_back(p);
+        }
+    }
+    if (vjunc_.empty()) return;
+
+    for (int j = 0; j < n_links_; ++j) {
+        const auto uj = static_cast<std::size_t>(j);
+        if (links.type[uj] != LinkType::CONDUIT) continue;
+        for (const bool at_node1 : { true, false }) {
+            const int n = at_node1 ? links.node1[uj] : links.node2[uj];
+            if (n < 0 || n >= n_nodes_) continue;
+            const int r = row_of_node[static_cast<std::size_t>(n)];
+            if (r < 0) continue;
+            VJuncPair& p = vjunc_[static_cast<std::size_t>(r)];
+            if      (p.link_a < 0) p.link_a = j;
+            else if (p.link_b < 0) p.link_b = j;
+            // A chain link belongs to two pairs — record each end separately
+            // (the old single vj_of_link_ map was last-write-wins, which left
+            // interior links coupled only to their downstream pair: the
+            // upwinding mechanism never fired and the convective correction
+            // was applied one-sided).
+            if (at_node1) vj_pair_n1_[uj] = r;
+            else          vj_pair_n2_[uj] = r;
+        }
+    }
+
+    for (VJuncPair& p : vjunc_) {
+        if (p.link_a < 0 || p.link_b < 0) continue;  // validation rejects these
+        const auto ua = static_cast<std::size_t>(p.link_a);
+        const auto ub = static_cast<std::size_t>(p.link_b);
+
+        // Through orientation: node2 of one conduit and node1 of the other.
+        if (links.node2[ua] == p.node && links.node1[ub] == p.node) {
+            p.up_link = p.link_a; p.dn_link = p.link_b; p.through = 1;
+        } else if (links.node2[ub] == p.node && links.node1[ua] == p.node) {
+            p.up_link = p.link_b; p.dn_link = p.link_a; p.through = 1;
+        } else {
+            p.through = 0;  // sag (both node2) or peak (both node1)
+        }
+
+        const int ca = ctx.link_subtypes.conduit_row(p.link_a);
+        const int cb = ctx.link_subtypes.conduit_row(p.link_b);
+        const double la = (ca >= 0) ? CD.length[static_cast<std::size_t>(ca)] : 0.0;
+        const double lb = (cb >= 0) ? CD.length[static_cast<std::size_t>(cb)] : 0.0;
+        p.lambda = 0.5 * (la + lb);
+    }
+}
+
+// ============================================================================
+// vjPrepareIteration — per-Picard-iteration virtual-junction pair cache
+// ============================================================================
+//
+// Computes for each through pair: the shared junction sigma from the
+// through-flow Froude number (velocity from the pair-average discharge and
+// the junction-end area, hydraulic depth from the junction-end area/width —
+// both evaluated from the shared node head on the identical cross-section),
+// the cross-junction upwind states (up-link mid area / hyd. radius), and in
+// FULL momentum mode the cross-junction convective correction
+//   dq4_j = dt · σ_j · [(v²A)_dn,mid − (v²A)_up,mid] / Λ .
+// Uses the pre-STEP-E geometry of this iteration; when the pair surcharges
+// the per-link kernels force sig = 0 anyway (closed-full), so the small
+// slot-override inconsistency is irrelevant.
+
+void DWSolver::vjPrepareIteration(const SimulationContext& ctx, double dt) {
+    const auto& links = ctx.links;
+    const bool full_momentum = (ctx.options.virtual_junction_momentum == 1);
+
+    for (VJuncPair& p : vjunc_) {
+        p.active = 0;
+        p.dirn = 0;
+        p.dq4j = 0.0;
+        if (!p.through || p.up_link < 0 || p.dn_link < 0) continue;
+
+        const auto uu = static_cast<std::size_t>(p.up_link);
+        const auto ud = static_cast<std::size_t>(p.dn_link);
+        const auto ucu = static_cast<std::size_t>(tile_uj_to_ci_[uu]);
+        const auto ucd = static_cast<std::size_t>(tile_uj_to_ci_[ud]);
+
+        // Junction-end state from the up-link's downstream end (same node
+        // head, identical xsect ⇒ same as the dn-link's upstream end).
+        const double aj = area2_[uu];
+        const double wj = width2_[uu];
+        if (aj <= FUDGE) continue;    // dry junction — per-link behaviour
+
+        const double qU = links.flow[uu] / tile_barrels_d_[ucu];
+        const double qD = links.flow[ud] / tile_barrels_d_[ucd];
+        double vj = 0.5 * (qU + qD) / aj;
+        if (std::fabs(vj) > MAX_VELOCITY)
+            vj = (vj > 0.0) ? MAX_VELOCITY : -MAX_VELOCITY;
+
+        const double dh = (wj > FUDGE) ? aj / wj : 0.0;
+        const double frj = (dh > 0.0)
+            ? std::fabs(vj) / std::sqrt(constants::GRAVITY * dh) : 0.0;
+        p.sigma_j = std::max(0.0, std::min(1.0, 2.0 * (1.0 - frj)));
+
+        p.a_up_mid = area_mid_[uu];
+        p.r_up_mid = hrad_mid_[uu];
+        p.active   = 1;
+        // Coherent signed through-flow: momentum is transmitted across the
+        // node only when both conduits carry flow the same way through it.
+        // Opposing/still flows (seiche antinode, converging fill fronts)
+        // have no momentum stream to transmit — the correction must vanish.
+        if      (qU >= 0.0 && qD >= 0.0 && qU + qD > 0.0) p.dirn = 1;
+        else if (qU <= 0.0 && qD <= 0.0 && qU + qD < 0.0) p.dirn = -1;
+
+        if (full_momentum && p.lambda > 0.0 && p.dirn != 0) {
+            const double aMu = std::max(area_mid_[uu], FUDGE);
+            const double aMd = std::max(area_mid_[ud], FUDGE);
+            const double vu = qU / aMu;
+            const double vd = qD / aMd;
+            // MEASURED DEFECT (2026-08-14, epaswmm5_qa suites/swashes
+            // runs/_fv_vj_probe/vj_full_sign_test.py). This term is
+            // SIGN-INVERTED relative to the per-link convective term it
+            // supplements. At constant Q, Δ(v²A) = Q²Δ(1/A) = −v²ΔA, whereas
+            // the per-link dq4 = σ·v²·(A₂−A₁)/L below is the correct
+            // non-conservative EXTRAN form (d(v²A)/dx = −v²dA/dx at constant
+            // Q is exactly what makes gA·dH/dx = v²dA/dx − gA·Sf reproduce
+            // the steady momentum equation at σ=1). Negating dq4j on
+            // macdonald-periodic restores mass conservation outright at
+            // dx=10 (−224.2 % → 0.000 %) and moves the depth bias from +0.629
+            // to +0.135 velocity heads. It does NOT make FULL useful: even
+            // sign-corrected it is l1 5.24 % against BASIC's 0.163 % and
+            // plain DW's 0.141 %, because dq4j is also added to BOTH adjacent
+            // links (2485/2503) on top of each link's own full-length dq4, so
+            // the convective term is applied ~3x. Attributing it to one side
+            // instead is worse still (l1 86-103 %). No term-level correction
+            // salvages this; see plans/VJ_MOMENTUM_SCOPE.md Phase 3.
+            p.dq4j = dt * p.sigma_j * (vd * vd * aMd - vu * vu * aMu) / p.lambda;
+        }
+    }
+}
+
+// ============================================================================
+// vjAccumulateResiduals — post-step momentum-residual diagnostic
+// ============================================================================
+//
+// R_j = (Q²/A)_up,end − (Q²/A)_dn,start + g·Ā·(y_up,end − y_dn,start)
+// per barrel, evaluated at the converged state of the routing step. With
+// equal cross-sections and matching end depths the hydrostatic terms cancel
+// exactly; the mean-area form keeps the diagnostic first-order accurate when
+// flow-classification patches leave the two end depths unequal. Mirrored
+// into ctx.vj_diag for the .rpt Virtual Junction Summary.
+
+void DWSolver::vjAccumulateResiduals(SimulationContext& ctx) {
+    if (vjunc_.empty()) return;
+
+    auto& d = ctx.vj_diag;
+    if (d.node_idx.size() != vjunc_.size()) {
+        d.clear();
+        for (const VJuncPair& p : vjunc_) {
+            d.node_idx.push_back(p.node);
+            d.up_link.push_back(p.up_link);
+            d.dn_link.push_back(p.dn_link);
+            d.resid_max.push_back(0.0);
+            d.resid_sum.push_back(0.0);
+            d.resid_n.push_back(0);
+        }
+    }
+
+    const auto& links = ctx.links;
+    for (std::size_t r = 0; r < vjunc_.size(); ++r) {
+        VJuncPair& p = vjunc_[r];
+        if (!p.through || p.up_link < 0 || p.dn_link < 0) continue;
+        const auto uu = static_cast<std::size_t>(p.up_link);
+        const auto ud = static_cast<std::size_t>(p.dn_link);
+        const double aU = area2_[uu];
+        const double aD = area1_[ud];
+        if (aU <= FUDGE || aD <= FUDGE) continue;
+
+        const auto ucu = static_cast<std::size_t>(tile_uj_to_ci_[uu]);
+        const auto ucd = static_cast<std::size_t>(tile_uj_to_ci_[ud]);
+        const double qU = links.flow[uu] / tile_barrels_d_[ucu];
+        const double qD = links.flow[ud] / tile_barrels_d_[ucd];
+
+        const double flux = qU * qU / aU - qD * qD / aD;
+        const double hyd  = constants::GRAVITY * 0.5 * (aU + aD)
+                            * (depth2_[uu] - depth1_[ud]);
+        const double R = flux + hyd;
+        const double aR = std::fabs(R);
+
+        p.resid_max = std::max(p.resid_max, aR);
+        p.resid_sum += aR;
+        ++p.resid_n;
+        d.resid_max[r] = p.resid_max;
+        d.resid_sum[r] = p.resid_sum;
+        d.resid_n[r]   = p.resid_n;
+    }
+}
+
+// ============================================================================
 // setNumThreads — configure OpenMP parallelism
 // ============================================================================
 
@@ -864,6 +1103,7 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
             t.degree      = nd.degree[ui];
             t.is_storage  = (nd.type[ui] == NodeType::STORAGE) ? 1 : 0;
             t.is_outfall  = (nd.type[ui] == NodeType::OUTFALL) ? 1 : 0;
+            t.is_virtual  = (ui < nd.is_virtual.size() && nd.is_virtual[ui]) ? 1 : 0;
         }
     }
 
@@ -1029,6 +1269,10 @@ int DWSolver::execute(SimulationContext& ctx, double dt,
         updateDPSState(ctx, dt);
     }
 
+    // Post-Picard: virtual-junction momentum-residual diagnostic (no-op when
+    // the model has no virtual junctions).
+    vjAccumulateResiduals(ctx);
+
     // Record the actual final convergence (legacy counts a step as
     // non-converging only when this is false, even if it used all MaxTrials —
     // a step that converges ON the last allowed iteration is "converged").
@@ -1133,6 +1377,25 @@ void DWSolver::findBypassedLinks(const SimulationContext& ctx) {
                            xnode_.converged[static_cast<std::size_t>(n2)]) ? 1 : 0;
         bypassed_[uj] = b;
     }
+
+    // Virtual-junction pairing: the two conduits of a pair bypass together or
+    // not at all — a frozen half-pair would break flux continuity at the
+    // zero-storage node. Tiny serial fixup behind the `omp for` barrier;
+    // every thread evaluates the identical replicated emptiness condition.
+    if (!vjunc_.empty()) {
+        #pragma omp single
+        {
+            for (const VJuncPair& p : vjunc_) {
+                if (p.link_a < 0 || p.link_b < 0) continue;
+                const auto ua = static_cast<std::size_t>(p.link_a);
+                const auto ub = static_cast<std::size_t>(p.link_b);
+                if (bypassed_[ua] != bypassed_[ub]) {
+                    bypassed_[ua] = 0;
+                    bypassed_[ub] = 0;
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1149,6 +1412,13 @@ static XSectParams buildXSP(const SimulationContext& ctx, std::size_t uk) {
     xs.y_full = links.xsect_y_full[uk];
     xs.a_full = links.xsect_a_full[uk];
     xs.w_max  = links.xsect_w_max[uk];
+    // Depth of maximum width. Read by the seepage clamp in
+    // recomputeConduitLossOne (legacy link.c:1381 `if (d >= ywMax) d = ywMax`)
+    // and by nothing else in xsect — leaving it 0 collapsed d_seep to 0, so the
+    // wetted width was 0 and DYNWAVE conduit seepage was identically zero for
+    // every shape. Router::computeConduitLosses (KINWAVE/STEADY/FV) always
+    // passed it, which is why the loss appeared under those models only.
+    xs.yw_max = links.xsect_yw_max[uk];
     xs.r_full = links.xsect_r_full[uk];
     xs.s_full = links.xsect_s_full[uk];
     xs.s_max  = links.xsect_s_max[uk];
@@ -1808,6 +2078,15 @@ void DWSolver::momentumKernels(SimulationContext& ctx, double dt, int step) {
         (surcharge_method != SurchargeMethod::DYNAMIC_SLOT);
     const bool do_losses = !losses_all_zero_;
 
+    // Virtual-junction pair cache for this Picard iteration (shared sigma,
+    // cross-junction upwind states, dq4j). Serial: pair count is tiny; the
+    // single's implicit barrier orders the cache before the kernel loop.
+    // No-op (no single, no barrier) for models without virtual junctions.
+    if (!vjunc_.empty()) {
+        #pragma omp single
+        vjPrepareIteration(ctx, dt);
+    }
+
     #pragma omp for schedule(static)
     for (int ci = 0; ci < n_conduits_; ++ci) {
         auto uci = static_cast<std::size_t>(ci);
@@ -2190,6 +2469,52 @@ void DWSolver::processManningLink(SimulationContext& ctx, double dt, int step,
     // r1_val/rMid > 0 for any wet section, so rWtd > 0 here (no div-by-zero).
     double rWtd = r1_val + (rMid - r1_val) * rho;
 
+    // ---- Virtual-junction pair coupling (plan §3.2, mechanisms 3–4) ----
+    // Chain-aware: this link may sit on TWO pairs (its node1's and its
+    // node2's). Mechanism 3 — when coherent through-flow ENTERS this link
+    // across its upstream (node1) interface, the junction-end upstream
+    // weighting uses the neighbour link's mid-state as the upwind state
+    // (rho keeps the per-link value; reversed flow stays central, matching
+    // the per-link rho convention). Mechanism 4 (FULL mode) — each active
+    // interface contributes its convective flux correction to BOTH adjacent
+    // links; dq4j is direction-gated in vjPrepareIteration (zero when the
+    // through-flow is incoherent).
+    // Mechanism 2 (blanket σ_j override) is REMOVED: the SWASHES bump probes
+    // showed it destabilizes frictionless chains (l1 76% alone vs 0.2% off);
+    // EXTRAN's per-link Froude sigma already carries the damping policy.
+    // Diagnostic toggles (SWMM_VJ_M3/M4=0 disables; default on).
+    static const bool vj_m3 = [] {
+        const char* s = std::getenv("SWMM_VJ_M3"); return !(s && *s == '0'); }();
+    static const bool vj_m4 = [] {
+        const char* s = std::getenv("SWMM_VJ_M4"); return !(s && *s == '0'); }();
+    double vj_dq4 = 0.0;
+    if (!vjunc_.empty()) {
+        const int r1 = vj_pair_n1_[uj];
+        const int r2 = vj_pair_n2_[uj];
+        if (r1 >= 0) {
+            const VJuncPair& p = vjunc_[static_cast<std::size_t>(r1)];
+            if (p.active) {
+                if (vj_m3 && p.dirn > 0 && static_cast<int>(uj) == p.dn_link &&
+                    !is_closed_full && !isFull && qLast > 0.0) {
+                    aWtd = p.a_up_mid + (aMid - p.a_up_mid) * rho;
+                    rWtd = p.r_up_mid + (rMid - p.r_up_mid) * rho;
+                }
+                if (vj_m4) vj_dq4 += p.dq4j;
+            }
+        }
+        // NOTE (2026-08-14): each interface's dq4j spans midpoint-to-midpoint
+        // (Λ = ½(L_a+L_b)) and is added HERE as well as at r1 above, so an
+        // interior link picks up two of them on top of its own full-length
+        // dq4. Attributing each interface to a single link instead was
+        // measured and is far worse (l1 86-103 % vs 4-9 %), so the
+        // duplication is not the primary defect — the sign inversion noted at
+        // vjPrepareIteration is. See plans/VJ_MOMENTUM_SCOPE.md Phase 3.
+        if (r2 >= 0) {
+            const VJuncPair& p = vjunc_[static_cast<std::size_t>(r2)];
+            if (p.active && vj_m4) vj_dq4 += p.dq4j;
+        }
+    }
+
     // Apply InertDamping override AFTER rho computation
     if (!is_closed_full) {
         if      (inert_damping == 0) sig = 1.0;  // NO_DAMPING
@@ -2236,6 +2561,10 @@ void DWSolver::processManningLink(SimulationContext& ctx, double dt, int step,
         dq3 = 2.0 * v * (aMid - aOld) * sig;
         if (length > 0.0)
             dq4 = dt * v * v * (area2_[uj] - area1_[uj]) / length * sig;  // PARITY dwflow.c:222
+        // Cross-junction convective correction for virtual-junction pairs
+        // (0 unless VIRTUAL_JUNCTION_MOMENTUM FULL and the pair is active);
+        // gated on sig so the inertial-damping overrides silence it too.
+        dq4 += vj_dq4;
     }
 
     // Local losses
@@ -2268,6 +2597,55 @@ void DWSolver::processManningLink(SimulationContext& ctx, double dt, int step,
     // length directly (NOT dt_g=dt*GRAVITY). dqdh feeds the surcharge node-depth
     // Jacobian (sumdqdh denominator), so the grouping/divide must match exactly.
     dqdh_[uj] = 1.0 / denom * GRAVITY * dt * aWtd / length * barrels_d;
+
+    // A3 parity term tracing for one link (SWMM_TRACE_LINK=<index>, first 64
+    // invocations; format-matched to the legacy trace in dwflow.c).
+    {
+        static FILE* lf = nullptr;
+        static long  lf_target = -2;
+        static long  lf_skip = 0;
+        static long  lf_step = 0;
+        static int   lf_count = 0;
+        static int   lf_rows = 0;
+        if (lf_target == -2) {
+            const char* p  = std::getenv("SWMM_TRACE_LINK");
+            const char* tr = std::getenv("SWMM_TRACE_RSTEP");
+            const char* sk = std::getenv("SWMM_TRACE_SKIP");
+            const char* ls = std::getenv("SWMM_TRACE_LSTEP");
+            lf_target = -1;
+            if (sk && *sk) lf_skip = std::atol(sk);
+            if (ls && *ls) lf_step = std::atol(ls);
+            if (p && *p && tr && *tr) {
+                char fname[512];
+                lf_target = std::atol(p);
+                std::snprintf(fname, sizeof(fname), "%s.link%ld", tr, lf_target);
+                lf = std::fopen(fname, "w");
+                if (lf) std::fprintf(lf,
+                    "n,qLast,v,sigma,rho,aWtd,rWtd,dq1,dq2,dq3,dq4,dq5,dq6,qOld,q,sa1,sa2,fc,y1,yMid,a1,aMid,r1,rMid\n");
+            }
+        }
+        if (lf && static_cast<long>(uj) == lf_target) {
+            ++lf_count;
+            // SWMM_TRACE_LSTEP=N: capture while computing routing step >= N
+            // (the RSTEP serial increments at the END of each step, so during
+            // step N the serial still reads N-1). Otherwise use the
+            // invocation-count window (SWMM_TRACE_SKIP).
+            const bool in_window = lf_step > 0
+                ? (openswmm::g_trace_rstep_sn + 1 >= lf_step)
+                : (lf_count > lf_skip);
+            if (in_window && lf_rows < 128) {
+                ++lf_rows;
+                std::fprintf(lf, "%d,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%d,%a,%a,%a,%a,%a,%a\n",
+                             lf_count, qLast, v, sig, rho, aWtd, rWtd,
+                             dq1, dq2, dq3, dq4, dq5, dq6, qOld, q,
+                             surf_area1_[uj], surf_area2_[uj],
+                             static_cast<int>(links.flow_class[uj]),
+                             depth1_[uj], depth_mid_[uj], area1_[uj],
+                             area_mid_[uj], hrad1_[uj], hrad_mid_[uj]);
+                if (lf_rows >= 128) { std::fclose(lf); lf = nullptr; }
+            }
+        }
+    }
 
     // Shared post-processing
     applyFlowLimits(ctx, dt, step, uj, q, qLast, barrels_d, isFull);
@@ -2430,7 +2808,11 @@ void DWSolver::updateNodeFlows(SimulationContext& ctx) {
         }
 
         // Accumulate link surface area contributions to nodes
-        // (matching legacy dynwave.c updateNodeFlows: surfArea * barrels)
+        // (matching legacy dynwave.c updateNodeFlows: surfArea * barrels).
+        // Virtual junctions accumulate their natural half-link areas too —
+        // the area is the continuity linearization, not bookkept storage
+        // (their committed volume is identically zero); what they skip is
+        // the artificial MIN_SURFAREA floor in setNodeDepth.
         const int ci_b = tile_uj_to_ci_[uj];
         int barrels = (ci_b >= 0)
             ? static_cast<int>(tile_barrels_d_[static_cast<std::size_t>(ci_b)]) : 1;
@@ -2543,7 +2925,7 @@ void DWSolver::computeAASkipFlags(const SimulationContext& ctx) {
     // continuity formulation, where setNodeDepth switches to the dQ/dH surcharge
     // branch at the crown — a branch-discontinuous operator that violates AA's
     // smooth-G assumption. Under SEMI_IMPLICIT the unified Crank-Nicolson update
-    // (dy = dV / (A - 0.5*dt*sumdqdh)) is C1-smooth through the free-surface ⟷
+    // (dy = dV / (A + 0.5*dt*sumdqdh)) is C1-smooth through the free-surface ⟷
     // surcharge transition, so plain surcharged junctions are AA-eligible. The
     // genuinely-discrete cases (pumps, weir/orifice at crown, active DPS slot,
     // static-slot kink) are non-smooth in the link-level sumdqdh inputs — not in
@@ -2858,7 +3240,14 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
     // the compiled-in constants::MIN_SURFAREA — matches legacy
     // dynwave.c:658 `surfArea = MAX(surfArea, MinSurfArea)` where
     // MinSurfArea is the runtime value from the INP [OPTIONS] block.
-    surf_area = std::max(surf_area, min_surf_area_);
+    //
+    // Virtual junctions skip the floor: their surface area is exactly the
+    // natural half-link free-surface area of the fused reach (the artificial
+    // MIN_SURFAREA storage smearing is the thing the feature removes; the
+    // natural area is the correct continuity linearization and their
+    // committed volume stays identically zero).
+    if (t.is_virtual == 0)
+        surf_area = std::max(surf_area, min_surf_area_);
 
     // --- Net flow volume change (trapezoidal averaging with previous step) ---
     double dQ = nodes.inflow[ui] - nodes.outflow[ui];
@@ -2889,6 +3278,46 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
     }
     xnode_.is_surcharged[ui] = is_surcharged ? 1 : 0;
 
+    // ---- Virtual junction: unfloored, sealed node update ----
+    // (plans/VIRTUAL_JUNCTION_IMPLEMENTATION_PLAN.md §3.1.) The head update
+    // follows the standard free-surface/surcharge formulations with the
+    // natural (unfloored) half-link surface area. When that area vanishes
+    // (dry pair, or fully surcharged with slot geometry) the update falls
+    // back to the zero-storage Newton step dy = dQ/Σdqdh — the engine
+    // accumulates sumdqdh POSITIVE with dQ_net/dH = −sumdqdh, the same sign
+    // convention the EXTRAN surcharge branch divides by. Flooding cannot
+    // occur (commitNodeDepthState seals the node: volume ≡ 0, overflow ≡ 0,
+    // no cap at full depth).
+    if (t.is_virtual != 0) {
+        const double sum = xnode_.sumdqdh[ui];
+        double y_vj;
+        if (surf_area > FUDGE && !is_surcharged) {
+            // Free surface: standard dV/A path on the natural area, with the
+            // usual under-relaxation.
+            y_vj = y_old + dV / surf_area;
+            xnode_.old_surf_area[ui] = surf_area;
+            if (step > 0) y_vj = (1.0 - omega) * y_last + omega * y_vj;
+        } else if (sum > FUDGE) {
+            // Surcharged or area-less: zero-storage Newton on the flow
+            // balance, with the EXTRAN-style crown-proximity blending so the
+            // transition into/out of surcharge stays smooth.
+            double denomv = sum;
+            if (yCrown > 0.0 && y_last < 1.25 * yCrown) {
+                const double f = (y_last - yCrown) / yCrown;
+                denomv += (xnode_.old_surf_area[ui] / dt - sum)
+                          * std::exp(-15.0 * f);
+            }
+            y_vj = (denomv != 0.0) ? (y_last + dQ / denomv) : y_last;
+            // Keep the surcharged iterate at or above the crown, mirroring
+            // the EXTRAN branch (the free-surface path recovers below it).
+            if (is_surcharged && y_vj < yCrown) y_vj = yCrown - FUDGE;
+        } else {
+            y_vj = y_last;   // dry pair — hold
+        }
+        commitNodeDepthState(ctx, node_idx, y_vj, dV, dt);
+        return;
+    }
+
     // Only EXTRAN takes the dQ/dH surcharge branch in the explicit solver.
     // DYNAMIC_SLOT uses the slot's effective top width T_s (fed into
     // surf_area1/2 by applyDPSGeometry) so the standard dV/A path produces
@@ -2915,10 +3344,12 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
         //
         //   Q_net_new ≈ Q_net + (dQ_net/dH) * dH
         //
-        // where dQ_net/dH = sumdqdh (positive: higher head ⟶ more net
-        // outflow through connected links).  Substituting and rearranging:
+        // where sumdqdh is accumulated POSITIVE from the link dqdh values
+        // (higher head ⟶ more net outflow through connected links), so
+        // dQ_net/dH = -sumdqdh — the same sign convention the EXTRAN
+        // surcharge branch divides by.  Substituting and rearranging:
         //
-        //   dH = dV / (A - dt * sumdqdh / 2)
+        //   dH = dV / (A + dt * sumdqdh / 2)
         //
         // dV already contains the trapezoidal average of old_net_inflow and
         // current dQ, so the sumdqdh correction folds the head-dependent
@@ -2930,7 +3361,7 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
         // over, producing a smooth transition without a branch.
         // =================================================================
 
-        double denom = surf_area - 0.5 * dt * xnode_.sumdqdh[ui];
+        double denom = surf_area + 0.5 * dt * xnode_.sumdqdh[ui];
         denom = std::max(denom, min_surf_area_);
 
         double dy = dV / denom;
@@ -3013,6 +3444,39 @@ void DWSolver::setNodeDepth(SimulationContext& ctx, int node_idx, double dt,
         }
     }
 
+    // A3 parity term tracing for one node (SWMM_TRACE_NODE=<index>, first 64
+    // invocations; format-matched to the legacy trace in dynwave.c).
+    {
+        static FILE* nf = nullptr;
+        static long  nf_target = -2;
+        static long  nf_skip = 0;
+        static int   nf_count = 0;
+        if (nf_target == -2) {
+            const char* p  = std::getenv("SWMM_TRACE_NODE");
+            const char* tr = std::getenv("SWMM_TRACE_RSTEP");
+            const char* sk = std::getenv("SWMM_TRACE_SKIP");
+            nf_target = -1;
+            if (sk && *sk) nf_skip = std::atol(sk);
+            if (p && *p && tr && *tr) {
+                char fname[512];
+                nf_target = std::atol(p);
+                std::snprintf(fname, sizeof(fname), "%s.node%ld", tr, nf_target);
+                nf = std::fopen(fname, "w");
+                if (nf) std::fprintf(nf,
+                    "n,yOld,yLast,dQ,dV,surfArea,sumdqdh,surch,yNew\n");
+            }
+        }
+        if (nf && node_idx == nf_target) {
+            ++nf_count;
+            if (nf_count > nf_skip && nf_count <= nf_skip + 128) {
+                std::fprintf(nf, "%d,%a,%a,%a,%a,%a,%a,%d,%a\n", nf_count,
+                             y_old, y_last, dQ, dV, surf_area, xnode_.sumdqdh[ui],
+                             is_surcharged ? 1 : 0, y_new);
+                if (nf_count >= nf_skip + 128) { std::fclose(nf); nf = nullptr; }
+            }
+        }
+    }
+
     // --- Commit the accepted candidate through the canonical routine ---
     // (bounds, flooding/ponding caps, overflow, volume, dYdT, depth/head).
     commitNodeDepthState(ctx, node_idx, y_new, dV, dt);
@@ -3046,6 +3510,20 @@ void DWSolver::commitNodeDepthState(SimulationContext& ctx, int node_idx,
 
     // --- Depth cannot be negative ---
     y_new = std::max(y_new, 0.0);
+
+    // --- Virtual junction: zero storage, no flooding by construction ---
+    // The head may rise above the pipe crown without cap (surcharge is
+    // expressed through the connecting conduits' slot/EXTRAN treatment,
+    // like a sealed manhole); volume and overflow are identically zero.
+    if (t.is_virtual != 0) {
+        nodes.overflow[ui] = 0.0;
+        nodes.volume[ui]   = 0.0;
+        if (dt > 0.0)
+            xnode_.dYdT[ui] = std::fabs(y_new - nodes.old_depth[ui]) / dt;
+        nodes.depth[ui] = y_new;
+        nodes.head[ui]  = t.invert_elev + y_new;
+        return;
+    }
 
     // --- Ponding eligibility (same rule as setNodeDepth's entry logic) ---
     const bool is_coupled =
@@ -3097,11 +3575,21 @@ void DWSolver::commitNodeDepthState(SimulationContext& ctx, int node_idx,
 double DWSolver::getRoutingStep(SimulationContext& ctx,
                                  double fixed_step, double courant_factor) {
     if (courant_factor <= 0.0) return fixed_step;
+    // Legacy dynwave_getRoutingStep: fixed steps below MINTIMESTEP bypass the
+    // variable-step machinery entirely.
+    if (fixed_step < MIN_TIMESTEP) return fixed_step;
+
+    // Effective minimum step — legacy dynwave_validate (dynwave.c:178-179)
+    // clamps MinRouteStep = min(MinRouteStep, RouteStep), then >= MINTIMESTEP,
+    // so the floor can never exceed the user's fixed routing step.
+    const double min_route_step =
+        std::max(std::min(ctx.options.min_routing_step, fixed_step),
+                 MIN_TIMESTEP);
 
     // On first call (no flows yet), use minimum step (matching legacy line 201-204:
     // "if (VariableStep == 0.0) VariableStep = MinRouteStep")
     if (variable_step_ <= 0.0) {
-        variable_step_ = std::max(ctx.options.min_routing_step, MIN_TIMESTEP);
+        variable_step_ = min_route_step;
         return variable_step_;
     }
 
@@ -3146,6 +3634,29 @@ double DWSolver::getRoutingStep(SimulationContext& ctx,
         }
     }
 
+    // Virtual-junction pair check (plan §3.3): the fused-reach convective
+    // coupling respects a local Courant condition Λ/(|v|+c) with the gravity
+    // wave speed from the junction depth. In practice the per-link CFL checks
+    // above dominate; this is a safety net for very short pair legs.
+    for (const VJuncPair& p : vjunc_) {
+        if (!p.through || p.lambda <= 0.0) continue;
+        const auto uu = static_cast<std::size_t>(p.up_link);
+        const double aj = area2_[uu];
+        const double wj = width2_[uu];
+        if (aj <= FUDGE || wj <= FUDGE) continue;
+        const auto ucu = static_cast<std::size_t>(tile_uj_to_ci_[uu]);
+        const double qU = ctx.links.flow[uu] / tile_barrels_d_[ucu];
+        const double vmag = std::fabs(qU) / aj;
+        const double c = std::sqrt(constants::GRAVITY * (aj / wj));
+        if (vmag + c <= FUDGE) continue;
+        double t = p.lambda / (vmag + c) * courant_factor;
+        if (t > 0.0 && t < dt_min) {
+            dt_min = t;
+            min_node = p.node;
+            min_link = -1;
+        }
+    }
+
     // Update CFL-critical element counters (matching legacy stats_updateCriticalTimeCount)
     if (min_node >= 0) {
         ctx.nodes.stat_time_courant_critical[static_cast<std::size_t>(min_node)] += 1.0;
@@ -3153,9 +3664,9 @@ double DWSolver::getRoutingStep(SimulationContext& ctx,
         ctx.links.stat_time_courant_critical[static_cast<std::size_t>(min_link)] += 1.0;
     }
 
-    // Apply user's minimum step (from MINIMUM_STEP option, typically 0.5 sec)
-    double min_step = ctx.options.min_routing_step;
-    min_step = std::max(min_step, MIN_TIMESTEP);
+    // Apply user's minimum step (MINIMUM_STEP clamped to the fixed routing
+    // step per legacy dynwave_validate — see min_route_step above)
+    const double min_step = min_route_step;
     const bool floored = dt_min < min_step;
     dt_min = std::max(dt_min, min_step);
     // Round to milliseconds for deterministic behavior

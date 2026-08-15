@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file ExplicitInertialSolver.hpp
  * @brief Explicit local-inertial FV time-marcher for the 2D surface.
@@ -22,7 +38,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_2D_EXPLICIT_INERTIAL_SOLVER_HPP
@@ -69,6 +85,9 @@ private:
     // over [t_last_sync_, t], rebuild the active cell/edge lists, and assign
     // the LTS tiers (dt0_ = finest active CFL requirement).
     void syncAndRebuild(double t);
+    // Tighten-only dt0_ refresh from CURRENT depths/speeds between rebuilds
+    // (dt0_ may only grow at syncAndRebuild, which reassigns the tiers).
+    void refreshDt0();
     // Fire one tier's faces over their Δt: inertial update + Froude cap +
     // face-cadence positivity share, booking ±ΔM into both side accumulators.
     void fireFaces(const std::vector<int>& faces, double dt_f);
@@ -109,6 +128,15 @@ private:
     std::vector<int>     bc_slot_;      ///< matching flat mesh edge slot
     std::vector<double>  bc_accum_;     ///< ∫F_applied dt per BC entry (m³),
                                         ///< inflow-positive, reset per advance
+    std::vector<double>  bc_q_;         ///< prognostic boundary-edge discharge
+                                        ///< (m²/s, inflow-positive). For
+                                        ///< SPECIFIED_STAGE it is integrated by
+                                        ///< the SAME inertial momentum law as an
+                                        ///< interior face (ghost at η_bc); for
+                                        ///< the prescribed-flux types it records
+                                        ///< the applied per-metre discharge so
+                                        ///< the Perot reconstruction sees the
+                                        ///< boundary momentum either way.
 
     // Live junction exchange (windowless coupling): state_->node_coupling
     // points, evaluated at tier-0 cadence against live 2D heads and the

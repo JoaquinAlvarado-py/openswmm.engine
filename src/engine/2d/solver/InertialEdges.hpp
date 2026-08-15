@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file InertialEdges.hpp
  * @brief Unique interior-edge structure for the local-inertial momentum DOFs.
@@ -25,7 +41,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_2D_INERTIAL_EDGES_HPP
@@ -48,7 +64,13 @@ struct InertialEdges {
     std::vector<int>    cL, cR;       ///< incident cell indices
     std::vector<double> xi;           ///< edge length ξ (m)
     std::vector<double> inv_dx;       ///< 1 / centroid-to-centroid distance (1/m)
-    std::vector<double> zface;        ///< max(tri_cz[cL], tri_cz[cR]) interface bed (m)
+    std::vector<double> zface;        ///< max(tri_cz[cL], tri_cz[cR]) interface bed (m) — MEAN face mode
+    /// Shared edge's TRUE endpoint bed elevations, sorted ze_lo ≤ ze_hi (m).
+    /// Used by FACE_RECONSTRUCTION = VFR_FACE to evaluate the B&S Eq. 14
+    /// wetted-edge depth so thin crests block at their real elevation instead
+    /// of the centroid-diluted zface (same endpoint rule as the boundary
+    /// path's edgeEndpointZ — both incident cells see the identical pair).
+    std::vector<double> ze_lo, ze_hi;
     std::vector<int>    slotL, slotR; ///< flat mesh edge slots [tri*3+e] for writeback
 
     // Explicit-marcher extension (ExplicitInertialSolver). Precomputed here so

@@ -15,6 +15,7 @@
 #ifdef OPENSWMM_HAS_2D
 #include "solver/SurfaceSolverFactory.hpp"
 #endif
+#include "../core/DateTime.hpp"
 #include "../core/SimulationContext.hpp"
 #include "../core/UnitConversion.hpp"
 #include "../core/PerfTimers.hpp"
@@ -225,6 +226,35 @@ void SurfaceRouter2D::initialize(SimulationContext& ctx) {
     const int us = ucf::getUnitSystem(static_cast<int>(ctx.options.flow_units));
     const double mesh_to_si = (us == 0) ? ft_to_m : 1.0;
 
+    // SPECIFIED_STAGE boundary heads share the mesh's vertical datum, so they
+    // convert with the same factor and under the same condition as vz: rows
+    // authored in the project's display units (feet for US) scale to the SI
+    // metres the solver compares against bed elevations; an SI-tagged mesh
+    // file's rows are already metres. Constant heads are scaled once after
+    // drainPendingRows() below; timeseries-driven heads are scaled at every
+    // lookup in resolveBoundaryValues() (the table carries display units).
+    bc_stage_scale_ =
+        (!options_.mesh_units_si && mesh_to_si != 1.0) ? mesh_to_si : 1.0;
+
+    // SPECIFIED_FLOW / TS_FLOW / RATING_CURVE discharges are authored in the
+    // project's display flow units PER METRE of edge (the GUI's contract —
+    // "Flow/m" in display units); the solver works in m³/s/m. Indexed by the
+    // FlowUnits enum order (CFS, GPM, MGD, CMS, LPS, MLD). Rating-curve
+    // STAGE (x-axis) shares the mesh vertical datum and converts with
+    // bc_stage_scale_ at lookup time.
+    {
+        static constexpr double kFlowToCms[6] = {
+            0.028316846592,     // CFS
+            6.30901964e-05,     // GPM
+            0.043812636574,     // MGD
+            1.0,                // CMS
+            0.001,              // LPS
+            0.011574074074      // MLD
+        };
+        const int fu = static_cast<int>(ctx.options.flow_units);
+        bc_flow_scale_ = (fu >= 0 && fu < 6) ? kFlowToCms[fu] : 1.0;
+    }
+
     // Convert mesh geometry from project length units (feet for US) to the SI
     // internal units the 2D solver expects. MUST run BEFORE buildMeshTopology
     // so all derived geometry (areas, edge lengths, centroids, midpoint Z) is
@@ -246,6 +276,10 @@ void SurfaceRouter2D::initialize(SimulationContext& ctx) {
         for (auto& a : mesh_.vert_coupling_area) a *= f2;
         for (auto& a : mesh_.tri_coupling_area)  a *= f2;
         for (auto& r : mesh_.tri_couplings)      r.area *= f2;
+        // INIT_DEPTH shares the mesh's vertical datum (it is a depth above the
+        // bed), so it converts with the same factor and under the same guards
+        // as vz — otherwise a US-unit deck's authored depth is read as metres.
+        for (auto& d : mesh_.tri_init_depth) d *= f;
         options_.mesh_scaled_to_si = true;
     }
 
@@ -350,6 +384,24 @@ void SurfaceRouter2D::initialize(SimulationContext& ctx) {
     // BoundaryData / mesh edge slots (sizes boundary_, flips the drained flag).
     drainPendingRows();
 
+    // Constant stage heads / flow discharges just re-drained from the
+    // authored rows are in project display units — bring them into SI.
+    // TS-driven entries (tseries slot == -2, name pending) are excluded:
+    // their value is overwritten from the table each step and scaled at
+    // lookup time; rating-curve discharges are likewise resolved per step.
+    if (bc_stage_scale_ != 1.0 || bc_flow_scale_ != 1.0) {
+        for (int idx = 0; idx < boundary_.size(); ++idx) {
+            const auto bt =
+                static_cast<BoundaryType>(boundary_.edge_bc_type[idx]);
+            if (bt == BoundaryType::SPECIFIED_STAGE
+                && boundary_.edge_bc_tseries[idx] == -1)
+                boundary_.edge_bc_head[idx] *= bc_stage_scale_;
+            else if (bt == BoundaryType::SPECIFIED_FLOW
+                     && boundary_.edge_bc_flow_tseries[idx] == -1)
+                boundary_.edge_bc_flow[idx] *= bc_flow_scale_;
+        }
+    }
+
     // A NORMAL_FLOW edge with zero bed slope produces zero Manning flux —
     // it silently behaves as a Wall (no auto-compute from bed geometry
     // exists). Warn once with a count so the authored intent isn't lost.
@@ -370,11 +422,19 @@ void SurfaceRouter2D::initialize(SimulationContext& ctx) {
         }
     }
 
-    // Set initial (dry) heads from ground elevation. FLAT: the bed centroid.
-    // VFR: the closure's dry anchor η(V=0) — chosen so the solver's
-    // head → volume seeding returns exactly V = 0 for every dry cell.
+    // Set initial heads from ground elevation plus the per-triangle
+    // [2D_TRIANGLES] INIT_DEPTH column (default 0 = dry). FLAT: the bed
+    // centroid. VFR: the closure's dry anchor η(V=0) — chosen so the
+    // solver's head → volume seeding returns exactly V = 0 for every dry
+    // cell; nonzero initial depths seed the corresponding volume and are
+    // captured as initial storage by the mass-balance ledger below.
     for (int i = 0; i < mesh_.n_triangles(); ++i) {
-        state_.head[i] = headFromMeanDepth(mesh_, options_, i, 0.0);
+        state_.head[i] = headFromMeanDepth(mesh_, options_, i,
+                                           mesh_.tri_init_depth[i]);
+        // Volume is the marcher's primary state (reconstructAll derives
+        // head/depth from it) — seed it directly; mean-depth * area holds
+        // for both FLAT and VFR closures by definition of the mean depth.
+        state_.volume[i] = mesh_.tri_init_depth[i] * mesh_.tri_area[i];
     }
     // Seed the vertex heads once from the dry cell heads: the all-vertex pass
     // now runs per accepted window (not per RHS eval), so pre-first-window
@@ -1029,23 +1089,32 @@ void SurfaceRouter2D::resolveBoundaryValues(SimulationContext& ctx, double t) {
     const int ne = boundary_.size();
     if (ne == 0) return;
 
-    // One-shot: resolve deferred timeseries / curve names to registry indices.
-    // ctx.table_names is only populated post-parse, so this can't happen at
-    // parse time; -2 = "name pending", -1 = not found (then treated as constant).
+    // One-shot: resolve deferred timeseries / curve names to table indices.
+    // ctx.tables is only populated post-parse, so this can't happen at parse
+    // time; -2 = "name pending", -1 = not found (then treated as constant).
     if (!boundary_names_resolved_) {
         boundary_names_resolved_ = true;
         for (int idx = 0; idx < ne; ++idx) {
             if (boundary_.edge_bc_tseries[idx] == -2)
                 boundary_.edge_bc_tseries[idx] =
-                    ctx.table_names.find(boundary_.edge_bc_tseries_name[idx]);
+                    ctx.find_timeseries(boundary_.edge_bc_tseries_name[idx]);
             if (boundary_.edge_bc_flow_tseries[idx] == -2)
                 boundary_.edge_bc_flow_tseries[idx] =
-                    ctx.table_names.find(boundary_.edge_bc_flow_tseries_name[idx]);
+                    ctx.find_timeseries(boundary_.edge_bc_flow_tseries_name[idx]);
             if (boundary_.edge_bc_rating_curve[idx] == -2)
                 boundary_.edge_bc_rating_curve[idx] =
-                    ctx.table_names.find(boundary_.edge_bc_rating_curve_name[idx]);
+                    ctx.find_curve(boundary_.edge_bc_rating_curve_name[idx]);
         }
     }
+
+    // Timeseries tables are keyed in absolute OADate days (PostParseResolver
+    // anchors relative series to start_date), but t is ELAPSED SECONDS from
+    // simulation start (ctx.current_time). Convert before the lookup — every
+    // other tseries consumer (climate, buildup, external inflows) does the
+    // same. Querying with raw seconds clamped every lookup to the series'
+    // first value (elapsed seconds < OADate days for the first ~12.8 h of a
+    // 2026-dated run), so a TS_STAGE/TS_FLOW boundary behaved as a constant.
+    const double abs_t = datetime::addSeconds(ctx.options.start_date, t);
 
     const int n_tables = static_cast<int>(ctx.tables.tables.size());
     for (int idx = 0; idx < ne; ++idx) {
@@ -1053,26 +1122,35 @@ void SurfaceRouter2D::resolveBoundaryValues(SimulationContext& ctx, double t) {
             case BoundaryType::SPECIFIED_STAGE: {
                 const int ts = boundary_.edge_bc_tseries[idx];
                 if (ts >= 0 && ts < n_tables)
-                    boundary_.edge_bc_head[idx] =
-                        table_lookup_cursor(ctx.tables.tables[ts], t);
+                    // Stage values are authored in project display units
+                    // (like the constant form); scale onto the SI datum.
+                    boundary_.edge_bc_head[idx] = bc_stage_scale_ *
+                        table_lookup_cursor(ctx.tables.tables[ts], abs_t);
                 break;  // else constant: edge_bc_head already holds the value
             }
             case BoundaryType::SPECIFIED_FLOW: {
                 const int ts = boundary_.edge_bc_flow_tseries[idx];
                 if (ts >= 0 && ts < n_tables)
-                    boundary_.edge_bc_flow[idx] =
-                        table_lookup_cursor(ctx.tables.tables[ts], t);
+                    // Series values are authored in display flow units per
+                    // metre (like the constant form); scale to m³/s/m.
+                    boundary_.edge_bc_flow[idx] = bc_flow_scale_ *
+                        table_lookup_cursor(ctx.tables.tables[ts], abs_t);
                 break;
             }
             case BoundaryType::RATING_CURVE: {
                 const int cv = boundary_.edge_bc_rating_curve[idx];
                 if (cv >= 0 && cv < n_tables) {
                     // Stage = boundary cell water-surface elevation (lagged to
-                    // start-of-step). Curve maps stage → outward discharge per
-                    // metre of edge (m³/s/m), consistent with SPECIFIED_FLOW.
+                    // start-of-step). The curve is authored in display units
+                    // on both axes — stage (x) shares the mesh vertical datum
+                    // (feet for US), discharge (y) is display flow units per
+                    // metre of edge — so the SI head converts back to display
+                    // for the query and the result scales to m³/s/m,
+                    // consistent with SPECIFIED_FLOW.
                     const int i = idx / 3;
-                    boundary_.edge_bc_flow[idx] =
-                        table_lookupEx(ctx.tables.tables[cv], state_.head[i]);
+                    boundary_.edge_bc_flow[idx] = bc_flow_scale_ *
+                        table_lookupEx(ctx.tables.tables[cv],
+                                       state_.head[i] / bc_stage_scale_);
                 }
                 break;
             }

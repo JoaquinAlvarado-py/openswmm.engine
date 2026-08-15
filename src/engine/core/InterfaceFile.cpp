@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file InterfaceFile.cpp
  * @brief Routing interface file — coupling between separate SWMM simulations.
@@ -19,7 +35,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "InterfaceFile.hpp"
@@ -495,12 +511,18 @@ int InterfaceManager::getIfaceNode(int index) const {
 bool InterfaceManager::isOutletNode(const SimulationContext& ctx, int node_idx) {
     auto ui = static_cast<std::size_t>(node_idx);
 
-    // For dynamic wave routing, only outfalls are outlets
-    if (ctx.options.routing_model == RoutingModel::DYNWAVE) {
+    // Under a routing model that solves the full network, only an OUTFALL
+    // discharges out of it — every other node is interior however its links are
+    // oriented. FV belongs on this side with DW: sending it down the branch
+    // below wrote SAVE OUTFLOWS for a different set of nodes than the run
+    // actually discharged through.
+    if (ctx.options.routing_model == RoutingModel::DYNWAVE ||
+        ctx.options.routing_model == RoutingModel::FV) {
         return ctx.nodes.type[ui] == NodeType::OUTFALL;
     }
 
-    // For other routing methods, outlets are nodes with no outflow links
+    // KINWAVE / STEADY route downhill only, so an outlet is a node with no
+    // outflow links.
     return ctx.nodes.degree[ui] == 0;
 }
 

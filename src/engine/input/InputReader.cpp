@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file InputReader.cpp
  * @brief Implementation of the top-level SWMM .inp file reader.
@@ -7,11 +23,13 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "InputReader.hpp"
 #include "Tokenizer.hpp"
+#include "../core/ErrorCodes.hpp"
+#include "../core/PerfTimers.hpp"
 
 #include <fstream>
 #include <sstream>
@@ -59,6 +77,7 @@ bool InputReader::read_stream(std::istream& stream, SimulationContext& ctx) {
 
     auto flush_section = [&]() {
         if (!current_tag.empty()) {
+            perf::ScopedTimer _pt(perf::sec_read_dispatch);
             dispatch_section(current_tag, section_lines, ctx);
             section_lines.clear();
         }
@@ -119,7 +138,48 @@ bool InputReader::read_stream(std::istream& stream, SimulationContext& ctx) {
     // Flush the last section
     flush_section();
 
+    // Sections are dispatched in file order, so a property row naming an object
+    // declared further down could not resolve. Give those rows one more pass now
+    // that every section has been read.
+    replay_deferred_rows(ctx);
+
     return ctx.error_code == 0;
+}
+
+// ============================================================================
+// replay_deferred_rows()
+// ============================================================================
+
+void InputReader::replay_deferred_rows(SimulationContext& ctx) {
+    if (ctx.deferred_section_rows.empty()) return;
+
+    const auto pending = std::move(ctx.deferred_section_rows);
+    ctx.deferred_section_rows.clear();
+
+    // Group by tag, preserving file order within each tag. A handler that still
+    // cannot resolve a row re-stashes it, which is how the unresolvable ones are
+    // detected below — no per-handler "am I replaying?" flag is needed.
+    std::vector<std::string> tags;
+    for (const auto& row : pending) {
+        if (std::find(tags.begin(), tags.end(), row.first) == tags.end())
+            tags.push_back(row.first);
+    }
+
+    for (const auto& tag : tags) {
+        std::vector<std::string> lines;
+        for (const auto& row : pending) {
+            if (row.first == tag) lines.push_back(row.second);
+        }
+        dispatch_section(tag, lines, ctx);
+    }
+
+    // Anything re-stashed on the replay names an object that does not exist.
+    // Legacy SWMM treats that as fatal (ERROR 209), so it must not be silent.
+    for (const auto& row : ctx.deferred_section_rows) {
+        auto tok = Tokenizer::tokenize(row.second);
+        ctx.errors.push_back(format_error(ERR_NAME, tok.empty() ? row.second : tok[0]));
+    }
+    ctx.deferred_section_rows.clear();
 }
 
 // ============================================================================

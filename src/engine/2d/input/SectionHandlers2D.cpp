@@ -27,8 +27,10 @@ namespace openswmm::twoD {
 
 namespace {
 
-// Case-insensitive string comparison
-bool iequals(const std::string& a, const std::string& b) {
+// Case-insensitive string comparison. Takes views so callers on the
+// allocation-free scan paths (prescan2DUnitsHeader) need no temporaries;
+// std::string arguments still convert implicitly.
+bool iequals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
         if (std::toupper(static_cast<unsigned char>(a[i]))
@@ -75,7 +77,7 @@ const std::string RETIRED_SUFFIX =
     " was retired with the CVODE/ARKODE 2D solvers: the explicit "
     "local-inertial marcher is the only 2D integrator. Remove the line; "
     "marcher settings are THETA, CFL_NUMBER, LTS_TIERS, H_MOVE, FROUDE_MAX, "
-    "MAX_TIMESTEP, COUPLING_AREA.";
+    "ADVECTION, MAX_TIMESTEP, COUPLING_AREA.";
 
 /// Retired [2D_OPTIONS] material: warn-and-ignore when a warnings sink is
 /// available (the file-load path — legacy models must still open), hard
@@ -193,6 +195,14 @@ std::string parse2DOptionsLine(const std::vector<std::string>& tokens,
         if (!ok || f <= 0.0)
             return "Invalid FROUDE_MAX value (expected > 0)";
         opts.froude_max = f;
+    } else if (iequals(key, "ADVECTION")) {
+        if (iequals(val, "YES") || iequals(val, "ON") || iequals(val, "TRUE"))
+            opts.advection = true;
+        else if (iequals(val, "NO") || iequals(val, "OFF") ||
+                 iequals(val, "FALSE"))
+            opts.advection = false;
+        else
+            return "Unknown ADVECTION: " + val + " (expected YES|NO)";
     } else if (iequals(key, "COUPLING_AREA")) {
         if (iequals(val, "AUTO"))
             opts.coupling_area_auto = true;
@@ -234,7 +244,7 @@ bool is2DOptionKey(const std::string& key) {
         "CELL_CLOSURE", "FACE_RECONSTRUCTION", "VFR_MIN_WET_FRAC",
         "OUTPUT_FILE",
         "INTEGRATOR", "THETA", "CFL_NUMBER", "H_MOVE",
-        "LTS_TIERS", "FROUDE_MAX", "COUPLING_AREA",
+        "LTS_TIERS", "FROUDE_MAX", "ADVECTION", "COUPLING_AREA",
     };
     for (const char* k : kKeys) {
         if (iequals(key, k)) return true;
@@ -279,6 +289,7 @@ std::string format2DOptionValue(const SolverOptions2D& opts,
     if (iequals(key, "H_MOVE"))        return fmt_g(opts.h_move);
     if (iequals(key, "LTS_TIERS"))     return std::to_string(opts.lts_tiers);
     if (iequals(key, "FROUDE_MAX"))    return fmt_g(opts.froude_max);
+    if (iequals(key, "ADVECTION"))     return opts.advection ? "YES" : "NO";
     if (iequals(key, "COUPLING_AREA")) return opts.coupling_area_auto ? "AUTO" : "DEFAULT";
     return {};
 }
@@ -314,7 +325,8 @@ std::string parse2DVertexLine(const std::vector<std::string>& tokens,
 
 std::string parse2DTriangleLine(const std::vector<std::string>& tokens,
                                  MeshData& mesh) {
-    if (tokens.size() < 4) return "Expected V1 V2 V3 MANNINGS_N [TAG]";
+    if (tokens.size() < 4)
+        return "Expected V1 V2 V3 MANNINGS_N [INIT_DEPTH] [TAG]";
 
     bool ok = false;
     int v0 = tryParseInt(tokens[0], ok);
@@ -329,8 +341,24 @@ std::string parse2DTriangleLine(const std::vector<std::string>& tokens,
     double n = tryParseDouble(tokens[3], ok);
     if (!ok) return "Invalid MANNINGS_N value";
 
+    // Optional column 5: INIT_DEPTH when numeric (m, >= 0, default 0 = dry),
+    // otherwise it is the TAG (backward compatible with the historical
+    // `V1 V2 V3 MANNINGS_N TAG` form). Column 6 is TAG when INIT_DEPTH is
+    // present. Files written by the engine/GUI always emit INIT_DEPTH when a
+    // tag exists, so round-tripped files are unambiguous.
+    double init_depth = 0.0;
     std::string tag;
-    if (tokens.size() >= 5) tag = tokens[4];
+    if (tokens.size() >= 5) {
+        bool num = false;
+        double d = tryParseDouble(tokens[4], num);
+        if (num) {
+            if (d < 0.0) return "Invalid INIT_DEPTH (must be >= 0)";
+            init_depth = d;
+            if (tokens.size() >= 6) tag = tokens[5];
+        } else {
+            tag = tokens[4];
+        }
+    }
 
     int idx = mesh.n_triangles();
     mesh.resize_triangles(idx + 1);
@@ -338,8 +366,35 @@ std::string parse2DTriangleLine(const std::vector<std::string>& tokens,
     mesh.tri_v1[idx] = v1;
     mesh.tri_v2[idx] = v2;
     mesh.mannings_n[idx] = n;
+    mesh.tri_init_depth[idx] = init_depth;
     mesh.tri_tag[idx] = tag;
 
+    return {};
+}
+
+
+// [2D_INITIAL_VELOCITY] — optional per-triangle initial velocity (m/s):
+//   TRI  U  V
+// Default is (0, 0); rows may cover any subset of triangles. The explicit
+// marcher projects (h·u, h·v) onto its face normals at initialize to seed the
+// prognostic face discharges (a depth-only IC cannot represent solutions with
+// v(t=0) ≠ 0, e.g. the SWASHES Thacker planar oscillation).
+std::string parse2DInitialVelocityLine(const std::vector<std::string>& tokens,
+                                       MeshData& mesh) {
+    if (tokens.size() < 3) return "Expected TRI U V";
+
+    bool ok = false;
+    int tri = tryParseInt(tokens[0], ok);
+    if (!ok || tri < 0 || tri >= mesh.n_triangles())
+        return "Invalid triangle index: " + tokens[0];
+
+    double u = tryParseDouble(tokens[1], ok);
+    if (!ok) return "Invalid U value";
+    double v = tryParseDouble(tokens[2], ok);
+    if (!ok) return "Invalid V value";
+
+    mesh.tri_init_u[tri] = u;
+    mesh.tri_init_v[tri] = v;
     return {};
 }
 
@@ -618,6 +673,11 @@ void register2DSections(MeshData& mesh,
             return parse2DTriangleLine(tokens, mesh);
         }));
 
+    registry.register_custom("2D_INITIAL_VELOCITY",
+        makeSectionHandler([&mesh](const std::vector<std::string>& tokens) {
+            return parse2DInitialVelocityLine(tokens, mesh);
+        }));
+
     registry.register_custom("2D_VERTEX_NODE_MAP",
         makeSectionHandler([&mesh](const std::vector<std::string>& tokens) {
             return parse2DVertexNodeMapLine(tokens, mesh);
@@ -693,6 +753,10 @@ std::string load2DMeshExternalFile(MeshData& mesh,
         makeSectionHandler([&mesh](const std::vector<std::string>& tokens) {
             return parse2DTriangleLine(tokens, mesh);
         }));
+    mini.register_custom("2D_INITIAL_VELOCITY",
+        makeSectionHandler([&mesh](const std::vector<std::string>& tokens) {
+            return parse2DInitialVelocityLine(tokens, mesh);
+        }));
     mini.register_custom("2D_VERTEX_NODE_MAP",
         makeSectionHandler([&mesh](const std::vector<std::string>& tokens) {
             return parse2DVertexNodeMapLine(tokens, mesh);
@@ -735,19 +799,31 @@ void prescan2DUnitsHeader(const std::string& inp_path, SolverOptions2D& opts)
     std::ifstream in(inp_path);
     if (!in) return;  // file missing — caller will surface the error
 
-    auto trim = [](std::string s) {
+    // Views, not strings. This pass reads the ENTIRE .inp — see the note below
+    // on why it cannot stop early — so on a large model it visits millions of
+    // lines. The previous by-value `trim(std::string)` allocated twice per
+    // line (the parameter copy and the substr result) for a scan that almost
+    // always finds nothing.
+    const auto trim = [](std::string_view s) noexcept {
         const auto issp = [](unsigned char c) { return std::isspace(c) != 0; };
-        while (!s.empty() && issp(static_cast<unsigned char>(s.back())))   s.pop_back();
-        std::size_t i = 0;
-        while (i < s.size() && issp(static_cast<unsigned char>(s[i]))) ++i;
-        return s.substr(i);
+        while (!s.empty() && issp(static_cast<unsigned char>(s.back())))
+            s.remove_suffix(1);
+        while (!s.empty() && issp(static_cast<unsigned char>(s.front())))
+            s.remove_prefix(1);
+        return s;
     };
 
+    // NB: this deliberately scans to EOF rather than stopping at the first
+    // "[SECTION]" header. The header is not always in the pre-section prefix —
+    // InpWriter emits `;; UNITS: SI (m)` underneath [2D_VERTICES] (InpWriter.cpp
+    // writeMesh2D), so every .inp the engine itself writes carries it mid-file.
+    // Stopping early would silently drop SI mesh scaling on round-trip.
+    // Last match wins, matching the previous behaviour.
     std::string line;
     while (std::getline(in, line)) {
-        const std::string t = trim(line);
+        const std::string_view t = trim(line);
         if (t.size() < 2 || t[0] != ';' || t[1] != ';') continue;
-        std::string rest = trim(t.substr(2));
+        std::string_view rest = trim(t.substr(2));
         // Match "UNITS:" prefix case-insensitively.
         constexpr std::string_view kKey = "UNITS:";
         if (rest.size() < kKey.size()) continue;
@@ -758,7 +834,7 @@ void prescan2DUnitsHeader(const std::string& inp_path, SolverOptions2D& opts)
             }
         }
         if (!match) continue;
-        const std::string value = trim(rest.substr(kKey.size()));
+        const std::string_view value = trim(rest.substr(kKey.size()));
         // Recognised metric markers.  Anything else (including absent /
         // unknown / explicit "ft") leaves the flag at its current value.
         const bool si =

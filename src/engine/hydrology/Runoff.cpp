@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file Runoff.cpp
  * @brief Subcatchment runoff — 3-subarea nonlinear reservoir model.
@@ -19,7 +35,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "Runoff.hpp"
@@ -229,8 +245,12 @@ void RunoffSolver::init(SimulationContext& ctx) {
                 break;
             case 4:
                 infil_models_[ui] = InfilModel::CURVE_NUM;
+                // Drying time is p3 — the third [INFILTRATION] column, matching
+                // legacy curvenum_setParams(), which reads p[2]. Reading p4 here
+                // left regen at 0 for every file-loaded CN subcatchment, so the
+                // soil store never recovered between events.
                 infil::curvenum_init(curvenum_states_[ui],
-                    ctx.subcatches.infil_p1[ui], ctx.subcatches.infil_p4[ui]);
+                    ctx.subcatches.infil_p1[ui], ctx.subcatches.infil_p3[ui]);
                 break;
         }
     }

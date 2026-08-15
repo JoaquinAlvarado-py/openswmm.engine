@@ -1,10 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Caleb Buahin
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Enumerations
 ============
 
 :author: Caleb Buahin
 :copyright: Copyright (c) 2026 Caleb Buahin
-:license: MIT
+:license: Apache-2.0
 
 Integer-backed enums mirroring the C API enum definitions in
 ``openswmm_engine.h``. These are pure Python (no Cython required)
@@ -187,12 +203,17 @@ class RouteModel(IntEnum):
 
     @cvar STEADY: Steady-state routing.
     @cvar KINWAVE: Kinematic wave routing.
-    @cvar DYNWAVE: Dynamic wave (full Saint-Venant) routing.
+    @cvar DYNWAVE: Dynamic wave (full Saint-Venant), implicit. The default.
+    @cvar FV: Explicit conservative finite volume (Godunov). Conserves volume
+        exactly and captures pressurization fronts and transcritical flow, at
+        the cost of needing a resolved mesh — set ``FV_CELL_LENGTH``. See the
+        Hydraulics Reference Manual, Chapter 8.
     """
 
     STEADY = 0
     KINWAVE = 1
     DYNWAVE = 2
+    FV = 3
 
 
 class NodeType(IntEnum):

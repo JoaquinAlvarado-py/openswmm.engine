@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_subcatchments_impl.cpp
  * @brief C API implementation — subcatchment identity, creation, properties, state, bulk.
@@ -7,10 +23,11 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "openswmm_api_common.hpp"
+#include "StringCase.hpp"
 #include "../../../include/openswmm/engine/openswmm_subcatchments.h"
 
 #include <algorithm>
@@ -122,6 +139,15 @@ SWMM_ENGINE_API int swmm_subcatch_set_imperv_pct(SWMM_Engine engine, int idx, do
     return SWMM_OK;
 }
 
+SWMM_ENGINE_API int swmm_subcatch_set_zero_imperv_pct(SWMM_Engine engine, int idx, double pct) {
+    CHECK_HANDLE(engine);
+    auto& ctx = to_engine(engine)->context();
+    CHECK_GEOMETRY(ctx);
+    CHECK_INDEX(idx >= 0 && idx < ctx.n_subcatches());
+    ctx.subcatches.frac_imperv_no_store[static_cast<std::size_t>(idx)] = pct / 100.0;
+    return SWMM_OK;
+}
+
 SWMM_ENGINE_API int swmm_subcatch_set_n_imperv(SWMM_Engine engine, int idx, double n) {
     CHECK_HANDLE(engine);
     auto& ctx = to_engine(engine)->context();
@@ -203,7 +229,7 @@ SWMM_ENGINE_API int swmm_subcatch_set_infil_green_ampt(SWMM_Engine engine, int i
 }
 
 SWMM_ENGINE_API int swmm_subcatch_set_infil_curve_number(SWMM_Engine engine, int idx,
-                                                           double cn) {
+                                                           double cn, double drying_time) {
     CHECK_HANDLE(engine);
     auto& ctx = to_engine(engine)->context();
     CHECK_GEOMETRY(ctx);
@@ -211,6 +237,9 @@ SWMM_ENGINE_API int swmm_subcatch_set_infil_curve_number(SWMM_Engine engine, int
     auto uidx = static_cast<std::size_t>(idx);
     ctx.subcatches.infil_model[uidx] = 4; // CURVE_NUMBER
     ctx.subcatches.infil_p1[uidx] = cn;
+    // p3 is the drying-time slot for CURVE_NUMBER: it is the third
+    // [INFILTRATION] column and legacy curvenum_setParams reads p[2].
+    ctx.subcatches.infil_p3[uidx] = drying_time;
     return SWMM_OK;
 }
 
@@ -249,6 +278,14 @@ SWMM_ENGINE_API int swmm_subcatch_get_imperv_pct(SWMM_Engine engine, int idx, do
     const auto& ctx = to_engine(engine)->context();
     CHECK_INDEX(idx >= 0 && idx < ctx.n_subcatches());
     if (pct) *pct = ctx.subcatches.frac_imperv[static_cast<std::size_t>(idx)] * 100.0;
+    return SWMM_OK;
+}
+
+SWMM_ENGINE_API int swmm_subcatch_get_zero_imperv_pct(SWMM_Engine engine, int idx, double* pct) {
+    CHECK_HANDLE(engine);
+    const auto& ctx = to_engine(engine)->context();
+    CHECK_INDEX(idx >= 0 && idx < ctx.n_subcatches());
+    if (pct) *pct = ctx.subcatches.frac_imperv_no_store[static_cast<std::size_t>(idx)] * 100.0;
     return SWMM_OK;
 }
 
@@ -376,11 +413,14 @@ SWMM_ENGINE_API int swmm_subcatch_get_infil_green_ampt(SWMM_Engine engine, int i
     return SWMM_OK;
 }
 
-SWMM_ENGINE_API int swmm_subcatch_get_infil_curve_number(SWMM_Engine engine, int idx, double* cn) {
+SWMM_ENGINE_API int swmm_subcatch_get_infil_curve_number(SWMM_Engine engine, int idx,
+                                                           double* cn, double* drying_time) {
     CHECK_HANDLE(engine);
     const auto& ctx = to_engine(engine)->context();
     CHECK_INDEX(idx >= 0 && idx < ctx.n_subcatches());
-    if (cn) *cn = ctx.subcatches.infil_p1[static_cast<std::size_t>(idx)];
+    auto uidx = static_cast<std::size_t>(idx);
+    if (cn)          *cn          = ctx.subcatches.infil_p1[uidx];
+    if (drying_time) *drying_time = ctx.subcatches.infil_p3[uidx];
     return SWMM_OK;
 }
 
@@ -456,6 +496,68 @@ SWMM_ENGINE_API int swmm_subcatch_get_coverage(SWMM_Engine engine, int sc_idx, i
              static_cast<std::size_t>(ctx.n_landuses()) +
              static_cast<std::size_t>(lu_idx);
     if (fraction) *fraction = ctx.subcatches.coverage[k];
+    return SWMM_OK;
+}
+
+SWMM_ENGINE_API int swmm_subcatch_get_coverages(SWMM_Engine engine, int sc_idx, double* out, int n) {
+    CHECK_HANDLE(engine);
+    const auto& ctx = to_engine(engine)->context();
+    CHECK_INDEX(sc_idx >= 0 && sc_idx < ctx.n_subcatches());
+    CHECK_INDEX(n >= 0 && n <= ctx.n_landuses());
+    if (!out) return SWMM_ERR_BADPARAM;
+
+    const bool sized = !ctx.subcatches.coverage.empty() &&
+                       ctx.subcatches.coverage_n_landuses == ctx.n_landuses();
+    const auto base = static_cast<std::size_t>(sc_idx) *
+                      static_cast<std::size_t>(ctx.n_landuses());
+    for (int lu = 0; lu < n; ++lu)
+        out[lu] = sized ? ctx.subcatches.coverage[base + static_cast<std::size_t>(lu)]
+                        : 0.0;
+    return SWMM_OK;
+}
+
+// ============================================================================
+// Initial pollutant loadings ([LOADINGS])
+// ============================================================================
+
+SWMM_ENGINE_API int swmm_subcatch_set_initial_loading(SWMM_Engine engine, int sc_idx, int pollut_idx, double buildup) {
+    CHECK_HANDLE(engine);
+    auto& ctx = to_engine(engine)->context();
+    CHECK_GEOMETRY(ctx);
+    CHECK_INDEX(sc_idx >= 0 && sc_idx < ctx.n_subcatches());
+    CHECK_INDEX(pollut_idx >= 0 && pollut_idx < ctx.n_pollutants());
+
+    // Ensure the quality arrays are sized ([LOADINGS] parks the initial
+    // buildup in subcatches.conc — same storage handle_loadings uses).
+    if (ctx.subcatches.conc_n_pollutants != ctx.n_pollutants() ||
+        static_cast<int>(ctx.subcatches.conc.size()) !=
+            ctx.n_subcatches() * ctx.n_pollutants()) {
+        ctx.subcatches.resize_quality(ctx.n_pollutants());
+    }
+
+    auto k = static_cast<std::size_t>(sc_idx) *
+             static_cast<std::size_t>(ctx.n_pollutants()) +
+             static_cast<std::size_t>(pollut_idx);
+    ctx.subcatches.conc[k] = buildup;
+    return SWMM_OK;
+}
+
+SWMM_ENGINE_API int swmm_subcatch_get_initial_loading(SWMM_Engine engine, int sc_idx, int pollut_idx, double* buildup) {
+    CHECK_HANDLE(engine);
+    const auto& ctx = to_engine(engine)->context();
+    CHECK_INDEX(sc_idx >= 0 && sc_idx < ctx.n_subcatches());
+    CHECK_INDEX(pollut_idx >= 0 && pollut_idx < ctx.n_pollutants());
+
+    if (ctx.subcatches.conc.empty() ||
+        ctx.subcatches.conc_n_pollutants != ctx.n_pollutants()) {
+        if (buildup) *buildup = 0.0;
+        return SWMM_OK;
+    }
+
+    auto k = static_cast<std::size_t>(sc_idx) *
+             static_cast<std::size_t>(ctx.n_pollutants()) +
+             static_cast<std::size_t>(pollut_idx);
+    if (buildup) *buildup = ctx.subcatches.conc[k];
     return SWMM_OK;
 }
 
@@ -920,11 +1022,9 @@ SWMM_ENGINE_API int swmm_aquifer_count(SWMM_Engine engine) {
 
 SWMM_ENGINE_API int swmm_aquifer_index(SWMM_Engine engine, const char* id) {
     if (!engine || !id) return -1;
-    const auto& names = to_engine(engine)->context().aquifers.names;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        if (names[i] == id) return static_cast<int>(i);
-    }
-    return -1;
+    // Route through the registry (case-insensitive, legacy hash.c parity)
+    // instead of scanning aquifers.names, which could disagree with it.
+    return to_engine(engine)->context().aquifer_names.find(id);
 }
 
 SWMM_ENGINE_API const char* swmm_aquifer_id(SWMM_Engine engine, int idx) {
@@ -939,6 +1039,9 @@ SWMM_ENGINE_API int swmm_aquifer_add(SWMM_Engine engine, const char* id) {
     if (!id) return SWMM_ERR_BADPARAM;
     auto& ctx = to_engine(engine)->context();
     CHECK_EDITABLE(ctx);
+    // Reject duplicates (case-insensitive) BEFORE touching the backing store;
+    // an unguarded NameIndex::add would throw across the C ABI.
+    if (ctx.aquifer_names.find(id) >= 0) return SWMM_ERR_BADPARAM;
 
     auto& aq = ctx.aquifers;
     aq.names.push_back(id);
@@ -957,6 +1060,26 @@ SWMM_ENGINE_API int swmm_aquifer_add(SWMM_Engine engine, const char* id) {
     aq.upper_evap_pat.push_back("");
 
     ctx.aquifer_names.add(id);
+    return SWMM_OK;
+}
+
+SWMM_ENGINE_API int swmm_aquifer_rename(SWMM_Engine engine, int idx, const char* new_id) {
+    CHECK_HANDLE(engine);
+    if (!new_id || new_id[0] == '\0') return SWMM_ERR_BADPARAM;
+    auto& ctx = to_engine(engine)->context();
+    CHECK_EDITABLE(ctx);
+    CHECK_INDEX(idx >= 0 && idx < ctx.aquifers.count());
+
+    // The name lives in TWO stores: aquifers.names backs swmm_aquifer_id, the
+    // NameIndex backs swmm_aquifer_index. Updating one without the other makes
+    // the two disagree. NameIndex::rename does the collision check (and allows
+    // a pure case-respelling of this same entry), so run it first and only
+    // touch the vector once it has accepted.
+    if (!ctx.aquifer_names.rename(idx, new_id)) return SWMM_ERR_BADPARAM;
+    ctx.aquifers.names[static_cast<std::size_t>(idx)] = new_id;
+
+    // No fixup needed elsewhere: [GROUNDWATER] resolves to an aquifer INDEX at
+    // parse time (subcatches.gw_aquifer) and keeps no name string.
     return SWMM_OK;
 }
 
@@ -1083,11 +1206,9 @@ SWMM_ENGINE_API int swmm_snowpack_count(SWMM_Engine engine) {
 
 SWMM_ENGINE_API int swmm_snowpack_index(SWMM_Engine engine, const char* id) {
     if (!engine || !id) return -1;
-    const auto& names = to_engine(engine)->context().snowpacks.names;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        if (names[i] == id) return static_cast<int>(i);
-    }
-    return -1;
+    // Route through the registry (case-insensitive, legacy hash.c parity)
+    // instead of scanning snowpacks.names, which could disagree with it.
+    return to_engine(engine)->context().snowpack_names.find(id);
 }
 
 SWMM_ENGINE_API const char* swmm_snowpack_id(SWMM_Engine engine, int idx) {
@@ -1102,6 +1223,9 @@ SWMM_ENGINE_API int swmm_snowpack_add(SWMM_Engine engine, const char* id) {
     if (!id) return SWMM_ERR_BADPARAM;
     auto& ctx = to_engine(engine)->context();
     CHECK_EDITABLE(ctx);
+    // Reject duplicates (case-insensitive) BEFORE touching the backing store;
+    // an unguarded NameIndex::add would throw across the C ABI.
+    if (ctx.snowpack_names.find(id) >= 0) return SWMM_ERR_BADPARAM;
 
     auto& sp = ctx.snowpacks;
     sp.names.push_back(id);
@@ -1112,6 +1236,32 @@ SWMM_ENGINE_API int swmm_snowpack_add(SWMM_Engine engine, const char* id) {
     sp.removal_subcatch.push_back("");
 
     ctx.snowpack_names.add(id);
+    return SWMM_OK;
+}
+
+SWMM_ENGINE_API int swmm_snowpack_rename(SWMM_Engine engine, int idx, const char* new_id) {
+    CHECK_HANDLE(engine);
+    if (!new_id || new_id[0] == '\0') return SWMM_ERR_BADPARAM;
+    auto& ctx = to_engine(engine)->context();
+    CHECK_EDITABLE(ctx);
+    CHECK_INDEX(idx >= 0 && idx < ctx.snowpacks.count());
+    const auto ui = static_cast<std::size_t>(idx);
+
+    // Two stores hold the name and both are read: snowpacks.names backs
+    // swmm_snowpack_id and the [SNOWPACKS] writer, while the NameIndex backs
+    // swmm_snowpack_index and the [SUBCATCHMENTS] snow-pack column. Let
+    // NameIndex::rename arbitrate the collision, then mirror into the vector.
+    const std::string prev = ctx.snowpacks.names[ui];
+    if (!ctx.snowpack_names.rename(idx, new_id)) return SWMM_ERR_BADPARAM;
+    ctx.snowpacks.names[ui] = new_id;
+
+    // subcatches.snowpack_name is the parse-time deferred-resolution string.
+    // PostParseResolver has already turned it into subcatches.snowpack, and no
+    // writer reads it, but keeping it coherent means a re-resolve cannot bind
+    // the subcatchment to a name that no longer exists.
+    for (auto& ref : ctx.subcatches.snowpack_name) {
+        if (openswmm::ieq(ref, prev)) ref = new_id;
+    }
     return SWMM_OK;
 }
 

@@ -1,10 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Caleb Buahin
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Node access (Pythonic v1 surface)
 =================================
 
 :author: Caleb Buahin
 :copyright: Copyright (c) 2026 Caleb Buahin
-:license: MIT
+:license: Apache-2.0
 
 The :class:`Nodes` collection and :class:`Node` wrapper are the entry
 point for reading and writing node state in the new bindings. The
@@ -427,6 +443,51 @@ cdef class Node:
         return NodeType(v)
 
     @property
+    def is_virtual(self) -> bool:
+        """C{True} when this node is a virtual junction.
+
+        A virtual junction is a zero-storage, momentum-transmitting
+        JUNCTION-typed node connecting exactly two conduits of identical
+        cross-section (INP C{[VIRTUAL_JUNCTIONS]}; refactored engine only).
+
+        Setting to C{True} runs full validation of the usage rules (exactly
+        two conduits, identical cross-section, zero offsets, no lateral
+        inflow sources) and applies the derived-geometry contract; a violated
+        rule raises with the specific rule message. Setting to C{False}
+        always succeeds for a virtual node.
+
+        @rtype: bool
+        """
+        _check_fresh(self)
+        cdef int v = 0
+        _check(swmm_node_is_virtual(_h(self._solver), self._index, &v))
+        return v != 0
+
+    @is_virtual.setter
+    def is_virtual(self, value) -> None:
+        _check_fresh(self)
+        _check(swmm_node_set_virtual(_h(self._solver), self._index,
+                                     1 if value else 0))
+
+    @property
+    def virtual_rule_violation(self) -> int:
+        """Dry-run check of the virtual-junction usage rules for this node.
+
+        C{0} when the node satisfies every structural rule (exactly two
+        attached conduits of identical cross-section, zero offsets, no
+        lateral inflow sources, dynamic-wave routing) — i.e. setting
+        L{is_virtual} to C{True} would succeed on a JUNCTION-typed node —
+        else the distinct ERR_VJ_* rule code (609-621) identifying the
+        violated rule. Read-only; no state is changed.
+
+        @rtype: int
+        """
+        _check_fresh(self)
+        cdef int code = 0
+        _check(swmm_node_virtual_eligible(_h(self._solver), self._index, &code))
+        return code
+
+    @property
     def solver(self):
         """The parent :class:`Solver`. Useful for cross-domain access."""
         return self._solver
@@ -456,6 +517,28 @@ cdef class Node:
     def max_depth(self, double value) -> None:
         _check_fresh(self)
         _check(swmm_node_set_max_depth(_h(self._solver), self._index, value))
+
+    @property
+    def rim_depth(self) -> float:
+        """Rendering-only rim (ground) depth above the invert; 0 = unset.
+
+        No hydraulics, routing, reporting or output-file path reads this, so
+        setting it can never change a result. It exists for virtual junctions,
+        whose L{max_depth} is derived (always the shared pipe crown): without
+        it a drawn ground line collapses to the crown at every break point.
+        It is the optional third token of an INP C{[VIRTUAL_JUNCTIONS]} row.
+
+        When 0, a renderer should fall back to L{max_depth}.
+        """
+        _check_fresh(self)
+        cdef double v = 0.0
+        _check(swmm_node_get_rim_depth(_h(self._solver), self._index, &v))
+        return v
+
+    @rim_depth.setter
+    def rim_depth(self, double value) -> None:
+        _check_fresh(self)
+        _check(swmm_node_set_rim_depth(_h(self._solver), self._index, value))
 
     @property
     def surcharge_depth(self) -> float:

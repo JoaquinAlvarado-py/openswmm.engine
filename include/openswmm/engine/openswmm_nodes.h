@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_nodes.h
  * @brief OpenSWMM Engine — Node C API.
@@ -10,7 +26,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_NODES_H
@@ -164,6 +180,27 @@ SWMM_ENGINE_API int swmm_node_set_pond_area(SWMM_Engine engine, int idx, double 
  */
 SWMM_ENGINE_API int swmm_node_set_initial_depth(SWMM_Engine engine, int idx, double depth);
 
+/**
+ * @brief Set a node's rendering-only rim (ground) depth above the invert.
+ *
+ * @details RENDERING ONLY — no hydraulics, routing, reporting or output-file
+ *          code reads this value, so setting it can never change a result.
+ *          It exists for virtual junctions, whose max depth is derived (always
+ *          the shared pipe crown): without it every viewer drawing a ground
+ *          line collapses the surface to the crown at each break point. It is
+ *          the optional third token of a [VIRTUAL_JUNCTIONS] row.
+ *
+ *          On other node types the value is simply carried; renderers use the
+ *          real max depth there. Pass 0 to clear it ("unset" — renderers fall
+ *          back to the max depth). Negative values are clamped to 0.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Zero-based node index.
+ * @param depth   Rim depth above the invert in project length units.
+ * @returns SWMM_OK on success, or an error code.
+ */
+SWMM_ENGINE_API int swmm_node_set_rim_depth(SWMM_Engine engine, int idx, double depth);
+
 /* =========================================================================
  * Geometry getters
  * ========================================================================= */
@@ -176,6 +213,60 @@ SWMM_ENGINE_API int swmm_node_set_initial_depth(SWMM_Engine engine, int idx, dou
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_node_get_type(SWMM_Engine engine, int idx, int* type);
+
+/**
+ * @brief Query whether a node is a virtual junction.
+ *
+ * @details A virtual junction is a zero-storage, momentum-transmitting
+ *          JUNCTION-typed node connecting exactly two conduits of identical
+ *          cross-section (INP section [VIRTUAL_JUNCTIONS]; refactored engine
+ *          only).
+ *
+ * @param engine  Engine handle.
+ * @param idx     Zero-based node index.
+ * @param[out] is_virtual  Receives 1 if the node is a virtual junction, else 0.
+ * @returns SWMM_OK on success, or an error code.
+ */
+SWMM_ENGINE_API int swmm_node_is_virtual(SWMM_Engine engine, int idx, int* is_virtual);
+
+/**
+ * @brief Set or clear a node's virtual-junction flag.
+ *
+ * @details Setting runs full validation of the usage rules and applies the
+ *          derived-geometry contract (full depth = pipe crown, zero surcharge
+ *          depth, zero ponded area). Clearing always succeeds for a virtual
+ *          node. BUILDING or OPENED state only.
+ *
+ * @param engine       Engine handle.
+ * @param idx          Zero-based node index (must be a JUNCTION to set).
+ * @param make_virtual 1 to set, 0 to clear.
+ * @returns SWMM_OK on success; SWMM_ERR_LIFECYCLE / SWMM_ERR_BADHANDLE /
+ *          SWMM_ERR_BADINDEX / SWMM_ERR_BADPARAM for generic failures; or a
+ *          distinct rule code on a violated usage rule so callers can render
+ *          actionable messages: 609 = not exactly two conduits, 611 =
+ *          cross-section mismatch, 613 = nonzero offset at the node, 617 =
+ *          a lateral inflow source targets the node.
+ */
+SWMM_ENGINE_API int swmm_node_set_virtual(SWMM_Engine engine, int idx, int make_virtual);
+
+/**
+ * @brief Dry-run check of the virtual-junction usage rules for a node.
+ *
+ * @details Read-only: evaluates the same structural rules that
+ *          swmm_node_set_virtual() enforces (exactly two attached conduits of
+ *          identical cross-section, zero offsets, no lateral inflow sources,
+ *          dynamic-wave routing) without changing any state and without
+ *          requiring the node to currently be a JUNCTION — so callers can
+ *          offer "convert to virtual junction" only when it would succeed.
+ *
+ * @param engine         Engine handle.
+ * @param idx            Zero-based node index.
+ * @param[out] rule_code Receives 0 when the node satisfies every rule, else
+ *                       the distinct ERR_VJ_* rule code (see
+ *                       swmm_node_set_virtual) identifying the violated rule.
+ * @returns SWMM_OK on success, or an error code for a bad handle/index.
+ */
+SWMM_ENGINE_API int swmm_node_virtual_eligible(SWMM_Engine engine, int idx, int* rule_code);
 
 /**
  * @brief Get a node's invert elevation.
@@ -194,6 +285,20 @@ SWMM_ENGINE_API int swmm_node_get_invert_elev(SWMM_Engine engine, int idx, doubl
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_node_get_max_depth(SWMM_Engine engine, int idx, double* depth);
+
+/**
+ * @brief Get a node's rendering-only rim (ground) depth above the invert.
+ *
+ * @details See swmm_node_set_rim_depth(). 0 means unset: a renderer drawing a
+ *          ground line should fall back to swmm_node_get_max_depth(), which
+ *          for a virtual junction is the pipe crown.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Zero-based node index.
+ * @param[out] depth  Receives the rim depth in project length units, or 0.
+ * @returns SWMM_OK on success, or an error code.
+ */
+SWMM_ENGINE_API int swmm_node_get_rim_depth(SWMM_Engine engine, int idx, double* depth);
 
 /* =========================================================================
  * Hydraulic state getters/setters

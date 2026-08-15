@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file HydStructures.cpp
  * @brief Non-conduit link flow — batch by type, numerically identical to legacy.
@@ -5,7 +21,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "HydStructures.hpp"
@@ -17,8 +33,14 @@
 #include "XSectBatch.hpp"
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace openswmm {
+
+// A3 parity tracing: routing-step serial defined in SWMMEngine.cpp, used to
+// step-gate the per-orifice term trace (SWMM_TRACE_ORIF + SWMM_TRACE_LSTEP).
+extern long g_trace_rstep_sn;
 
 namespace hydstruct {
 
@@ -632,6 +654,38 @@ void StructureSolver::computeOrificeFlowK(SimulationContext& ctx,
         q = std::max(q, 0.0);
         links.flow[uj] = q * dir;
         links.dqdh[uj] = dqdh;
+
+        // A3 parity term tracing for one orifice (SWMM_TRACE_ORIF=<index>,
+        // step-gated via SWMM_TRACE_LSTEP; format-matched to legacy link.c).
+        {
+            static FILE* of = nullptr;
+            static long  of_target = -2;
+            static long  of_step = 0;
+            static int   of_rows = 0;
+            if (of_target == -2) {
+                const char* p  = std::getenv("SWMM_TRACE_ORIF");
+                const char* tr = std::getenv("SWMM_TRACE_RSTEP");
+                const char* ls = std::getenv("SWMM_TRACE_LSTEP");
+                of_target = -1;
+                if (ls && *ls) of_step = std::atol(ls);
+                if (p && *p && tr && *tr) {
+                    char fname[512];
+                    of_target = std::atol(p);
+                    std::snprintf(fname, sizeof(fname), "%s.orif%ld", tr, of_target);
+                    of = std::fopen(fname, "w");
+                    if (of) std::fprintf(of,
+                        "h1,h2,hcrest,hcrown,f,head,cWeir,cOrif,hCrit,dqdh,q\n");
+                }
+            }
+            if (of && j == of_target &&
+                (of_step <= 0 || g_trace_rstep_sn + 1 >= of_step) && of_rows < 128) {
+                ++of_rows;
+                std::fprintf(of, "%a,%a,%a,%a,%a,%a,%a,%a,%a,%a,%a\n",
+                             h1, h2, hcrest, hcrown, f, head,
+                             cWeir, cOrif, hCrit, dqdh, q * dir);
+                if (of_rows >= 128) { std::fclose(of); of = nullptr; }
+            }
+        }
 
         // Scatter orifice surface area to end nodes via legacy
         // findNonConduitSurfArea (half each, then zero the UP_CRITICAL end's

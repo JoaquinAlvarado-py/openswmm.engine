@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file test_site_drainage_builder.cpp
  * @brief End-to-end model-builder parity test for the site drainage model.
@@ -43,14 +59,13 @@
  *         - SnowPack assignment — swmm_snowpack_add exists but no
  *           swmm_subcatch_set_snowpack to attach one (unused in this model).
  *       Also: spatial sections ([MAP]/[COORDINATES]/[VERTICES]/[Polygons]) have
- *       no builder setters (display-only, no simulation effect), and
- *       swmm_options_set rejects MINIMUM_STEP (the engine default 0.5 already
- *       equals the file's value, so it is not set here).  Tracked as follow-ups:
+ *       no builder setters (display-only, no simulation effect).
+ *       Tracked as follow-ups:
  *       swmm_subcatch_set_curb_length / _pct_zero / _subarea_routing /
  *       _pct_routed / _snowpack.
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
- * @license  MIT License
+ * @license  Apache-2.0
  * @ingroup  engine_tests
  */
 
@@ -221,8 +236,7 @@ void build_site_drainage_model(SWMM_Engine e) {
     opt("SYS_FLOW_TOL",        "5");
     opt("LAT_FLOW_TOL",        "5");
     opt("THREADS",             "1");
-    // MINIMUM_STEP (0.5) is the engine default (SimulationOptions::min_routing_step),
-    // already matching the INP — no setter needed.
+    opt("MINIMUM_STEP",        "0.5");
 
     // --- [TIMESERIES] 2-yr ---
     ASSERT_EQ(swmm_timeseries_add(e, "2-yr"), SWMM_OK);

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_inflows_impl.cpp
  * @brief C API implementation — external inflows, DWF, RDII.
@@ -7,7 +23,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "openswmm_api_common.hpp"
@@ -40,7 +56,8 @@ inline std::vector<std::string> unique_uh_group_names(
     out.reserve(uh.entries.size() + uh.gage_assignments.size());
     auto seen_or_push = [&out](const std::string& name) {
         if (name.empty()) return;
-        for (const auto& s : out) if (s == name) return;
+        for (const auto& s : out)
+            if (openswmm::ieq(s, name)) return;  // case-insensitive identity
         out.push_back(name);
     };
     for (const auto& e : uh.entries)          seen_or_push(e.name);
@@ -457,7 +474,8 @@ inline int find_uh_entry(const openswmm::UnitHydData& uh,
     const auto n = uh.entries.size();
     for (std::size_t i = 0; i < n; ++i) {
         const auto& e = uh.entries[i];
-        if (e.name == name && e.month == month && e.response == response)
+        if (openswmm::ieq(e.name, name) && e.month == month &&
+            e.response == response)
             return static_cast<int>(i);
     }
     return -1;
@@ -467,7 +485,8 @@ inline int find_uh_gage_assignment(const openswmm::UnitHydData& uh,
                                     const std::string& name) {
     const auto n = uh.gage_assignments.size();
     for (std::size_t i = 0; i < n; ++i) {
-        if (uh.gage_assignments[i] == name) return static_cast<int>(i);
+        if (openswmm::ieq(uh.gage_assignments[i], name))
+            return static_cast<int>(i);
     }
     return -1;
 }
@@ -578,7 +597,7 @@ SWMM_ENGINE_API int swmm_hydrograph_clear_group_months(SWMM_Engine engine, const
     v.erase(
         std::remove_if(v.begin(), v.end(),
                        [&](const openswmm::UnitHydEntry& e) {
-                           return e.name == name && e.month != -1;
+                           return openswmm::ieq(e.name, name) && e.month != -1;
                        }),
         v.end());
     return SWMM_OK;
@@ -623,21 +642,24 @@ SWMM_ENGINE_API int swmm_hydrograph_group_rename(SWMM_Engine engine, int idx,
     if (old_name == new_name) return SWMM_OK;
 
     for (const auto& s : names) {
-        if (s == new_name) return SWMM_ERR_BADPARAM;
+        // Case-insensitive collision with a DIFFERENT group is rejected; a
+        // pure case-respelling of this same group is allowed.
+        if (!openswmm::ieq(s, old_name) && openswmm::ieq(s, new_name))
+            return SWMM_ERR_BADPARAM;
     }
 
     for (auto& e : uh.entries) {
-        if (e.name == old_name) e.name = new_name;
+        if (openswmm::ieq(e.name, old_name)) e.name = new_name;
     }
     for (auto& g : uh.gage_assignments) {
-        if (g == old_name) g = new_name;
+        if (openswmm::ieq(g, old_name)) g = new_name;
     }
     for (auto& e : ctx.rdii_decay.entries) {
-        if (e.uh_name == old_name) e.uh_name = new_name;
+        if (openswmm::ieq(e.uh_name, old_name)) e.uh_name = new_name;
     }
     auto& ra = ctx.rdii_assigns;
     for (std::size_t i = 0; i < ra.uh_name.size(); ++i) {
-        if (ra.uh_name[i] == old_name) ra.uh_name[i] = new_name;
+        if (openswmm::ieq(ra.uh_name[i], old_name)) ra.uh_name[i] = new_name;
     }
     return SWMM_OK;
 }

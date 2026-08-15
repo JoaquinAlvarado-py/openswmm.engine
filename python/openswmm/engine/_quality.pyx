@@ -1,10 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Caleb Buahin
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Water quality (Pythonic v1 surface)
 ===================================
 
 :author: Caleb Buahin
 :copyright: Copyright (c) 2026 Caleb Buahin
-:license: MIT
+:license: Apache-2.0
 
 ``solver.quality`` exposes landuse, buildup, washoff, and treatment
 configuration with enum-typed function selectors and ``int | str``
@@ -98,6 +114,16 @@ class Landuse:
     def sweep_removal(self, double value) -> None:
         cdef SWMM_Engine h = <SWMM_Engine><size_t>self._solver.handle
         _check(swmm_landuse_set_sweep_removal(h, self._index, value))
+
+    def rename(self, str new_id) -> None:
+        """Rename this land use in place.
+
+        Land uses are referenced positionally, so buildup/washoff rows and
+        subcatchment coverages follow automatically.
+        """
+        cdef SWMM_Engine h = <SWMM_Engine><size_t>self._solver.handle
+        cdef bytes b = new_id.encode('utf-8')
+        _check(swmm_landuse_rename(h, self._index, b))
 
     def __repr__(self) -> str:
         try:
@@ -266,6 +292,23 @@ class Quality:
         cdef int pi = _resolve_pollutant(self._solver, pollutant)
         cdef SWMM_Engine h = <SWMM_Engine><size_t>self._solver.handle
         _check(swmm_treatment_clear(h, ni, pi))
+
+    def validate_treatment_expression(self, str expression):
+        """Validate a treatment expression WITHOUT modifying the engine.
+
+        Returns ``(ok, message, col)`` — ``ok`` True when the expression
+        parses; on failure ``message`` is the diagnostic and ``col`` the
+        0-based character offset of the error (-1 when not attributable).
+        """
+        cdef SWMM_Engine h = <SWMM_Engine><size_t>self._solver.handle
+        cdef bytes b = expression.encode('utf-8')
+        cdef char errbuf[512]
+        cdef int col = -1
+        errbuf[0] = 0
+        cdef int rc = swmm_treatment_validate_expression(h, b, errbuf, 512, &col)
+        if rc == 0:
+            return (True, "", -1)
+        return (False, errbuf.decode('utf-8'), col)
 
     def __repr__(self) -> str:
         try:

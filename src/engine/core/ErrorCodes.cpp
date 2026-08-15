@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file ErrorCodes.cpp
  * @brief Error/warning description table and formatting — legacy-compatible.
@@ -12,7 +28,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "ErrorCodes.hpp"
@@ -163,6 +179,13 @@ static const std::unordered_map<int, const char*>& error_table() {
         {603, "Time Series %s contains NaN or Inf values."},
         {605, "column count mismatch in data for %s."},
         {607, "Rain Gage %s references unknown time series."},
+        {609, "Virtual Junction %s must connect exactly two conduits."},
+        {611, "Virtual Junction %s connects conduits with different cross sections."},
+        {613, "Virtual Junction %s has a conduit with a nonzero offset."},
+        {615, "Virtual Junction %s conduit inverts do not agree at the node."},
+        {617, "Virtual Junction %s cannot receive lateral inflow."},
+        {619, "Virtual Junction %s requires DYNWAVE or FV flow routing."},
+        {621, "too many items for Virtual Junction %s."},
     };
     return table;
 }
@@ -194,6 +217,9 @@ static const std::unordered_map<int, const char*>& warning_table() {
         {104, "[2D_OPTIONS] %s was retired with the CVODE/ARKODE 2D solvers "
               "and was ignored; the explicit local-inertial marcher is the "
               "only 2D integrator."},
+        {105, "%s is accepted but has no effect yet under FLOW_ROUTING FV."},
+        {106, "%s is a dynamic wave option and does not apply under "
+              "FLOW_ROUTING FV."},
     };
     return table;
 }

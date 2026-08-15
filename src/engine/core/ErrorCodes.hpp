@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file ErrorCodes.hpp
  * @brief Legacy-compatible error and warning codes with description lookup.
@@ -18,7 +34,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_ERROR_CODES_HPP
@@ -171,6 +187,15 @@ enum ErrorCode : int {
     ERR_TIMESERIES_NAN          = 603,  ///< Time Series %s contains NaN or Inf values
     ERR_TABLE_COL_MISMATCH      = 605,  ///< column count mismatch in data for %s
     ERR_GAGE_TSERIES_NOTFOUND   = 607,  ///< Rain Gage %s references unknown time series
+
+    // --- Virtual junctions (609–621) — refactored engine only ---
+    ERR_VJ_LINK_COUNT           = 609,  ///< Virtual Junction %s must connect exactly two conduits
+    ERR_VJ_XSECT_MISMATCH       = 611,  ///< Virtual Junction %s connects conduits with different cross sections
+    ERR_VJ_OFFSET               = 613,  ///< Virtual Junction %s has a conduit with a nonzero offset
+    ERR_VJ_INVERT_MISMATCH      = 615,  ///< Virtual Junction %s conduit inverts do not agree at the node
+    ERR_VJ_LATERAL_INFLOW       = 617,  ///< Virtual Junction %s cannot receive lateral inflow
+    ERR_VJ_ROUTING_MODEL        = 619,  ///< Virtual Junction %s requires DYNWAVE or FV flow routing
+    ERR_VJ_EXTRA_TOKENS         = 621,  ///< too many items for Virtual Junction %s
 };
 
 // ============================================================================
@@ -238,6 +263,8 @@ enum WarnCode : int {
     WARN_BOUNDARY_OVERLAP       = 102, ///< boundary regions overlap for %s
     WARN_FILES_SLOT_UNSUPPORTED = 103, ///< [FILES] %s is not supported and was ignored
     WARN_2D_OPTION_RETIRED      = 104, ///< [2D_OPTIONS] %s retired with CVODE/ARKODE and was ignored
+    WARN_FV_OPTION_INERT        = 105, ///< %s has no effect under FLOW_ROUTING FV
+    WARN_DW_OPTION_UNDER_FV     = 106, ///< %s is a dynamic wave option and does not apply under FLOW_ROUTING FV
 };
 
 // ============================================================================

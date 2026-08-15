@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_subcatchments.h
  * @brief OpenSWMM Engine — Subcatchment C API.
@@ -10,7 +26,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_SUBCATCHMENTS_H
@@ -118,6 +134,17 @@ SWMM_ENGINE_API int swmm_subcatch_set_slope(SWMM_Engine engine, int idx, double 
 SWMM_ENGINE_API int swmm_subcatch_set_imperv_pct(SWMM_Engine engine, int idx, double pct);
 
 /**
+ * @brief Set the percentage of the impervious area having no depression storage.
+ * @details The [SUBAREAS] @c PctZero column; legacy @c Subcatch[i].fracImperv2.
+ * @param engine  Engine handle.
+ * @param idx     Zero-based subcatchment index.
+ * @param pct     Zero-depression-storage impervious area as a percentage
+ *                (0–100) of the impervious area.
+ * @returns SWMM_OK on success, or an error code.
+ */
+SWMM_ENGINE_API int swmm_subcatch_set_zero_imperv_pct(SWMM_Engine engine, int idx, double pct);
+
+/**
  * @brief Set Manning's n for the impervious area.
  * @param engine  Engine handle.
  * @param idx     Zero-based subcatchment index.
@@ -174,9 +201,19 @@ SWMM_ENGINE_API int swmm_subcatch_set_infil_green_ampt(SWMM_Engine engine, int i
                                                          double suction, double conductivity,
                                                          double initial_deficit);
 
-/** @brief Set Curve Number infiltration parameter. */
+/**
+ * @brief Set Curve Number infiltration parameters.
+ * @param engine       Engine handle.
+ * @param idx          Zero-based subcatchment index.
+ * @param cn           SCS curve number (clamped to 10–99 by the runoff solver).
+ * @param drying_time  Days for a fully saturated soil to dry, matching the
+ *                     third [INFILTRATION] column and legacy
+ *                     @c curvenum_setParams p[2]. Drives the regeneration
+ *                     constant; a value <= 0 disables regeneration.
+ * @returns SWMM_OK on success, or an error code.
+ */
 SWMM_ENGINE_API int swmm_subcatch_set_infil_curve_number(SWMM_Engine engine, int idx,
-                                                           double cn);
+                                                           double cn, double drying_time);
 
 /**
  * @brief Set ONLY the infiltration model code for a subcatchment.
@@ -214,6 +251,16 @@ SWMM_ENGINE_API int swmm_subcatch_get_area(SWMM_Engine engine, int idx, double* 
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_subcatch_get_imperv_pct(SWMM_Engine engine, int idx, double* pct);
+
+/**
+ * @brief Get the percentage of the impervious area having no depression storage.
+ * @param engine    Engine handle.
+ * @param idx       Zero-based subcatchment index.
+ * @param[out] pct  Receives the zero-depression-storage percentage (0–100).
+ * @returns SWMM_OK on success, or an error code.
+ * @see swmm_subcatch_set_zero_imperv_pct
+ */
+SWMM_ENGINE_API int swmm_subcatch_get_zero_imperv_pct(SWMM_Engine engine, int idx, double* pct);
 
 /**
  * @brief Get the outlet node index for a subcatchment.
@@ -355,13 +402,16 @@ SWMM_ENGINE_API int swmm_subcatch_get_infil_green_ampt(SWMM_Engine engine, int i
                                                           double* deficit);
 
 /**
- * @brief Get the Curve Number infiltration parameter for a subcatchment.
- * @param engine   Engine handle.
- * @param idx      Zero-based subcatchment index.
- * @param[out] cn  Receives the SCS curve number.
+ * @brief Get the Curve Number infiltration parameters for a subcatchment.
+ * @param engine            Engine handle.
+ * @param idx               Zero-based subcatchment index.
+ * @param[out] cn           Receives the SCS curve number. May be NULL.
+ * @param[out] drying_time  Receives the drying time in days. May be NULL.
  * @returns SWMM_OK on success, or an error code.
+ * @see swmm_subcatch_set_infil_curve_number
  */
-SWMM_ENGINE_API int swmm_subcatch_get_infil_curve_number(SWMM_Engine engine, int idx, double* cn);
+SWMM_ENGINE_API int swmm_subcatch_get_infil_curve_number(SWMM_Engine engine, int idx,
+                                                           double* cn, double* drying_time);
 
 /* =========================================================================
  * Subcatchment statistics
@@ -399,28 +449,74 @@ SWMM_ENGINE_API int swmm_subcatch_get_stat_max_runoff(SWMM_Engine engine, int id
  * ========================================================================= */
 
 /**
- * @brief Set the land use coverage fraction for a subcatchment.
+ * @brief Set the land use coverage percent for a subcatchment.
  *
- * @details Assigns what fraction of a subcatchment's area is covered by
+ * @details Assigns what percent of a subcatchment's area is covered by
  *          a particular land use category (for buildup/washoff modeling).
+ *          Stored and reported verbatim in PERCENT (0–100), matching the
+ *          [COVERAGES] .inp convention.
  *
  * @param engine    Engine handle.
  * @param sc_idx    Zero-based subcatchment index.
  * @param lu_idx    Zero-based land use index.
- * @param fraction  Coverage fraction (0–1).
+ * @param fraction  Coverage in percent (0–100).
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_subcatch_set_coverage(SWMM_Engine engine, int sc_idx, int lu_idx, double fraction);
 
 /**
- * @brief Get the land use coverage fraction for a subcatchment.
+ * @brief Get the land use coverage percent for a subcatchment.
  * @param engine          Engine handle.
  * @param sc_idx          Zero-based subcatchment index.
  * @param lu_idx          Zero-based land use index.
- * @param[out] fraction   Receives the coverage fraction (0–1).
+ * @param[out] fraction   Receives the coverage in percent (0–100).
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_subcatch_get_coverage(SWMM_Engine engine, int sc_idx, int lu_idx, double* fraction);
+
+/**
+ * @brief Get all land use coverage percents for a subcatchment in one call.
+ *
+ * @details Bulk peer of swmm_subcatch_get_coverage for grid editors: fills
+ *          out[0..n-1] with the coverage percent for land uses 0..n-1.
+ *          n must not exceed the engine's land use count.
+ *
+ * @param engine   Engine handle.
+ * @param sc_idx   Zero-based subcatchment index.
+ * @param[out] out Caller-owned array receiving n percents (0–100).
+ * @param n        Number of land uses to fetch (array capacity).
+ * @returns SWMM_OK on success, or an error code.
+ */
+SWMM_ENGINE_API int swmm_subcatch_get_coverages(SWMM_Engine engine, int sc_idx, double* out, int n);
+
+/* =========================================================================
+ * Initial pollutant loadings ([LOADINGS])
+ * ========================================================================= */
+
+/**
+ * @brief Set the initial pollutant buildup on a subcatchment.
+ *
+ * @details The [LOADINGS] value: initial buildup mass per unit area
+ *          (normalizer units) present at the simulation start, overriding
+ *          the DRY_DAYS-derived buildup for the pollutant.
+ *
+ * @param engine      Engine handle.
+ * @param sc_idx      Zero-based subcatchment index.
+ * @param pollut_idx  Zero-based pollutant index.
+ * @param buildup     Initial buildup (mass per unit area).
+ * @returns SWMM_OK on success, or an error code.
+ */
+SWMM_ENGINE_API int swmm_subcatch_set_initial_loading(SWMM_Engine engine, int sc_idx, int pollut_idx, double buildup);
+
+/**
+ * @brief Get the initial pollutant buildup on a subcatchment.
+ * @param engine         Engine handle.
+ * @param sc_idx         Zero-based subcatchment index.
+ * @param pollut_idx     Zero-based pollutant index.
+ * @param[out] buildup   Receives the initial buildup (mass per unit area).
+ * @returns SWMM_OK on success, or an error code.
+ */
+SWMM_ENGINE_API int swmm_subcatch_get_initial_loading(SWMM_Engine engine, int sc_idx, int pollut_idx, double* buildup);
 
 /* =========================================================================
  * Hydraulic state getters
@@ -760,6 +856,23 @@ SWMM_ENGINE_API const char* swmm_aquifer_id(SWMM_Engine engine, int idx);
 SWMM_ENGINE_API int swmm_aquifer_add(SWMM_Engine engine, const char* id);
 
 /**
+ * @brief Rename an aquifer in place.
+ *
+ * @details Updates both the name vector and the name registry so
+ *          swmm_aquifer_id() and swmm_aquifer_index() stay in agreement.
+ *          [GROUNDWATER] holds an aquifer INDEX, not a name, so subcatchment
+ *          references follow automatically.
+ *          Lifecycle: BUILDING or OPENED.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Aquifer index.
+ * @param new_id  New unique name (non-empty). A pure case-respelling of this
+ *                same aquifer is allowed.
+ * @returns SWMM_OK, or SWMM_ERR_BADPARAM on an empty or duplicate name.
+ */
+SWMM_ENGINE_API int swmm_aquifer_rename(SWMM_Engine engine, int idx, const char* new_id);
+
+/**
  * @brief Aquifer parameter codes for swmm_aquifer_get_param / _set_param.
  *
  * @details Values use input-file units (the same columns as the [AQUIFERS]
@@ -888,6 +1001,25 @@ SWMM_ENGINE_API const char* swmm_snowpack_id(SWMM_Engine engine, int idx);
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_snowpack_add(SWMM_Engine engine, const char* id);
+
+/**
+ * @brief Rename a snow pack in place.
+ *
+ * @details Updates both the name vector (read by swmm_snowpack_id() and the
+ *          [SNOWPACKS] writer) and the name registry (read by
+ *          swmm_snowpack_index() and the [SUBCATCHMENTS] snow-pack column),
+ *          plus the deferred-resolution name held per subcatchment. Melt
+ *          parameters and subcatchment assignments are index-based and follow
+ *          automatically.
+ *          Lifecycle: BUILDING or OPENED.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Snow pack index.
+ * @param new_id  New unique name (non-empty). A pure case-respelling of this
+ *                same snow pack is allowed.
+ * @returns SWMM_OK, or SWMM_ERR_BADPARAM on an empty or duplicate name.
+ */
+SWMM_ENGINE_API int swmm_snowpack_rename(SWMM_Engine engine, int idx, const char* new_id);
 
 /* -------------------------------------------------------------------------
  * Snowpack surface parameters

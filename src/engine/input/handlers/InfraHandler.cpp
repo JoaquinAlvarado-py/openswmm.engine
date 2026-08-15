@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file InfraHandler.cpp
  * @brief Section handlers for [STREETS], [INLETS], [INLET_USAGE],
@@ -8,7 +24,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "InfraHandler.hpp"
@@ -31,6 +47,17 @@ void handle_streets(SimulationContext& ctx, const std::vector<std::string>& line
     for (const auto& line : lines) {
         auto tok = Tokenizer::tokenize(line);
         if (tok.size() < 5) continue;
+
+        // One definition line per street; a second definition in any case
+        // spelling is a duplicate ID (legacy input.c parity, ERR 207).
+        bool dup = false;
+        for (const auto& existing : ctx.streets.names) {
+            if (ieq(existing, tok[0])) { dup = true; break; }
+        }
+        if (dup) {
+            ctx.errors.push_back(format_error(ERR_DUP_NAME, tok[0]));
+            continue;
+        }
 
         ctx.streets.names.push_back(std::string(tok[0]));
         ctx.streets.t_crown.push_back(to_double(tok[1]));
@@ -97,10 +124,10 @@ void handle_inlet_usage(SimulationContext& ctx, const std::vector<std::string>& 
         const int link_idx = ctx.link_names.find(tok[0]);
         if (link_idx < 0) continue;
 
-        // Find inlet design index by name
+        // Find inlet design index by name (case-insensitive)
         int design_idx = -1;
         for (int i = 0; i < ctx.inlets.count(); ++i) {
-            if (ctx.inlets.names[static_cast<std::size_t>(i)] == tok[1]) {
+            if (ieq(ctx.inlets.names[static_cast<std::size_t>(i)], tok[1])) {
                 design_idx = i;
                 break;
             }
@@ -178,7 +205,7 @@ void handle_adjustments(SimulationContext& ctx, const std::vector<std::string>& 
         // Subcatchment pattern assignments: N-PERV, DSTORE, INFIL
         else if (keyword == "N-PERV" && tok.size() >= 3) {
             const int si = ctx.subcatch_names.find(tok[1]);
-            const int pi = ctx.table_names.find(tok[2]);
+            const int pi = ctx.find_table_any(tok[2]);
             if (si >= 0 && pi >= 0) {
                 const auto usi = static_cast<std::size_t>(si);
                 if (usi >= ctx.subcatch_n_perv_pattern.size())
@@ -188,7 +215,7 @@ void handle_adjustments(SimulationContext& ctx, const std::vector<std::string>& 
         }
         else if (keyword == "DSTORE" && tok.size() >= 3) {
             const int si = ctx.subcatch_names.find(tok[1]);
-            const int pi = ctx.table_names.find(tok[2]);
+            const int pi = ctx.find_table_any(tok[2]);
             if (si >= 0 && pi >= 0) {
                 const auto usi = static_cast<std::size_t>(si);
                 if (usi >= ctx.subcatch_d_store_pattern.size())
@@ -198,7 +225,7 @@ void handle_adjustments(SimulationContext& ctx, const std::vector<std::string>& 
         }
         else if (keyword == "INFIL" && tok.size() >= 3) {
             const int si = ctx.subcatch_names.find(tok[1]);
-            const int pi = ctx.table_names.find(tok[2]);
+            const int pi = ctx.find_table_any(tok[2]);
             if (si >= 0 && pi >= 0) {
                 const auto usi = static_cast<std::size_t>(si);
                 if (usi >= ctx.subcatch_infil_pattern.size())

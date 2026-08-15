@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_edit_impl.cpp
  * @brief C API implementation — object deletion and type conversion.
@@ -7,13 +23,14 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "openswmm_api_common.hpp"
 #include "TypeHelpers.hpp"
 #include "../edit/ObjectDeleter.hpp"
 #include "../edit/TypeConverter.hpp"
+#include "../edit/VirtualJunctionOps.hpp"
 #include "../../../include/openswmm/engine/openswmm_edit.h"
 
 #include <cstring>
@@ -494,6 +511,47 @@ SWMM_ENGINE_API int swmm_link_convert(SWMM_Engine engine, int idx, int new_type,
 
     auto res = openswmm::edit::convert_link(ctx, idx, internal_new);
     conversion_to_c(res, result_out);
+    return SWMM_OK;
+}
+
+// ============================================================================
+// Conduit split / virtual-junction fusion
+// ============================================================================
+
+SWMM_ENGINE_API int swmm_conduit_split(SWMM_Engine engine, int link_idx, double t,
+                                       const char* new_node_name,
+                                       const char* new_link_name,
+                                       int make_virtual,
+                                       int* new_node_idx, int* new_link_idx) {
+    CHECK_HANDLE(engine);
+    auto& ctx = to_engine(engine)->context();
+    CHECK_EDITABLE(ctx);
+    CHECK_INDEX(link_idx >= 0 && link_idx < ctx.n_links());
+    if (!new_node_name || !new_link_name) return SWMM_ERR_BADPARAM;
+
+    const auto res = openswmm::edit::vj_split_conduit(
+        ctx, link_idx, t, new_node_name, new_link_name, make_virtual != 0);
+    if (res.new_node_idx < 0)
+        return SWMM_ERR_BADPARAM;   // split rejected (bad t / names / type)
+    if (new_node_idx) *new_node_idx = res.new_node_idx;
+    if (new_link_idx) *new_link_idx = res.new_link_idx;
+    // Split succeeded; a nonzero err here is a make_virtual rule code — the
+    // node stands as a regular junction and the caller decides what to do.
+    return (res.err == 0) ? SWMM_OK : res.err;
+}
+
+SWMM_ENGINE_API int swmm_virtual_junction_fuse(SWMM_Engine engine, int node_idx,
+                                               int* surviving_link_idx) {
+    CHECK_HANDLE(engine);
+    auto& ctx = to_engine(engine)->context();
+    CHECK_EDITABLE(ctx);
+    CHECK_INDEX(node_idx >= 0 && node_idx < ctx.n_nodes());
+
+    int surviving = -1;
+    const int code = openswmm::edit::vj_fuse(ctx, node_idx, &surviving);
+    if (code == -1) return SWMM_ERR_BADPARAM;   // not a virtual junction
+    if (code != 0)  return code;                // ERR_VJ_LINK_COUNT
+    if (surviving_link_idx) *surviving_link_idx = surviving;
     return SWMM_OK;
 }
 

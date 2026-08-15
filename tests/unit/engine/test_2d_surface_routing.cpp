@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file test_2d_surface_routing.cpp
  * @brief Unit tests for the optional 2D surface routing module.
@@ -17,10 +33,11 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <string>
@@ -584,26 +601,67 @@ TEST(VertexRenderReconstruction, AllDryYieldsZero) {
         EXPECT_DOUBLE_EQ(state.vert_depth_signed[v], 0.0);
 }
 
-TEST(VertexRenderReconstruction, SubCellShorelineIsSigned) {
-    // Wet cell spanning a step: its high vertex must carry a NEGATIVE signed
-    // depth (eta below the vertex), so the barycentric blend crosses zero at
-    // the sub-cell shoreline instead of snapping at a cell boundary.
+TEST(VertexRenderReconstruction, WallTopVertexIsNoDataNotNotched) {
+    // Wetted-contact gate: a wet cell spanning a step votes at a vertex only
+    // if its water surface reaches that corner (eta > z_v). T1's water pools
+    // far below its high vertex v2, so v2 must read the 0 no-data sentinel —
+    // NOT a negative signed depth that would drag interpolated surfaces near
+    // the wall down to the film level (the profile-plot "notch").
     auto mesh = makeStepMesh();
     buildVertexStencils(mesh);
 
     SurfaceStateData state;
     state.resize(mesh.n_triangles(), mesh.n_vertices());
     state.depth[0] = 0.5;    // flat T0: eta = 0.5
-    state.depth[1] = 0.2;    // tilted T1 (z 0..5): partially wet
+    state.depth[1] = 0.2;    // tilted T1 (z 0..5): partially wet, eta << 5
 
     reconstructVertexRenderDepths(mesh, state, 1.0e-3);
 
-    // v2 (z=5) is touched only by the wet T1 whose eta << 5.
-    EXPECT_LT(state.vert_depth_signed[2], 0.0);
-    // And the implied eta at v2 equals T1's cell eta (single-cell stencil).
+    // v2 (z=5): T1's eta does not reach it → no-data sentinel, exactly 0.
+    EXPECT_DOUBLE_EQ(state.vert_depth_signed[2], 0.0);
+    // Low vertices are reached by their contributors' etas and stay positive.
+    EXPECT_GT(state.vert_depth_signed[0], 0.0);
+    EXPECT_GT(state.vert_depth_signed[1], 0.0);
+    EXPECT_GT(state.vert_depth_signed[3], 0.0);
+    // The emitted field is non-negative everywhere (gate ⇒ eta_v > z_v).
+    for (int v = 0; v < mesh.n_vertices(); ++v)
+        EXPECT_GE(state.vert_depth_signed[v], 0.0);
+}
+
+TEST(VertexRenderReconstruction, WallBaseFilmDoesNotNotchPool) {
+    // The artifact the gate fixes: a deep pool (T0) and a thin flank film
+    // (T1, pooled at the wall base) share vertices v0/v3. Without the gate the
+    // film's LOW eta is depth-blended into the shared base vertices AND
+    // stamped as a negative signed depth on the wall-top vertex, notching the
+    // rendered pool surface toward the wall. With the gate: the wall-top
+    // vertex is no-data, and the base vertices' implied eta stays within the
+    // contributing cells' eta range (both of which reach those corners).
+    auto mesh = makeStepMesh();
+    buildVertexStencils(mesh);
+
+    SurfaceStateData state;
+    state.resize(mesh.n_triangles(), mesh.n_vertices());
+    state.depth[0] = 1.0;     // pool: flat T0, eta = 1.0
+    state.depth[1] = 0.01;    // thin film on the flank, pools near the base
+
+    reconstructVertexRenderDepths(mesh, state, 1.0e-3);
+
+    const double eta0 = cellFreeSurfaceElevation(
+        1.0, mesh.vz[0], mesh.vz[1], mesh.vz[3]);           // 1.0
     const double eta1 = cellFreeSurfaceElevation(
-        0.2, mesh.vz[0], mesh.vz[3], mesh.vz[2]);
-    EXPECT_NEAR(state.vert_depth_signed[2] + mesh.vz[2], eta1, 1e-12);
+        0.01, mesh.vz[0], mesh.vz[3], mesh.vz[2]);          // ≈ base level
+
+    // Wall-top vertex: film eta << z_v2 → sentinel, not a negative.
+    EXPECT_DOUBLE_EQ(state.vert_depth_signed[2], 0.0);
+    // Shared base vertices: both cells reach them; the blend stays bracketed
+    // by the contributing etas (no value below the film, none above the pool).
+    for (int v : {0, 3}) {
+        const double eta_v = state.vert_depth_signed[v] + mesh.vz[v];
+        EXPECT_GE(eta_v, std::min(eta0, eta1) - 1e-12);
+        EXPECT_LE(eta_v, std::max(eta0, eta1) + 1e-12);
+    }
+    // Pool-only vertex v1 reads the pool exactly.
+    EXPECT_NEAR(state.vert_depth_signed[1], eta0 - mesh.vz[1], 1e-12);
 }
 
 
@@ -1053,6 +1111,51 @@ TEST(InputParsing, Parse2DTriangleLine) {
     EXPECT_TRUE(err.empty()) << err;
     EXPECT_EQ(mesh.n_triangles(), 2);
     EXPECT_EQ(mesh.tri_tag[1], "road");
+    EXPECT_NEAR(mesh.tri_init_depth[1], 0.0, 1e-12);   // tag-only: dry default
+}
+
+TEST(InputParsing, Parse2DTriangleInitDepth) {
+    MeshData mesh;
+    mesh.resize_vertices(3);
+
+    // 5-token numeric column 5 = INIT_DEPTH, no tag
+    auto err = parse2DTriangleLine({"0", "1", "2", "0.035", "0.125"}, mesh);
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_NEAR(mesh.tri_init_depth[0], 0.125, 1e-12);
+    EXPECT_TRUE(mesh.tri_tag[0].empty());
+
+    // 6-token: INIT_DEPTH then TAG
+    err = parse2DTriangleLine({"0", "2", "1", "0.025", "0.5", "lowland"}, mesh);
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_NEAR(mesh.tri_init_depth[1], 0.5, 1e-12);
+    EXPECT_EQ(mesh.tri_tag[1], "lowland");
+
+    // non-numeric column 5 keeps the historical TAG meaning
+    err = parse2DTriangleLine({"1", "0", "2", "0.03", "channel"}, mesh);
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_NEAR(mesh.tri_init_depth[2], 0.0, 1e-12);
+    EXPECT_EQ(mesh.tri_tag[2], "channel");
+
+    // negative depth rejected
+    err = parse2DTriangleLine({"0", "1", "2", "0.035", "-0.1"}, mesh);
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(InputParsing, Parse2DInitialVelocity) {
+    MeshData mesh;
+    mesh.resize_vertices(4);
+    ASSERT_TRUE(parse2DTriangleLine({"0", "1", "2", "0.03"}, mesh).empty());
+    ASSERT_TRUE(parse2DTriangleLine({"0", "2", "3", "0.03"}, mesh).empty());
+
+    auto err = parse2DInitialVelocityLine({"1", "0.5", "-1.25"}, mesh);
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_NEAR(mesh.tri_init_u[1], 0.5, 1e-12);
+    EXPECT_NEAR(mesh.tri_init_v[1], -1.25, 1e-12);
+    EXPECT_NEAR(mesh.tri_init_u[0], 0.0, 1e-12);   // unlisted rows stay 0
+
+    // Out-of-range triangle and short rows rejected
+    EXPECT_FALSE(parse2DInitialVelocityLine({"2", "1", "1"}, mesh).empty());
+    EXPECT_FALSE(parse2DInitialVelocityLine({"0", "1"}, mesh).empty());
 }
 
 TEST(InputParsing, Parse2DVertexNodeMap) {

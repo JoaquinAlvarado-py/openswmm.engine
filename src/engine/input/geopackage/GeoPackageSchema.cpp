@@ -95,6 +95,13 @@ CREATE TABLE IF NOT EXISTS nodes (
     surcharge_depth REAL,
     ponded_area     REAL,
     tag             TEXT,
+    -- Virtual junctions are JUNCTION-typed (node_type stays "JUNCTION"), so
+    -- the flag needs its own column or a round-trip demotes them to plain
+    -- junctions. rim_depth is the rendering-only ground depth that goes with
+    -- it (the optional [VIRTUAL_JUNCTIONS] MaxDepth); both are NULL in files
+    -- written before they existed and the reader treats that as 0.
+    is_virtual      INTEGER,
+    rim_depth       REAL,
     UNIQUE(simulation_id, node_id)
 );
 
@@ -522,7 +529,8 @@ CREATE TABLE IF NOT EXISTS subcatch_adjustments (
     UNIQUE(simulation_id, subcatch_id, adjust_type)
 );
 
--- Pollutants
+-- Pollutants. dwf_conc/init_conc (iteration 4): the [POLLUTANTS] Cdwf and
+-- Cinit columns — absent in older files, read back as 0 via column_exists.
 CREATE TABLE IF NOT EXISTS pollutants (
     fid             INTEGER PRIMARY KEY AUTOINCREMENT,
     simulation_id   TEXT NOT NULL,
@@ -535,7 +543,74 @@ CREATE TABLE IF NOT EXISTS pollutants (
     snow_only       INTEGER,
     co_pollutant    TEXT,
     co_fraction     REAL,
+    dwf_conc        REAL DEFAULT 0,
+    init_conc       REAL DEFAULT 0,
     UNIQUE(simulation_id, pollutant_id)
+);
+
+-- Land uses ([LANDUSES]) — sweeping params per land use (iteration 4).
+CREATE TABLE IF NOT EXISTS landuses (
+    fid             INTEGER PRIMARY KEY AUTOINCREMENT,
+    simulation_id   TEXT NOT NULL,
+    landuse_id      TEXT NOT NULL,
+    sweep_interval  REAL DEFAULT 0,
+    sweep_removal   REAL DEFAULT 0,
+    last_swept      REAL DEFAULT 0,
+    comment         TEXT,
+    UNIQUE(simulation_id, landuse_id)
+);
+
+-- Buildup functions ([BUILDUP]) — one row per (landuse, pollutant) with a
+-- non-NONE function (iteration 4). Mirrors the treatment keying.
+CREATE TABLE IF NOT EXISTS buildup (
+    fid             INTEGER PRIMARY KEY AUTOINCREMENT,
+    simulation_id   TEXT NOT NULL,
+    landuse_id      TEXT NOT NULL,
+    pollutant_id    TEXT NOT NULL,
+    func_type       TEXT NOT NULL,   -- 'POW' | 'EXP' | 'SAT' | 'EXT'
+    coeff1          REAL DEFAULT 0,
+    coeff2          REAL DEFAULT 0,
+    coeff3          REAL DEFAULT 0,
+    normalizer      TEXT DEFAULT 'AREA',   -- 'AREA' | 'CURB'
+    UNIQUE(simulation_id, landuse_id, pollutant_id)
+);
+
+-- Washoff functions ([WASHOFF]) — one row per (landuse, pollutant) with a
+-- non-NONE function (iteration 4).
+CREATE TABLE IF NOT EXISTS washoff (
+    fid             INTEGER PRIMARY KEY AUTOINCREMENT,
+    simulation_id   TEXT NOT NULL,
+    landuse_id      TEXT NOT NULL,
+    pollutant_id    TEXT NOT NULL,
+    func_type       TEXT NOT NULL,   -- 'EXP' | 'RC' | 'EMC'
+    coeff           REAL DEFAULT 0,
+    expon           REAL DEFAULT 0,
+    sweep_effic     REAL DEFAULT 0,
+    bmp_effic       REAL DEFAULT 0,
+    UNIQUE(simulation_id, landuse_id, pollutant_id)
+);
+
+-- Subcatchment land-use coverages ([COVERAGES], percent) + per-pair days
+-- since last swept (iteration 4). Zero-percent pairs are not stored.
+CREATE TABLE IF NOT EXISTS subcatch_coverages (
+    fid             INTEGER PRIMARY KEY AUTOINCREMENT,
+    simulation_id   TEXT NOT NULL,
+    subcatch_id     TEXT NOT NULL,
+    landuse_id      TEXT NOT NULL,
+    percent         REAL NOT NULL,
+    last_swept      REAL DEFAULT 0,
+    UNIQUE(simulation_id, subcatch_id, landuse_id)
+);
+
+-- Initial pollutant loadings ([LOADINGS]) — initial buildup per
+-- (subcatchment, pollutant); zero rows are not stored (iteration 4).
+CREATE TABLE IF NOT EXISTS subcatch_loadings (
+    fid             INTEGER PRIMARY KEY AUTOINCREMENT,
+    simulation_id   TEXT NOT NULL,
+    subcatch_id     TEXT NOT NULL,
+    pollutant_id    TEXT NOT NULL,
+    init_buildup    REAL NOT NULL,
+    UNIQUE(simulation_id, subcatch_id, pollutant_id)
 );
 
 -- LID control definitions (one row per lid-layer combination)
@@ -1079,6 +1154,7 @@ CREATE TABLE IF NOT EXISTS mesh_2d_triangles (
     v1              INTEGER NOT NULL,
     v2              INTEGER NOT NULL,
     mannings_n      REAL NOT NULL DEFAULT 0.035,
+    init_depth      REAL NOT NULL DEFAULT 0,
     tag             TEXT,
     bed_elev        REAL,
     coupled_node    TEXT,

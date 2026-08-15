@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file SWMMEngine.cpp
  * @brief Implementation of the SWMMEngine lifecycle manager.
@@ -7,7 +23,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "SWMMEngine.hpp"
@@ -41,6 +57,7 @@
 #endif
 
 #include <cstring>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -71,6 +88,13 @@ static constexpr int SWMM_ERR_PLUGIN         = 10;  // public SWMM_ERR_PLUGIN
 static constexpr int SWMM_ERR_IO             = 11;  // public SWMM_ERR_IO
 
 namespace openswmm {
+
+// A3 parity tracing: routing-step serial (updated by the RSTEP trace in
+// stepRouting) so the per-link term trace in DynamicWave.cpp can be gated on
+// a step number (SWMM_TRACE_LSTEP) instead of an invocation count — bypassed
+// links make invocation counts hard to predict. Mirrors SwmmTraceRstepSn in
+// the legacy engine (dwflow.c / routing.c).
+long g_trace_rstep_sn = 0;
 
 // ============================================================================
 // Constructor / Destructor
@@ -120,6 +144,18 @@ int SWMMEngine::open(const char* inp_path,
     // Reset context for a fresh run
     ctx_.reset();
 
+    // Zero the load-phase accumulators so a process that opens several models
+    // reports each one separately (see core/PerfTimers.hpp).
+    perf::reset_load();
+
+    // Stamp the report wall clock before any parsing work. Legacy takes this
+    // timestamp in report_writeLogo(), which swmm_open() calls before
+    // project_readInput(), so its "Total elapsed time" covers parse +
+    // validate + init. Stamping here keeps the reported elapsed time
+    // comparable with legacy/PCSWMM instead of excluding the (potentially
+    // very long, on large models) initialization window.
+    std::time(&ctx_.wall_start);
+
     rpt_path_ = rpt_path ? rpt_path : "";
     out_path_ = out_path ? out_path : "";
 
@@ -165,12 +201,16 @@ int SWMMEngine::open(const char* inp_path,
     // the mesh is already SI. The external-mesh path runs its own prescan
     // below and overrides this if both files carry the header.
     if (inp_path && inp_path[0] != '\0') {
+        perf::ScopedTimer _pt(perf::sec_open_prescan2d);
         twoD::prescan2DUnitsHeader(inp_path, surface_router_.options());
     }
 #endif
 
-    if (input_plugin->read(inp_path ? inp_path : "", ctx_) != 0) {
-        return ctx_.error_code != 0 ? ctx_.error_code : SWMM_ERR_PARSE;
+    {
+        perf::ScopedTimer _pt(perf::sec_open_read);
+        if (input_plugin->read(inp_path ? inp_path : "", ctx_) != 0) {
+            return ctx_.error_code != 0 ? ctx_.error_code : SWMM_ERR_PARSE;
+        }
     }
 
 #ifdef OPENSWMM_HAS_2D
@@ -219,12 +259,18 @@ int SWMMEngine::open(const char* inp_path,
     }
 
     // Resolve cross-references (forward refs, final array sizing, head init)
-    input::resolve_cross_references(ctx_);
+    {
+        perf::ScopedTimer _pt(perf::sec_open_resolve);
+        input::resolve_cross_references(ctx_);
+    }
 
     // Project-level sanity checks + step-clamp warnings (legacy project_validate:
     // WARNING 01/06/07). Must run before the fatal gate below so any warnings it
     // records reach the report.
-    validate_project();
+    {
+        perf::ScopedTimer _pt(perf::sec_open_validate);
+        validate_project();
+    }
 
     // Post-parse validation errors accumulated during resolution (e.g.
     // ERR_TRANSECT_MANNING 227 for a zero channel Manning's n) are fatal:
@@ -369,10 +415,47 @@ int SWMMEngine::initialize() noexcept {
         return SWMM_ERR_WRONG_STATE;
     }
 
+    // Everything from here to init_modules() is the "state seeding" phase —
+    // per-node/per-link loops over ctx_. Closed out just before init_modules(),
+    // which is broken into its own four legs.
+    const auto _pt_state0 = perf::now();
+
     // Apply initial depths/flows from input (all defaults already in NodeData etc.)
     // reset_state() applies init_depth to depth/old_depth/head but volumes need
     // separate computation using node geometry tables.
     ctx_.reset_state();
+
+    // MIN_SURFAREA is a project OPTION, and the junction storage convention was
+    // not reading it. Legacy keeps no junction storage at all (node_getVolume
+    // returns fullVolume*(d/fd), and fullVolume is 0 for a plain junction);
+    // this engine books it deliberately (plan §7B.6) at MIN_SURFAREA*fullDepth,
+    // but took the 12.566 ft² COMPILE-TIME constant rather than the option. So
+    // a deck asking for a smaller manhole got it honoured in the dynamic wave's
+    // surface-area floor (DynamicWave.cpp:391) and nowhere else — and the FV
+    // solver, whose node area IS this volume divided by full depth, could not
+    // see the option at all: MIN_SURFAREA 0.01 and 12.566 produced byte-
+    // identical FV output. On the SWASHES 1D chains, where the nodes are an
+    // artifact of discretizing a continuous channel and the decks ask for 0.01,
+    // that is 1257x the intended storage at every node.
+    //
+    // Setting full_volume here means node::getVolume takes its fullVolume > 0
+    // branch everywhere, so the mass balance, the dynamic wave and the FV mesh
+    // all read ONE number. Default is unchanged: min_surf_area defaults to 0,
+    // meaning "use the constant".
+    {
+        const double ucf_len = ucf::Ucf[ucf::LENGTH][
+            ucf::getUnitSystem(static_cast<int>(ctx_.options.flow_units))];
+        const double min_sa = (ctx_.options.min_surf_area > 0.0)
+            ? ctx_.options.min_surf_area / (ucf_len * ucf_len)
+            : constants::MIN_SURFAREA;
+        for (int i = 0; i < ctx_.n_nodes(); ++i) {
+            const auto ui = static_cast<std::size_t>(i);
+            if (ctx_.nodes.type[ui] == NodeType::STORAGE) continue;
+            const double fd = ctx_.nodes.full_depth[ui];
+            if (fd > 0.0 && !(ctx_.nodes.full_volume[ui] > 0.0))
+                ctx_.nodes.full_volume[ui] = min_sa * fd;
+        }
+    }
 
     // Compute initial volumes from init_depth (matching legacy node_initState)
     for (int i = 0; i < ctx_.n_nodes(); ++i) {
@@ -660,8 +743,18 @@ int SWMMEngine::initialize() noexcept {
     // Legacy swmm5.c:721 — ReportTime = 1000 * (double)ReportStep
     ctx_.next_report_ms      = 1000.0 * ctx_.options.report_step;
 
+    perf::sec_init_state += perf::since(_pt_state0);
+
     // Initialize all computational modules (batch SoA setup)
     init_modules();
+
+    // A mesh the finite-volume solver cannot build is a fatal model error, not
+    // a warning: there is no fallback routing, so continuing would produce a
+    // plausible-looking report describing a network that never moved water.
+    if (!ctx_.errors.empty()) {
+        set_error(SWMM_ERR_PARSE, ctx_.errors.front().c_str());
+        return SWMM_ERR_PARSE;
+    }
 
     // Seed node inflow/outflow from the initial link flows so the FIRST
     // routing step's trapezoidal node-continuity term reads the correct
@@ -736,6 +829,10 @@ int SWMMEngine::start(int save_results) noexcept {
     // routing-step-size coarsening, and the outfall interface write are all
     // gated on this in step()/postOutputSnapshot().
     do_routing_ = (ctx_.n_nodes() > 0 && !ctx_.options.ignore_routing);
+
+    // Everything up to prepare_all() is interface-file work ([FILES] inflows /
+    // outflows / hotstart / RDII / rainfall).
+    const auto _pt_iface0 = perf::now();
 
     // Open routing interface files ([FILES] USE INFLOWS / SAVE OUTFLOWS) and
     // process headers eagerly — matching legacy routing_open() →
@@ -856,8 +953,11 @@ int SWMMEngine::start(int save_results) noexcept {
                                   "supported by this engine and was ignored");
     }
 
+    perf::sec_start_iface += perf::since(_pt_iface0);
+
     // Phase 4: call prepare() on all plugins (opens output files/headers)
     if (!plugins_.empty()) {
+        perf::ScopedTimer _pt(perf::sec_start_plugins);
         const int rc = plugins_.prepare_all(ctx_);
         if (rc != 0) {
             set_error(SWMM_ERR_PLUGIN, "swmm_engine_start: plugin prepare() failed");
@@ -2660,13 +2760,23 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
 
             // Scatter dqdh — legacy dynwave.c lines 565-575:
             // TYPE4_PUMP adds dqdh to node1 (inlet) only; skip node2.
-            double dqdh = links.dqdh[uj];
-            const int pr_t4 = ctx_.link_subtypes.pump_row(j);
-            const bool is_type4_pump = (links.type[uj] == LinkType::PUMP &&
-                                        pr_t4 >= 0 &&
-                                        ctx_.link_subtypes.pumps.curve_type[static_cast<std::size_t>(pr_t4)] == 4);
-            dw.nodeSumDqdh(n1) += dqdh;
-            if (!is_type4_pump) dw.nodeSumDqdh(n2) += dqdh;
+            //
+            // Only when the dynamic-wave solver owns this step. This callback is
+            // SHARED with the finite-volume router, which never calls
+            // DWSolver::init, so the accumulator below is an empty vector there
+            // — writing to it corrupted the heap for any FV model carrying a
+            // pump, orifice, weir or outlet. Skipping is not merely safe, it is
+            // correct: ∂Q/∂h is the head sensitivity the implicit node
+            // continuity solve needs, and an explicit solver has no such solve.
+            if (dw.isInitialized()) {
+                double dqdh = links.dqdh[uj];
+                const int pr_t4 = ctx_.link_subtypes.pump_row(j);
+                const bool is_type4_pump = (links.type[uj] == LinkType::PUMP &&
+                                            pr_t4 >= 0 &&
+                                            ctx_.link_subtypes.pumps.curve_type[static_cast<std::size_t>(pr_t4)] == 4);
+                dw.nodeSumDqdh(n1) += dqdh;
+                if (!is_type4_pump) dw.nodeSumDqdh(n2) += dqdh;
+            }
         }
 
 #ifdef OPENSWMM_HAS_2D
@@ -2676,7 +2786,7 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
         // zero-sensitivity explicit source produced. Gated to the default
         // EXPLICIT node continuity until the SEMI_IMPLICIT denominator sign
         // convention is ruled on (DynamicWave.cpp:2932, pre-existing).
-        if (surface_router_.isActive() &&
+        if (dw.isInitialized() && surface_router_.isActive() &&
             ctx_.options.node_continuity == NodeContinuity::EXPLICIT) {
             std::vector<std::pair<int, double>> gs;
             surface_router_.computeCouplingConductances(ctx_, gs);
@@ -2701,6 +2811,101 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
     // matches legacy's "% of Steps Not Converging".
     ctx_.routing_stats.update_iterations(iters, router_.lastStepConverged());
 
+    // A3 parity tracing (env-gated, zero cost when SWMM_TRACE_RSTEP unset):
+    // one CSV row per routing step, format-matched to the legacy trace at the
+    // end of routing_execute (routing.c) for first-divergence hunting.
+    {
+        static FILE* trace_file = nullptr;
+        static bool  trace_init = false;
+        if (!trace_init) {
+            trace_init = true;
+            const char* p = std::getenv("SWMM_TRACE_RSTEP");
+            if (p && *p) {
+                trace_file = std::fopen(p, "w");
+                if (trace_file)
+                    std::fprintf(trace_file,
+                                 "step,new_ms,dt_ms,iters,qsum,ysum,lsum,rosum,qhash,yhash\n");
+            }
+        }
+        if (trace_file) {
+            static long trace_sn = 0;
+            // Order-fixed serial sums (link/node index order, matching the
+            // legacy trace) — hex-exact fingerprints of the hydraulic state.
+            // FNV-1a 64-bit hashes over the raw bit patterns of link flow &
+            // node depth (element order) — exact first-divergence detector
+            // (the %a sums absorb small-magnitude element diffs).
+            double q_sum = 0.0, y_sum = 0.0, l_sum = 0.0, ro_sum = 0.0;
+            unsigned long long q_hash = 14695981039346656037ULL;
+            unsigned long long y_hash = 14695981039346656037ULL;
+            unsigned long long bits = 0;
+            for (int tj = 0; tj < ctx_.n_links(); ++tj) {
+                q_sum += ctx_.links.flow[static_cast<std::size_t>(tj)];
+                std::memcpy(&bits, &ctx_.links.flow[static_cast<std::size_t>(tj)],
+                            sizeof bits);
+                q_hash = (q_hash ^ bits) * 1099511628211ULL;
+            }
+            for (int tj = 0; tj < ctx_.n_nodes(); ++tj) {
+                y_sum += ctx_.nodes.depth[static_cast<std::size_t>(tj)];
+                std::memcpy(&bits, &ctx_.nodes.depth[static_cast<std::size_t>(tj)],
+                            sizeof bits);
+                y_hash = (y_hash ^ bits) * 1099511628211ULL;
+            }
+            for (int tj = 0; tj < ctx_.n_nodes(); ++tj)
+                l_sum += ctx_.nodes.lat_flow[static_cast<std::size_t>(tj)];
+            for (int tj = 0; tj < ctx_.n_subcatches(); ++tj)
+                ro_sum += ctx_.subcatches.runoff[static_cast<std::size_t>(tj)];
+            std::fprintf(trace_file, "%ld,%.6f,%.6f,%d,%a,%a,%a,%a,%016llx,%016llx\n",
+                         ++trace_sn,
+                         ctx_.elapsed_ms + 1000.0 * dt_routing,
+                         1000.0 * dt_routing, iters, q_sum, y_sum, l_sum,
+                         ro_sum, q_hash, y_hash);
+            g_trace_rstep_sn = trace_sn;  // step-gate for DynamicWave link trace
+
+            // Optional per-element dump at one step (SWMM_TRACE_DUMP_STEP=N),
+            // format-matched to the legacy dump for element-level pinpointing.
+            {
+                static long dump_step = -1;
+                static bool dump_init = false;
+                if (!dump_init) {
+                    dump_init = true;
+                    const char* d = std::getenv("SWMM_TRACE_DUMP_STEP");
+                    if (d && *d) dump_step = std::atol(d);
+                }
+                if (trace_sn == dump_step) {
+                    char fname[512];
+                    std::snprintf(fname, sizeof(fname), "%s.dump%ld",
+                                  std::getenv("SWMM_TRACE_RSTEP"), dump_step);
+                    if (FILE* df = std::fopen(fname, "w")) {
+                        for (int tj = 0; tj < ctx_.n_links(); ++tj) {
+                            auto utj = static_cast<std::size_t>(tj);
+                            std::fprintf(df, "L,%d,%a,%a\n", tj,
+                                         ctx_.links.flow[utj],
+                                         ctx_.links.dqdh[utj]);
+                        }
+                        for (int tj = 0; tj < ctx_.n_nodes(); ++tj) {
+                            auto utj = static_cast<std::size_t>(tj);
+                            std::fprintf(df, "N,%d,%a,%a,%a,%a,%a\n", tj,
+                                         ctx_.nodes.depth[utj],
+                                         ctx_.nodes.inflow[utj],
+                                         ctx_.nodes.outflow[utj],
+                                         ctx_.nodes.lat_flow[utj],
+                                         ctx_.nodes.old_lat_flow[utj]);
+                        }
+                        for (int tj = 0; tj < ctx_.n_subcatches(); ++tj) {
+                            auto utj = static_cast<std::size_t>(tj);
+                            std::fprintf(df, "S,%d,%a,%a,%a,%a\n", tj,
+                                         ctx_.subcatches.runoff[utj],
+                                         ctx_.subcatches.rainfall[utj],
+                                         ctx_.subcatches.infil_loss[utj],
+                                         ctx_.subcatches.old_runoff[utj]);
+                        }
+                        std::fclose(df);
+                    }
+                }
+            }
+        }
+    }
+
 #ifdef OPENSWMM_HAS_2D
     // B3+. Post-routing: compute 2D↔1D coupling exchange, update rainfall,
     //      advance the 2D solver, transfer outfall discharges to 2D cells.
@@ -2712,7 +2917,13 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
 
     // B3b. Culvert inlet control (FHWA HEC-5 equations)
     //      Uses pre-built culvert_links_ (populated in initHydraulics)
-    if (!culvert_links_.empty()) {
+    //
+    //      NOT for FV: it applies the same closure as a cap on the flux
+    //      crossing the culvert's upstream face, inside the solver. Rewriting
+    //      links.flow here afterwards would contradict the node ledger
+    //      publishFv already booked from those fluxes.
+    if (!culvert_links_.empty() &&
+        ctx_.options.routing_model != RoutingModel::FV) {
         culvert::batchComputeInletControl(
             culvert_links_.data(),
             static_cast<int>(culvert_links_.size()),
@@ -2906,7 +3117,8 @@ void SWMMEngine::updateStatistics(double dt_routing) noexcept {
             // DW: capacityLimited = (a1 >= aFull) && (HGL slope > bed slope)
             if (up_full) {
                 bool cap_ltd = true;
-                if (ctx_.options.routing_model == RoutingModel::DYNWAVE &&
+                if ((ctx_.options.routing_model == RoutingModel::DYNWAVE ||
+                     ctx_.options.routing_model == RoutingModel::FV) &&
                     n1 >= 0 && n2 >= 0) {
                     double h1h = ctx_.nodes.head[static_cast<std::size_t>(n1)];
                     double h2h = ctx_.nodes.head[static_cast<std::size_t>(n2)];
@@ -3007,6 +3219,31 @@ void SWMMEngine::updateStatistics(double dt_routing) noexcept {
 }
 
 // ============================================================================
+// effectiveUserLatFlow — per-step forced lateral inflow at a node
+// ============================================================================
+
+// Effective runtime-forced lateral inflow at node uj for this step: the
+// persistent runtime-API value (user_lat_flow, set via
+// swmm_node_set_lateral_inflow) with any active ForcingData lateral-inflow
+// forcing overlaid — OVERRIDE replaces it, ADD adds to it. The forcing is
+// never written back into user_lat_flow: it is re-applied each step while
+// its mode is active and vanishes when the mode clears, so a RESET forcing
+// lasts exactly one step and a PERSIST+ADD forcing contributes a steady
+// (non-compounding) rate. Issue #113.
+static double effectiveUserLatFlow(const SimulationContext& ctx,
+                                   std::size_t uj) noexcept {
+    double q = ctx.nodes.user_lat_flow[uj];
+    if (uj < ctx.forcing.node_lat_inflow_mode.size()) {
+        const auto m = ctx.forcing.node_lat_inflow_mode[uj];
+        if (m == ForcingMode::OVERRIDE)
+            q = ctx.forcing.node_lat_inflow_value[uj];
+        else if (m == ForcingMode::ADD)
+            q += ctx.forcing.node_lat_inflow_value[uj];
+    }
+    return q;
+}
+
+// ============================================================================
 // updateRoutingMassBalance() — routing mass balance totals after routing
 // ============================================================================
 
@@ -3047,7 +3284,10 @@ void SWMMEngine::updateRoutingMassBalance(double dt_routing) noexcept {
     // Critical: under DYNWAVE, degree==0 non-STORAGE nodes are NOT terminal —
     // they fall into the "interior" branch and only contribute system flow
     // when overflow is positive AND newVolume <= fullVolume.
-    const bool is_dw = (ctx_.options.routing_model == RoutingModel::DYNWAVE);
+    // ==DYNWAVE audit: FV also gives every node a head and a volume, so
+    // degree==0 non-STORAGE nodes are interior under FV exactly as under DW.
+    const bool is_dw = (ctx_.options.routing_model == RoutingModel::DYNWAVE ||
+                        ctx_.options.routing_model == RoutingModel::FV);
     for (int j = 0; j < ctx_.n_nodes(); ++j) {
         auto uj = static_cast<std::size_t>(j);
         const NodeType nt = ctx_.nodes.type[uj];
@@ -3132,8 +3372,9 @@ void SWMMEngine::updateRoutingMassBalance(double dt_routing) noexcept {
             auto uj = static_cast<std::size_t>(j);
             if (ctx_.nodes.runoff_inflow[uj] > 0.0)
                 runoff_q += ctx_.nodes.runoff_inflow[uj];
-            if (ctx_.nodes.user_lat_flow[uj] > 0.0)
-                user_q_total += ctx_.nodes.user_lat_flow[uj];
+            if (const double q_user = effectiveUserLatFlow(ctx_, uj);
+                q_user > 0.0)
+                user_q_total += q_user;
             if (ctx_.nodes.coupling_inflow[uj] < 0.0)
                 coupling_out_q += -ctx_.nodes.coupling_inflow[uj];
         }
@@ -3999,6 +4240,11 @@ int SWMMEngine::report() noexcept {
 // ============================================================================
 
 int SWMMEngine::close() noexcept {
+    // Load-phase breakdown. Emitted here rather than from end() so it reports
+    // for a bare open()+close() too — the benchmark harness times open alone,
+    // open+initialize, and the full sequence. (See core/PerfTimers.hpp.)
+    if (perf::enabled()) perf::dump_load();
+
     // Stop IO thread if still running (safe to call even if already stopped)
     io_thread_.stop();
 
@@ -4048,18 +4294,14 @@ double SWMMEngine::subcatchSnowDepth(int idx) const noexcept {
 void SWMMEngine::applyForcings(double dt) noexcept {
     auto& f = ctx_.forcing;
 
-    // ---- Node lateral inflow forcing → write to user_lat_flow ----
-    // Transient ForcingData lateral inflows are merged into user_lat_flow
-    // so that the existing stepRunoff application path and mass balance
-    // tracking in updateRoutingMassBalance handle them uniformly.
-    for (int i = 0; i < ctx_.n_nodes(); ++i) {
-        auto ui = static_cast<std::size_t>(i);
-        if (f.node_lat_inflow_mode[ui] == ForcingMode::OVERRIDE) {
-            ctx_.nodes.user_lat_flow[ui] = f.node_lat_inflow_value[ui];
-        } else if (f.node_lat_inflow_mode[ui] == ForcingMode::ADD) {
-            ctx_.nodes.user_lat_flow[ui] += f.node_lat_inflow_value[ui];
-        }
-    }
+    // ---- Node lateral inflow forcing ----
+    // Applied as a per-step OVERLAY, not written into user_lat_flow (which
+    // holds the persistent swmm_node_set_lateral_inflow value): while the
+    // forcing mode is active, effectiveUserLatFlow() folds the ForcingData
+    // value into lateral-inflow assembly and mass-balance tracking each
+    // step; when clear_reset_entries() clears the mode the forcing simply
+    // stops. The previous += mutation compounded PERSIST+ADD forcings each
+    // step and left expired RESET forcings behind permanently. Issue #113.
 
     // ---- Node head boundary forcing (outfalls only) ----
     //
@@ -4351,10 +4593,10 @@ void SWMMEngine::emit_progress() noexcept {
 // ============================================================================
 
 void SWMMEngine::init_modules() noexcept {
-    initHydraulics();
-    initHydrology();
-    initQuality();
-    initGeometry();
+    { perf::ScopedTimer _pt(perf::sec_init_hydraulics); initHydraulics(); }
+    { perf::ScopedTimer _pt(perf::sec_init_hydrology);  initHydrology();  }
+    { perf::ScopedTimer _pt(perf::sec_init_quality);    initQuality();    }
+    { perf::ScopedTimer _pt(perf::sec_init_geometry);   initGeometry();   }
     initMassBalance();
 
     // Allocate forcing arrays to match object counts
@@ -4382,7 +4624,19 @@ void SWMMEngine::initHydraulics() noexcept {
     RouteModel rm = RouteModel::DYNWAVE;
     if (ctx_.options.routing_model == RoutingModel::KINWAVE) rm = RouteModel::KINWAVE;
     else if (ctx_.options.routing_model == RoutingModel::STEADY) rm = RouteModel::STEADY;
+    else if (ctx_.options.routing_model == RoutingModel::FV) rm = RouteModel::FV;
     router_.init(ctx_, rm);
+
+    // Surface what the FV mesh builder found. Without this the diagnostics were
+    // collected into Router::fv_errors_ and never read by anyone: initFv bails
+    // leaving fv_solver_ == nullptr, stepFv then returns 0 for every step, and
+    // the model RUNS TO COMPLETION WITH NO HYDRAULIC ROUTING AT ALL — clean
+    // exit, empty report, no message. A DUMMY-shape conduit is enough to
+    // trigger it, and DUMMY conduits are common in real models.
+    for (const std::string& w : router_.fvWarnings())
+        ctx_.warnings.push_back(w);
+    for (const std::string& e : router_.fvErrors())
+        ctx_.errors.push_back(e);
 
     // Relational node refactor — Phase 4 (authoritative): the storage/outfall/
     // divider side-tables are the single source of truth, populated by the
@@ -4427,8 +4681,9 @@ void SWMMEngine::initHydraulics() noexcept {
             ctx_.errors.push_back(format_error(ERR_NO_OUTLETS, ""));
             set_error(SWMM_ERR_PARSE, ctx_.errors.back().c_str());
         }
-        // Gap #84a: adverse slope only errors for non-DW routing
-        if (rm != RouteModel::DYNWAVE) {
+        // Gap #84a: adverse slope only errors for non-DW routing. FV joins DW
+        // here — a conservative scheme resolves an adverse slope natively.
+        if (rm != RouteModel::DYNWAVE && rm != RouteModel::FV) {
             for (int j = 0; j < n_ll; ++j) {
                 auto uj = static_cast<std::size_t>(j);
                 if (ctx_.links.type[uj] != LinkType::CONDUIT) continue;
@@ -4524,9 +4779,19 @@ void SWMMEngine::initHydraulics() noexcept {
     }
 
     // Initialize routing time-step histogram bins (log-scale from RouteStep
-    // down to MinRouteStep, matching legacy stats.c stats_open)
-    ctx_.routing_stats.init_histogram(ctx_.options.routing_step,
-                                       ctx_.options.min_routing_step);
+    // down to MinRouteStep, matching legacy stats.c stats_open). For DYNWAVE
+    // legacy runs stats_open after dynwave_validate, which clamps
+    // MinRouteStep = min(MinRouteStep, RouteStep) then >= MINTIMESTEP.
+    {
+        double hist_min_step = ctx_.options.min_routing_step;
+        if (rm == RouteModel::DYNWAVE || rm == RouteModel::FV) {
+            hist_min_step = std::max(
+                std::min(hist_min_step, ctx_.options.routing_step),
+                constants::MIN_TIMESTEP);
+        }
+        ctx_.routing_stats.init_histogram(ctx_.options.routing_step,
+                                          hist_min_step);
+    }
 
     // NOTE: Conduit conveyance (beta, rough_factor, q_full) is computed in
     // PostParseResolver and then adjusted for conduit lengthening in
@@ -4849,17 +5114,18 @@ void SWMMEngine::initHydrology() noexcept {
 
         // Resolve timeseries names to table indices
         if (ctx_.options.temp_source == 1 && !ctx_.options.temp_ts_name.empty()) {
-            ctx_.climate_state.temp_ts_index = ctx_.table_names.find(ctx_.options.temp_ts_name);
+            ctx_.climate_state.temp_ts_index = ctx_.find_timeseries(ctx_.options.temp_ts_name);
         }
         if (evap_type == 2 && !ctx_.options.evap_ts_name.empty()) {
-            ctx_.climate_state.evap_ts_index = ctx_.table_names.find(ctx_.options.evap_ts_name);
+            ctx_.climate_state.evap_ts_index = ctx_.find_timeseries(ctx_.options.evap_ts_name);
         }
 
-        // Resolve recovery pattern name to pattern index
+        // Resolve recovery pattern name to pattern index (case-insensitive)
         if (!ctx_.options.evap_recovery_pat.empty()) {
             int np = ctx_.patterns.count();
             for (int i = 0; i < np; ++i) {
-                if (ctx_.patterns.names[static_cast<std::size_t>(i)] == ctx_.options.evap_recovery_pat) {
+                if (ieq(ctx_.patterns.names[static_cast<std::size_t>(i)],
+                        ctx_.options.evap_recovery_pat)) {
                     ctx_.climate_state.recovery_pat_index = i;
                     break;
                 }
@@ -4898,17 +5164,11 @@ void SWMMEngine::initHydrology() noexcept {
             gw.tension_slope[ui]    = ctx_.aquifers.tension_slope[uaq]
                                       / ucf::Ucf[ucf::LENGTH][unit_sys];
             gw.upper_evap_frac[ui]  = ctx_.aquifers.upper_evap[uaq];
-            // Resolve upper evaporation pattern name to index
+            // Resolve upper evaporation pattern name to index (case-insensitive)
             gw.upper_evap_pat[ui] = -1;
             const auto& pat_name = ctx_.aquifers.upper_evap_pat[uaq];
-            if (!pat_name.empty()) {
-                for (int p = 0; p < ctx_.patterns.count(); ++p) {
-                    if (ctx_.patterns.names[static_cast<std::size_t>(p)] == pat_name) {
-                        gw.upper_evap_pat[ui] = p;
-                        break;
-                    }
-                }
-            }
+            if (!pat_name.empty())
+                gw.upper_evap_pat[ui] = ctx_.patterns.find(pat_name);
             gw.lower_evap_depth[ui] = ctx_.aquifers.lower_evap[uaq]
                                       / ucf::Ucf[ucf::LENGTH][unit_sys];
             gw.lower_loss_coeff[ui] = ctx_.aquifers.lower_loss[uaq]
@@ -5524,7 +5784,22 @@ void SWMMEngine::assembleLateralInflows(double dt_routing) noexcept {
         auto uj = static_cast<std::size_t>(j);
         ctx_.nodes.lat_flow[uj] += ctx_.nodes.rdii_inflow[uj];
         ctx_.nodes.lat_flow[uj] += ctx_.nodes.iface_inflow[uj];
-        ctx_.nodes.lat_flow[uj] += ctx_.nodes.user_lat_flow[uj]
+
+        // Runtime-forced lateral inflow: persistent API value with any
+        // active ForcingData forcing overlaid (see effectiveUserLatFlow).
+        // Counts as external inflow for continuity, matching legacy
+        // addExternalInflows (routing.c: apiExtInflow →
+        // massbal_addInflowFlow(EXTERNAL_INFLOW, q), positive only).
+        // Without this the routed volume appears in total_out but never in
+        // total_in and the continuity error grows unboundedly negative. The
+        // cumulative routing_forcing_inflow diagnostic (a subset of
+        // routing_external) is accumulated in updateRoutingMassBalance.
+        // Issue #113.
+        const double q_user = effectiveUserLatFlow(ctx_, uj);
+        if (q_user > 0.0)
+            sum_ext += q_user;
+
+        ctx_.nodes.lat_flow[uj] += q_user
                                  + ctx_.nodes.coupling_inflow[uj];
     }
 
@@ -5595,9 +5870,33 @@ double SWMMEngine::reportedNodeVolume(int i, double depth,
     if (ctx_.nodes.type[ui] == NodeType::STORAGE)
         return volume;                         // storage curve volume (= legacy)
     double fd = ctx_.nodes.full_depth[ui];
-    return (fd > 0.0)
-               ? report_full_volume_[ui] * (depth / fd)
-               : 0.0;                            // plain junction → 0 (= legacy)
+    if (!(fd > 0.0)) return 0.0;
+
+    // A PONDING node holds real water above its rim, and both solvers write
+    // that volume directly rather than deriving it from depth (DW
+    // getFloodedDepth, FV applyNodeCapacity). Reporting the rim relation
+    // instead dropped the entire pond out of Final Stored Volume, and the
+    // ponded inflow then read as a continuity error — 27 % under FV and 83 %
+    // under DW on a two-hour single-junction pond. Reporting the volume is also
+    // what keeps the flooding term out of the mass balance for these nodes:
+    // updateRoutingMassBalance books overflow as a loss only while the volume
+    // is at or below full, which is exactly the ponded/not-ponded distinction.
+    if (ctx_.options.allow_ponding && ctx_.nodes.ponded_area[ui] > 0.0 &&
+        depth > fd)
+        return volume;
+
+    // Legacy convention: a plain junction contributes ZERO to reported
+    // storage, because report_full_volume_ is 0 for it. FV junctions are now
+    // algebraic INTERFACES that hold no water of their own — the water at a
+    // junction's head stands in the incident cells, already counted through
+    // link volumes — so FV shares the convention. (The earlier bucket model
+    // DID hold MIN_SURFAREA·depth of real water per junction and reported it
+    // here; keeping that relation after the buckets were removed re-counted
+    // the cells' water and read as a continuity error proportional to
+    // junction count — measured −0.005 % per junction on a 120-junction
+    // chain, one MIN_SURFAREA·depth per node.)
+
+    return report_full_volume_[ui] * (depth / fd);
 }
 
 void SWMMEngine::initMassBalance() noexcept {

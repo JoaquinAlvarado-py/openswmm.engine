@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file LinksHandler.cpp
  * @brief Section handlers for [CONDUITS], [PUMPS], [ORIFICES], [WEIRS], [OUTLETS], [XSECTIONS], [LOSSES], [TRANSECTS].
@@ -19,7 +35,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "LinksHandler.hpp"
@@ -47,13 +63,17 @@ static void ensure_link_capacity(SimulationContext& ctx, int idx) {
 // ============================================================================
 
 void handle_conduits(SimulationContext& ctx, const std::vector<std::string>& lines) {
+    // Pre-reserve from the section's row count (an upper bound: some rows
+    // are comments or duplicates). Capacity only — see reserve_to().
+    ctx.links.reserve_to(ctx.links.count() + static_cast<int>(lines.size()));
+    ctx.link_names.reserve(static_cast<std::size_t>(ctx.link_names.size()) + lines.size());
     for (const auto& pl : parse_section(lines)) {
         auto tok = Tokenizer::tokenize(pl.data);
         if (tok.size() < 7) continue;  // Name Node1 Node2 Length Roughness In Out required
 
         const std::string& name = tok[0];
-        int idx = ctx.link_names.find(name);
-        if (idx < 0) idx = ctx.link_names.add(name);
+        int idx = add_unique(ctx.link_names, name, ctx.errors);
+        if (idx < 0) continue;  // duplicate ID (ERR 207, legacy input.c parity)
 
         ensure_link_capacity(ctx, idx);
 
@@ -84,8 +104,8 @@ void handle_pumps(SimulationContext& ctx, const std::vector<std::string>& lines)
         if (tok.size() < 3) continue;
 
         const std::string& name = tok[0];
-        int idx = ctx.link_names.find(name);
-        if (idx < 0) idx = ctx.link_names.add(name);
+        int idx = add_unique(ctx.link_names, name, ctx.errors);
+        if (idx < 0) continue;  // duplicate ID (ERR 207, legacy input.c parity)
 
         ensure_link_capacity(ctx, idx);
 
@@ -93,10 +113,15 @@ void handle_pumps(SimulationContext& ctx, const std::vector<std::string>& lines)
         const auto upr = static_cast<std::size_t>(pr);
         ctx.links.node1[idx] = ctx.node_names.find(tok[1]);
         ctx.links.node2[idx] = ctx.node_names.find(tok[2]);
-        // tok[3]: pump curve name — store for deferred resolution
-        if (tok.size() > 3) {
+        // tok[3]: pump curve name — store for deferred resolution.
+        // "*" is the ideal-pump placeholder (legacy pump_readParams,
+        // link.c:1437), not a curve name: leave curve at -1 so the pump is
+        // typed IDEAL (curve_type 6) instead of raising ERR_NAME on a lookup
+        // of "*". The .inp writer emits "*" for an unset curve, so rejecting
+        // it here broke the save/re-open round-trip for ideal pumps.
+        if (tok.size() > 3 && tok[3] != "*") {
             ctx.links.pump_curve_name[idx] = tok[3];
-            ctx.link_subtypes.pumps.curve[upr] = ctx.table_names.find(tok[3]);
+            ctx.link_subtypes.pumps.curve[upr] = ctx.find_curve(tok[3]);
         }
         // tok[4]: init status (ON/OFF)
         if (tok.size() > 4) {
@@ -126,8 +151,8 @@ void handle_orifices(SimulationContext& ctx, const std::vector<std::string>& lin
         if (tok.size() < 3) continue;
 
         const std::string& name = tok[0];
-        int idx = ctx.link_names.find(name);
-        if (idx < 0) idx = ctx.link_names.add(name);
+        int idx = add_unique(ctx.link_names, name, ctx.errors);
+        if (idx < 0) continue;  // duplicate ID (ERR 207, legacy input.c parity)
 
         ensure_link_capacity(ctx, idx);
 
@@ -162,8 +187,8 @@ void handle_weirs(SimulationContext& ctx, const std::vector<std::string>& lines)
         if (tok.size() < 3) continue;
 
         const std::string& name = tok[0];
-        int idx = ctx.link_names.find(name);
-        if (idx < 0) idx = ctx.link_names.add(name);
+        int idx = add_unique(ctx.link_names, name, ctx.errors);
+        if (idx < 0) continue;  // duplicate ID (ERR 207, legacy input.c parity)
 
         ensure_link_capacity(ctx, idx);
 
@@ -210,8 +235,8 @@ void handle_outlets(SimulationContext& ctx, const std::vector<std::string>& line
         if (tok.size() < 3) continue;
 
         const std::string& name = tok[0];
-        int idx = ctx.link_names.find(name);
-        if (idx < 0) idx = ctx.link_names.add(name);
+        int idx = add_unique(ctx.link_names, name, ctx.errors);
+        if (idx < 0) continue;  // duplicate ID (ERR 207, legacy input.c parity)
 
         ensure_link_capacity(ctx, idx);
 
@@ -293,7 +318,13 @@ void handle_xsections(SimulationContext& ctx, const std::vector<std::string>& li
         if (tok.size() < 3) continue;
 
         const int idx = ctx.link_names.find(tok[0]);
-        if (idx < 0) continue;  // Unknown link — xsection appears before conduit?
+        if (idx < 0) {
+            // The link is declared in a section further down the file. Stash the
+            // row for InputReader to re-dispatch once everything is parsed; a
+            // silent drop here left the link with zero area and zero flow.
+            ctx.deferred_section_rows.emplace_back("XSECTIONS", line);
+            continue;
+        }
 
         ensure_link_capacity(ctx, idx);
 
@@ -377,7 +408,11 @@ void handle_losses(SimulationContext& ctx, const std::vector<std::string>& lines
         if (tok.size() < 2) continue;  // At minimum: Link Kentry
 
         const int idx = ctx.link_names.find(tok[0]);
-        if (idx < 0) continue;  // Unknown link
+        if (idx < 0) {
+            // Same deferral as [XSECTIONS] — the link may be declared later.
+            ctx.deferred_section_rows.emplace_back("LOSSES", line);
+            continue;
+        }
 
         ensure_link_capacity(ctx, idx);
 
@@ -435,6 +470,17 @@ void handle_transects(SimulationContext& ctx, const std::vector<std::string>& li
             if (tok.size() < 3) continue;
 
             const std::string& name = tok[1];
+
+            // A second X1 with the same name (any case spelling) is a
+            // duplicate ID in legacy (ERR 207). Record the error but keep
+            // parsing so the GR/NC lines that follow stay attached to a
+            // consistent transect slot; the open fails on ctx.errors anyway.
+            for (const auto& existing : ctx.transects.names) {
+                if (ieq(existing, name)) {
+                    ctx.errors.push_back(format_error(ERR_DUP_NAME, name));
+                    break;
+                }
+            }
 
             ctx.transects.names.push_back(name);
             // All parallel arrays in TransectStore must be kept in lock-step

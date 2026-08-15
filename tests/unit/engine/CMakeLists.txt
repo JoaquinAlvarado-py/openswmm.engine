@@ -84,6 +84,8 @@ endfunction()
 #       engine component is written (see MASTER_IMPLEMENTATION_PLAN.md phases).
 
 add_gtest_unit(test_engine_tokenizer         test_tokenizer.cpp)
+add_gtest_unit(test_engine_name_index        test_name_index.cpp)
+add_gtest_unit(test_engine_name_case_parity  test_name_case_parity.cpp)
 add_gtest_unit(test_engine_options_parser    test_options_parser.cpp)
 add_gtest_unit(test_engine_timeseries_file_roundtrip test_timeseries_file_roundtrip.cpp)
 add_gtest_unit(test_engine_pathresolver      test_pathresolver.cpp)
@@ -105,6 +107,15 @@ add_gtest_unit(test_engine_section_order_parity   test_section_order_parity.cpp)
 add_gtest_unit(test_engine_capi_file_paths        test_capi_file_paths.cpp)
 add_gtest_unit(test_engine_events_section         test_events_section.cpp)
 add_gtest_unit(test_engine_report_options_api     test_report_options_api.cpp)
+# Legacy parity for the .rpt analysis-timing block: the wall clock starts at
+# open() (before parsing) as in report_writeLogo(), and elapsed time rolls
+# whole days into a "d." prefix as in report_writeSysTime().
+add_gtest_unit(test_engine_report_timing          test_report_timing.cpp)
+# In-place rename for snow packs / aquifers / inlets / streets / LID controls.
+# Without these APIs the GUI registries flushed a renamed object as a NEW one,
+# duplicating it in the engine and orphaning the original.
+add_gtest_unit(test_engine_object_rename          test_object_rename.cpp)
+add_gtest_unit(test_engine_options_api_units      test_options_api_units.cpp)
 add_gtest_unit(test_engine_climate_api             test_climate_api.cpp)
 add_gtest_unit(test_engine_hotstart          test_hotstart.cpp)
 add_gtest_unit(test_engine_simd_math         test_simd_math.cpp)
@@ -120,13 +131,31 @@ target_compile_definitions(test_engine_xsection PRIVATE
 )
 # STREET cross-section end-to-end (parse → street transect → routing).
 add_gtest_unit(test_engine_street_xsect      test_street_xsect.cpp)
+# ctx.transect_tables must keep cached element pointers valid as it grows —
+# XSectBatch and Link cache raw double* into its elements at initialize() and
+# swmm_link_set_xsect can append afterwards. Guards the deque choice.
+add_gtest_unit(test_engine_transect_table_stability test_transect_table_stability.cpp)
 # STREET cross-section programmatic builder API (set/get xsect + get_params).
 add_gtest_unit(test_engine_street_xsect_api  test_street_xsect_api.cpp)
 # Standalone cross-section geometry API + SWMM_XSectShape enum parity guard.
 add_gtest_unit(test_engine_xsect_api         test_xsect_api.cpp)
+# Portable cross-section kernels (plan §5.1): the public accessors route through
+# the moved bodies, and an evaluator over INDEPENDENT copies of the geometry
+# tables reproduces the host one at ULP zero — the device-rebinding claim,
+# checked on the host across the full shape catalog and depth range.
+add_gtest_unit(test_engine_xsect_kernels_parity test_xsect_kernels_parity.cpp)
+# Same reason as test_engine_xsect_parity below: XSectLookup.hpp switches its
+# normalization and interpolation arithmetic on SWMM_XSECT_FAST_LOOKUP, so a
+# test TU built without the engine's setting would compare the header compiled
+# in one numerical mode against the library compiled in the other.
+if(OPENSWMM_FAST_XSECT_LOOKUP)
+    target_compile_definitions(test_engine_xsect_kernels_parity
+                               PRIVATE SWMM_XSECT_FAST_LOOKUP)
+endif()
 # GUI editor round-trip getters/setters (pollutant units, aquifer ET pattern,
 # snowpack surfaces, inlet params/type, LID layers/type).
 add_gtest_unit(test_engine_editor_roundtrip_api test_editor_roundtrip_api.cpp)
+add_gtest_unit(test_engine_virtual_junction test_virtual_junction.cpp)
 
 add_gtest_unit(test_engine_infiltration     test_infiltration.cpp)
 target_compile_definitions(test_engine_infiltration PRIVATE
@@ -189,6 +218,7 @@ add_gtest_unit(test_engine_gap_fixes       test_gap_fixes.cpp)
 add_gtest_unit(test_engine_storage_shapes  test_storage_shapes.cpp)
 add_gtest_unit(test_engine_storage_shape_roundtrip test_storage_shape_roundtrip.cpp)
 add_gtest_unit(test_engine_links_pump_stats_bulk test_links_pump_stats_bulk.cpp)
+add_gtest_unit(test_engine_pump_ideal_curve test_pump_ideal_curve.cpp)
 add_gtest_unit(test_engine_nodes_bulk_phase3 test_nodes_bulk_phase3.cpp)
 add_gtest_unit(test_engine_links_bulk_phase3 test_links_bulk_phase3.cpp)
 add_gtest_unit(test_engine_subcatchments_bulk_phase3 test_subcatchments_bulk_phase3.cpp)
@@ -199,6 +229,7 @@ add_gtest_unit(test_engine_report_section  test_report_section.cpp)
 add_gtest_unit(test_engine_concurrent       test_concurrent_engines.cpp)
 add_gtest_unit(test_engine_object_deletion test_object_deletion.cpp)
 add_gtest_unit(test_engine_object_deletion_ext test_object_deletion_ext.cpp)
+add_gtest_unit(test_engine_quality_roundtrip test_quality_roundtrip.cpp)
 add_gtest_unit(test_engine_type_conversion test_type_conversion.cpp)
 add_gtest_unit(test_engine_tags           test_tags.cpp)
 # Engine gaps BN-LINK-01a / -01b — symmetric getters for initial-flow /
@@ -359,6 +390,10 @@ if(OPENSWMM_BUILD_2D)
     # model in CMS and CFS and asserts matching 2D depths/continuity. Guards the
     # always-feet⇄metres coupling factors (the 1D side is always feet-internal).
     add_gtest_unit(test_engine_2d_coupling_units test_2d_coupling_units.cpp)
+    # [2D_TRIANGLES] INIT_DEPTH unit-system regression — the column shares the
+    # mesh's vertical datum (project display units), so initialize() must scale
+    # it by mesh_to_si like vz. It was consumed raw as metres before the fix.
+    add_gtest_unit(test_engine_2d_init_depth_units test_2d_init_depth_units.cpp)
     # Two-way 1D↔2D OUTFALL coupling regression — a coupled outfall's pipe
     # discharge must reach the 2D mesh (it read nodes.outflow≈0 before the fix)
     # and both the 2D and 1D continuity ledgers must close.
@@ -400,6 +435,39 @@ if(OPENSWMM_BUILD_2D)
     add_gtest_unit(test_engine_2d_windowless_coupling
                    test_2d_windowless_coupling.cpp)
 endif()
+
+# ---------------------------------------------------------------------------
+# Explicit finite-volume 1D network solver (FLOW_ROUTING FV).
+# See plans/EXPLICIT_FV_KOKKOS_1D_SOLVER_PLAN.md §6.
+# ---------------------------------------------------------------------------
+# Cross-section closure: A(h) monotone and C⁰ through the crown, dA/dh == T
+# (the tapered slot mouth), A↔h round-trip incl. the taper band and deep slot,
+# I₁ as the antiderivative of A with an analytic above-crown extension, and the
+# FV_SLOT_CELERITY design value actually delivered.
+add_gtest_unit(test_engine_fv_closure test_fv_solver_closure.cpp)
+# Analytic scheme gates: exact lake-at-rest over a slope break AND while
+# pressurized, Ritter (dry) and Stoker (wet) dam break vs. the closed-form
+# solutions incl. shock SPEED, and mass conservation to machine precision over
+# 10⁵ substeps.
+add_gtest_unit(test_engine_fv_analytic test_fv_solver_analytic.cpp)
+# Network gates: virtual-junction equivalence (single conduit vs. split), node
+# coupling and continuity, mixed-flow filling bore vs. Rankine–Hugoniot,
+# compaction results-transparency, and the scalar-transport contracts.
+add_gtest_unit(test_engine_fv_network test_fv_solver_network.cpp)
+# Local time stepping (§6.12): fall-through to global stepping bit-for-bit on an
+# untiered mesh, tier-interface conservation exact at every tier count, a
+# wetting front crossing tier boundaries without loss, and the substep-count
+# relief a 100x graded reach actually delivers.
+add_gtest_unit(test_engine_fv_lts test_fv_lts.cpp)
+# Engine-level gates (§6.7): FLOW_ROUTING FV end-to-end on the reference
+# drainage model — routing continuity vs DYNWAVE, routed-volume agreement,
+# mesh-refinement CONVERGENCE toward the DW hydrograph (the consistency gate),
+# conservation independent of resolution, and the FV_* .inp round-trip.
+add_gtest_unit(test_engine_fv_integration test_fv_engine_integration.cpp)
+target_compile_definitions(test_engine_fv_integration PRIVATE
+    OPENSWMM_FV_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/regression/data"
+    OPENSWMM_FV_UNIT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+    OPENSWMM_FV_TEST_OUT_DIR="${PROJECT_SOURCE_DIR}/tests/output")
 
 # Golden cross-section parity harness — diffs the new xsect:: implementation
 # against the legacy xsect.c. The legacy dylib hides its internal xsect_*

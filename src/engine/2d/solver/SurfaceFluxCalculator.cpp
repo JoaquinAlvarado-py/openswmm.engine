@@ -7,6 +7,7 @@
  */
 
 #include "SurfaceFluxCalculator.hpp"
+#include "InertialKernels.hpp"
 #include "../data/BoundaryData.hpp"
 
 #include <cmath>
@@ -61,16 +62,10 @@ inline void edgeEndpointZ(const MeshData& mesh, int t, int e,
 // bands. A cell with water pooled below the whole shared edge conveys nothing
 // across it (kills the uphill-creep / slope-stranding artifacts, per the
 // paper's sloping-bed and roughened-bed tests).
-inline double faceDepthFromEta(double eta, double z_lo, double z_hi) noexcept {
-    if (eta <= z_lo) return 0.0;
-    const double dz = z_hi - z_lo;
-    if (dz < 1.0e-9) return eta - z_lo;             // level edge
-    if (eta <= z_hi) {
-        const double t = eta - z_lo;
-        return t * t / (2.0 * dz);
-    }
-    return eta - 0.5 * (z_lo + z_hi);
-}
+// The implementation now lives in InertialKernels.hpp
+// (inertial::faceDepthFromEta) — one source shared by this boundary path, the
+// GPU boundary kernels, and the VFR interior-face path.
+using inertial::faceDepthFromEta;
 
 // Head-difference regularization for the diffusive-wave flux. The collapsed
 // Manning flux carries √|Δη|, whose derivative ∂F/∂Δη ∝ 1/√|Δη| → ∞ as the
@@ -137,6 +132,12 @@ inline double boundaryEdgeFlux(const MeshData& mesh, const SurfaceStateData& sta
             // Collapsed-Manning flux toward the prescribed stage h_bc, mirroring
             // the interior operator with the ghost at h_bc and the centroid→edge
             // distance Δx = 2A/(3L) (triangle centroid is 1/3 of the height up).
+            // NOTE: the explicit marchers (CPU + Kokkos) no longer call this
+            // branch — they integrate stage boundaries with the interior
+            // local-inertial momentum law (prognostic bc_q_ vs a ghost at
+            // η_bc), because this diffusive-wave conductance saturated the
+            // equilibrium clamp into a Dirichlet cell and left every BC-driven
+            // steady case one head-jump above its prescribed stage.
             if (n <= 0.0) return 0.0;
             const double h_bc = b->edge_bc_head[idx];
             const double dh   = state.head[i] - h_bc;

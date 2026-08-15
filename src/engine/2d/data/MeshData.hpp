@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file MeshData.hpp
  * @brief Structure-of-Arrays (SoA) storage for 2D triangular mesh geometry.
@@ -12,7 +28,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_2D_MESH_DATA_HPP
@@ -87,6 +103,9 @@ struct MeshData {
 
     // Surface properties
     std::vector<double> mannings_n;     ///< Manning's roughness coefficient
+    std::vector<double> tri_init_depth; ///< Initial water depth (m, default 0 = dry)
+    std::vector<double> tri_init_u;     ///< [2D_INITIAL_VELOCITY] u (m/s, default 0)
+    std::vector<double> tri_init_v;     ///< [2D_INITIAL_VELOCITY] v (m/s, default 0)
     std::vector<std::string> tri_tag;   ///< Optional triangle tag
 
     // -----------------------------------------------------------------------
@@ -185,6 +204,9 @@ struct MeshData {
         edge_conveyance.resize(n3, 1.0);  // §11A — default unrestricted
 
         mannings_n.resize(n, 0.035);
+        tri_init_depth.resize(n, 0.0);
+        tri_init_u.resize(n, 0.0);
+        tri_init_v.resize(n, 0.0);
         tri_tag.resize(n);
         tri_coupled_node.resize(n, -1);
         tri_coupled_node_name.resize(n);

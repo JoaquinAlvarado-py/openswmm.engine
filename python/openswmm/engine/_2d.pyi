@@ -1,10 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Caleb Buahin
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 2D Surface Routing
 ==================
 
 :author: Caleb Buahin
 :copyright: Copyright (c) 2026 Caleb Buahin
-:license: MIT
+:license: Apache-2.0
 
 Type stubs for :mod:`openswmm.engine._2d`.
 
@@ -184,6 +200,22 @@ class Surface2D:
 
     def set_triangle_mannings(self, idx: int, n: float) -> None:
         """Set Manning's M{n} for a triangle (must be strictly positive)."""
+        ...
+
+    def get_triangle_init_depth(self, idx: int) -> float:
+        """Return the initial water depth of a triangle, in mesh length units."""
+        ...
+
+    def set_triangle_init_depth(self, idx: int, depth: float) -> None:
+        """Set the initial water depth of a triangle (mesh length units, M{>= 0})."""
+        ...
+
+    def get_triangle_init_velocity(self, idx: int) -> tuple[float, float]:
+        """Return the C{(u, v)} initial velocity of a triangle, in m/s."""
+        ...
+
+    def set_triangle_init_velocity(self, idx: int, u: float, v: float) -> None:
+        """Set the C{(u, v)} initial velocity of a triangle (m/s, finite)."""
         ...
 
     def get_triangle_tag(self, idx: int) -> str:

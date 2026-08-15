@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_infrastructure_impl.cpp
  * @brief C API implementation — transects, streets, inlets, LID controls, LID usage.
@@ -7,11 +23,12 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "openswmm_api_common.hpp"
 #include "../../../include/openswmm/engine/openswmm_infrastructure.h"
+#include "StringCase.hpp"
 
 #include <cctype>
 #include <string>
@@ -28,6 +45,10 @@ SWMM_ENGINE_API int swmm_transect_add(SWMM_Engine engine, const char* id) {
 
     auto& ctx = to_engine(engine)->context();
     auto& ts = ctx.transects;
+
+    // Reject duplicates (case-insensitive, legacy hash.c parity).
+    for (const auto& existing : ts.names)
+        if (openswmm::ieq(existing, id)) return SWMM_ERR_BADPARAM;
 
     ts.names.push_back(id);
     ts.comments.push_back(std::string{});
@@ -75,9 +96,10 @@ SWMM_ENGINE_API int swmm_transect_count(SWMM_Engine engine) {
 
 SWMM_ENGINE_API int swmm_transect_index(SWMM_Engine engine, const char* id) {
     if (!engine || !id) return -1;
+    // Case-insensitive (legacy hash.c parity)
     const auto& names = to_engine(engine)->context().transects.names;
     for (std::size_t i = 0; i < names.size(); ++i) {
-        if (names[i] == id) return static_cast<int>(i);
+        if (openswmm::ieq(names[i], id)) return static_cast<int>(i);
     }
     return -1;
 }
@@ -238,19 +260,10 @@ SWMM_ENGINE_API int swmm_transect_rename(SWMM_Engine engine, int idx, const char
     if (ts.names[ui] == new_id) return SWMM_OK;
 
     // Case-insensitive collision check against every other slot.
-    auto ieq = [](const std::string& a, const std::string& b) {
-        if (a.size() != b.size()) return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            const unsigned char ca = static_cast<unsigned char>(a[i]);
-            const unsigned char cb = static_cast<unsigned char>(b[i]);
-            if (std::tolower(ca) != std::tolower(cb)) return false;
-        }
-        return true;
-    };
     const std::string newName(new_id);
     for (std::size_t i = 0; i < ts.names.size(); ++i) {
         if (i == ui) continue;
-        if (ieq(ts.names[i], newName)) return SWMM_ERR_BADPARAM;
+        if (openswmm::ieq(ts.names[i], newName)) return SWMM_ERR_BADPARAM;
     }
 
     ts.names[ui] = newName;
@@ -308,6 +321,44 @@ SWMM_ENGINE_API int swmm_street_add(SWMM_Engine engine, const char* id) {
     return SWMM_OK;
 }
 
+SWMM_ENGINE_API int swmm_street_rename(SWMM_Engine engine, int idx, const char* new_id) {
+    CHECK_HANDLE(engine);
+    if (!new_id || new_id[0] == '\0') return SWMM_ERR_BADPARAM;
+    auto& ctx = to_engine(engine)->context();
+    auto& st  = ctx.streets;
+    CHECK_INDEX(idx >= 0 && idx < st.count());
+    const auto ui = static_cast<std::size_t>(idx);
+
+    // Same-name (case-sensitive) is a no-op.
+    if (st.names[ui] == new_id) return SWMM_OK;
+
+    // Streets have no NameIndex — lookups are linear ieq scans — so do the
+    // collision check the same way.
+    const std::string newName(new_id);
+    for (std::size_t i = 0; i < st.names.size(); ++i) {
+        if (i == ui) continue;
+        if (openswmm::ieq(st.names[i], newName)) return SWMM_ERR_BADPARAM;
+    }
+
+    const std::string prev = st.names[ui];
+    st.names[ui] = newName;
+
+    // Unlike the other four, a street IS referenced by name after parsing:
+    // STREET_XSECT links keep it in links.pump_curve_name (that field is
+    // overloaded for named cross-section references). InpWriter emits it as
+    // [XSECTIONS] Geom1 and swmm_link_get_xsect resolves the street back by
+    // name, so skipping this fixup would write a dangling reference.
+    for (std::size_t i = 0; i < ctx.links.pump_curve_name.size(); ++i) {
+        if (i < ctx.links.xsect_shape.size() &&
+            ctx.links.xsect_shape[i] != openswmm::XsectShape::STREET_XSECT)
+            continue;
+        if (openswmm::ieq(ctx.links.pump_curve_name[i], prev))
+            ctx.links.pump_curve_name[i] = newName;
+    }
+
+    return SWMM_OK;
+}
+
 SWMM_ENGINE_API int swmm_street_set_params(SWMM_Engine engine, int idx,
                                              double t_crown, double h_curb, double sx, double n_road,
                                              double gutter_depres, double gutter_width, int sides,
@@ -338,9 +389,10 @@ SWMM_ENGINE_API int swmm_street_count(SWMM_Engine engine) {
 
 SWMM_ENGINE_API int swmm_street_index(SWMM_Engine engine, const char* id) {
     if (!engine || !id) return -1;
+    // Case-insensitive (legacy hash.c parity)
     const auto& names = to_engine(engine)->context().streets.names;
     for (std::size_t i = 0; i < names.size(); ++i) {
-        if (names[i] == id) return static_cast<int>(i);
+        if (openswmm::ieq(names[i], id)) return static_cast<int>(i);
     }
     return -1;
 }
@@ -397,6 +449,29 @@ SWMM_ENGINE_API int swmm_inlet_add(SWMM_Engine engine, const char* id, const cha
     return SWMM_OK;
 }
 
+SWMM_ENGINE_API int swmm_inlet_rename(SWMM_Engine engine, int idx, const char* new_id) {
+    CHECK_HANDLE(engine);
+    if (!new_id || new_id[0] == '\0') return SWMM_ERR_BADPARAM;
+    auto& inl = to_engine(engine)->context().inlets;
+    CHECK_INDEX(idx >= 0 && idx < inl.count());
+    const auto ui = static_cast<std::size_t>(idx);
+
+    if (inl.names[ui] == new_id) return SWMM_OK;
+
+    // No NameIndex for inlets — swmm_inlet_index scans with ieq, so the
+    // collision check must match.
+    const std::string newName(new_id);
+    for (std::size_t i = 0; i < inl.names.size(); ++i) {
+        if (i == ui) continue;
+        if (openswmm::ieq(inl.names[i], newName)) return SWMM_ERR_BADPARAM;
+    }
+
+    inl.names[ui] = newName;
+    // [INLET_USAGE] rows hold inlet_usages.design_index, not a name string, so
+    // there is nothing further to fix up.
+    return SWMM_OK;
+}
+
 SWMM_ENGINE_API int swmm_inlet_set_params(SWMM_Engine engine, int idx, double length, double width,
                                             const char* grate_type, double open_area, double splash_veloc) {
     CHECK_HANDLE(engine);
@@ -420,9 +495,10 @@ SWMM_ENGINE_API int swmm_inlet_count(SWMM_Engine engine) {
 
 SWMM_ENGINE_API int swmm_inlet_index(SWMM_Engine engine, const char* id) {
     if (!engine || !id) return -1;
+    // Case-insensitive (legacy hash.c parity)
     const auto& names = to_engine(engine)->context().inlets.names;
     for (std::size_t i = 0; i < names.size(); ++i) {
-        if (names[i] == id) return static_cast<int>(i);
+        if (openswmm::ieq(names[i], id)) return static_cast<int>(i);
     }
     return -1;
 }
@@ -505,6 +581,9 @@ SWMM_ENGINE_API int swmm_lid_add(SWMM_Engine engine, const char* id, int type) {
     if (ctx.state != openswmm::EngineState::BUILDING &&
         ctx.state != openswmm::EngineState::OPENED)
         return SWMM_ERR_LIFECYCLE;
+    // Reject duplicates (case-insensitive) BEFORE touching the backing store;
+    // an unguarded NameIndex::add would throw across the C ABI.
+    if (ctx.lid_names.find(id) >= 0) return SWMM_ERR_BADPARAM;
 
     auto& lid = ctx.lid_controls;
     lid.names.push_back(id);
@@ -518,6 +597,25 @@ SWMM_ENGINE_API int swmm_lid_add(SWMM_Engine engine, const char* id, int type) {
     lid.removals.push_back({});
 
     ctx.lid_names.add(id);
+    return SWMM_OK;
+}
+
+SWMM_ENGINE_API int swmm_lid_rename(SWMM_Engine engine, int idx, const char* new_id) {
+    CHECK_HANDLE(engine);
+    if (!new_id || new_id[0] == '\0') return SWMM_ERR_BADPARAM;
+    auto& ctx = to_engine(engine)->context();
+    if (ctx.state != openswmm::EngineState::BUILDING &&
+        ctx.state != openswmm::EngineState::OPENED)
+        return SWMM_ERR_LIFECYCLE;
+    CHECK_INDEX(idx >= 0 && idx < ctx.lid_controls.count());
+
+    // Both stores are read: lid_controls.names backs swmm_lid_id and the
+    // [LID_CONTROLS] writer, the NameIndex backs swmm_lid_index and the
+    // [LID_USAGE] writer. NameIndex::rename arbitrates the collision.
+    if (!ctx.lid_names.rename(idx, new_id)) return SWMM_ERR_BADPARAM;
+    ctx.lid_controls.names[static_cast<std::size_t>(idx)] = new_id;
+
+    // lid_usage rows carry lid_index, not a name string — nothing else to fix.
     return SWMM_OK;
 }
 
@@ -648,11 +746,9 @@ SWMM_ENGINE_API int swmm_lid_count(SWMM_Engine engine) {
 
 SWMM_ENGINE_API int swmm_lid_index(SWMM_Engine engine, const char* id) {
     if (!engine || !id) return -1;
-    const auto& names = to_engine(engine)->context().lid_controls.names;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        if (names[i] == id) return static_cast<int>(i);
-    }
-    return -1;
+    // Route through the registry (case-insensitive, legacy hash.c parity)
+    // instead of scanning lid_controls.names, which could disagree with it.
+    return to_engine(engine)->context().lid_names.find(id);
 }
 
 SWMM_ENGINE_API const char* swmm_lid_id(SWMM_Engine engine, int idx) {

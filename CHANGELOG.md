@@ -19,6 +19,317 @@ retroactive.
 > scale factors and the cross-section legacy-parity port — is not yet itemized
 > here. See `git log v6.0.0-alpha.1..` for the interim record.
 
+## [Unreleased]
+
+### Performance
+
+- **Model load and initialization: up to 17× faster, and the wall-clock window
+  before the first routing step cut on every model size.** A user reported 25
+  minutes between clicking Run and the analysis starting on a large model; that
+  window is `open()` + `initialize()` + `start()`, and none of it was
+  instrumented. See `plans/MODEL_LOAD_OPTIMIZATION_RESULTS_2026-08-13.md` for
+  the full measured breakdown, including the four plan predictions that
+  measurement disproved.
+
+  Measured in Release, medians of 5, one process per model:
+
+  | Model | before | after |
+  |---|---:|---:|
+  | 100k-conduit FV model, `open+initialize` | 8047 ms | 466 ms (**17.3×**) |
+  | 500 timeseries × 10k rows, `open` | 7213 ms | 2571 ms (**2.81×**) |
+  | 10k rain gages, `open` | 335 ms | 49 ms (**6.90×**) |
+  | 50k STREET conduits, `open` | 448 ms | 159 ms (**2.83×**) |
+  | 100k nodes + inflows with `REPORT INPUT YES`, full | 2550 ms | 897 ms (**2.84×**) |
+  | 500k nodes/links with geometry, `open` | 3553 ms | 2482 ms (**1.43×**) |
+
+  Peak RSS also falls: −35% on the STREET model, −17% on the 500k model.
+
+  The individual fixes: a case-insensitive hash index over the timeseries/curve
+  store (it was a linear scan called once per data row while parsing
+  `[TIMESERIES]`/`[CURVES]`); memoized STREET/CUSTOM transect tabulation (one
+  ~1.3 KB table per street instead of one per link); a one-pass node-inflow
+  prepass in the `REPORT INPUT YES` summary (was O(nodes × inflow rows));
+  memoized finite-volume per-conduit geometry tabulation (~5,000 closure
+  evaluations per conduit, for a result that depends only on the cross-section);
+  reserved SoA capacity and token vectors during parsing; an allocation-free
+  `;; UNITS:` prescan; a 1 MB buffer on the binary `.out` stream; and
+  file-size-derived reserves for external FILE-backed timeseries in place of a
+  flat 100,000-row allocation each.
+
+  All of it is bit-identical: every change was gated on a parity check
+  comparing the `.rpt` (timing lines masked), the `.out` byte for byte, and the
+  written-back `.inp`, across six models covering STREET, IRREGULAR, FV,
+  storage and quality.
+
+### Changed
+
+- **Relicensed from MIT to the Apache License, Version 2.0** (#123, #122). The
+  `LICENSE` file now carries the full Apache 2.0 text, retaining the addendum
+  that acknowledges the USEPA SWMM material residing in the public domain under
+  17 USC § 105 — the Apache grant covers only the OpenSWMM authors' original
+  contributions and places no restriction on that public domain material. A new
+  `NOTICE` file records the required attribution and SWMM provenance. All
+  first-party source headers now carry the Apache 2.0 boilerplate and an
+  `SPDX-License-Identifier: Apache-2.0` tag in place of the previous MIT tags.
+  `CLA.md` (v1.1), `CONTRIBUTING.md`, `CITATION.cff`, `README.md`, the Python
+  bindings' `pyproject.toml` and the Sphinx license page were updated to match.
+  Built-in plugin metadata (`IPluginComponentInfo::license_type`) now reports
+  `"Apache-2.0"`.
+
+### Added
+
+- **Model-load benchmark harness and parity gate.**
+  `OPENSWMM_PERF=1` now emits a `[PERF-LOAD]` line attributing the whole
+  open/initialize/start window across 20 phases (including a `read.scan` vs
+  `read.dispatch` split of parsing).
+  `tests/benchmarks/scripts/gen_load_bench.py` generates a deterministic
+  scaling corpus up to 500k elements (not committed — 500 MB — but reproducible
+  from the committed generator); `bench_model_load` times three cuts per model
+  and reports peak RSS; `parity_probe` + `tests/benchmarks/scripts/load_parity.sh`
+  compare `.rpt`/`.out`/write-back `.inp` between two builds. Two new ctest
+  gates run under `ctest -L unit`: `load_parity_selfcheck` (engine output is
+  deterministic) and `bench_corpus_generator_smoke`.
+
+- **Per-triangle 2D initial conditions in the Python bindings.**
+  `Surface2D.get_triangle_init_depth` / `set_triangle_init_depth` and
+  `get_triangle_init_velocity` / `set_triangle_init_velocity`, wrapping
+  `swmm_2d_triangle_get_init_depth`, `swmm_2d_set_triangle_init_depth`,
+  `swmm_2d_triangle_get_init_velocity` and `swmm_2d_set_triangle_init_velocity`.
+  These were the last four exported C functions with no Python wrapper; the
+  binding surface is now complete (0 `py-gap` in
+  `plans/parity/provenance_matrix.md`). Initial depth is in **mesh length
+  units** — the vertex-Z convention, not the SI metres the runtime state
+  accessors use.
+
+- **Gymnasium coverage column in the parity tooling.**
+  `plans/parity/tools/build_matrix_provenance.py` gained `--gym-root` and a
+  third `Gym` column derived from the `openswmm.gymnasium` adapter surface
+  (`_engine/solver_adapter.py`, plus any module that imports `openswmm`
+  directly, so a bypass of the choke point shows up). Advisory and never
+  gated — gymnasium is an RL surface, not an API mirror. 281 of 903 C symbols
+  are currently reachable through it.
+
+- **`FLOW_ROUTING FV` — an explicit conservative finite-volume solver.** A
+  Godunov-type scheme on a cell mesh cut from the conduits, alongside (not
+  replacing) dynamic wave analysis. Conservation form with hydrostatic
+  (Audusse) reconstruction, HLL interface flux, semi-implicit Manning friction
+  and explicit zero-D node continuity, substepping internally at the Courant
+  limit so the routing step is a reporting cadence rather than a stability
+  constraint. Documented as Chapter 8 of the Hydraulics Reference Manual.
+
+  What it delivers on the EPA reference drainage model: **routing continuity
+  error 0.000 %, at every mesh resolution**, against 0.026 % for the implicit
+  solver on the same file. Mixed free-surface/pressurized flow needs no
+  regime-switching logic — the Preissmann slot is folded into the cross-section
+  closure with a tapered mouth, so a filling bore is captured rather than
+  tracked and its speed is an output of the scheme. Virtual junctions become
+  ordinary interior faces, so a conduit split by one reproduces the unsplit
+  conduit cell for cell, including the reversed A→VJ←B orientation.
+
+  Seventeen `FV_*` `[OPTIONS]` keys, all readable and writable through
+  `swmm_options_get`/`set` (and therefore through the Python bindings and the
+  MCP server), and all **inert rather than rejected** under the other routing
+  models so switching `FLOW_ROUTING` never invalidates a file:
+  `FV_CELL_LENGTH`, `FV_MIN_CELLS`, `FV_CFL`, `FV_RIEMANN`, `FV_ORDER`,
+  `FV_LIMITER`, `FV_SCALAR_SCHEME`, `FV_TIME_INTEGRATION`, `FV_SLOT_CELERITY`,
+  `FV_DISPERSION`, `FV_STRUCTURE_COUPLING`, `FV_COMPACTION`, `FV_BACKEND`,
+  `FV_MIN_PARALLEL_CELLS`, `FV_LTS`, `FV_LTS_MAX_TIERS`,
+  `FV_CFL_CENSUS_INTERVAL`.
+
+  > **Refine further if peak flows matter.** The default is
+  > `FV_MIN_CELLS 4`; at that mesh the solver attenuates this model's peaks by
+  > 15.3 % on average, against 37.1 % at one cell per conduit and 7.6 % at
+  > eight. The cause is geometric, not diffusive — a cell-centred scheme puts a
+  > single cell's bed at the conduit's *mid-point* elevation, presenting an
+  > artificial bed step of half the conduit's fall at every manhole — so
+  > higher-order reconstruction does not rescue it. Dynamic wave analysis
+  > remains the default routing model and the right choice for routine design
+  > storms, continuous simulation and planning work.
+
+  > **It is also slower.** On the same model the finite-volume solver runs
+  > ~7× the dynamic wave solver's wall-clock at one cell per conduit, ~15× at
+  > the default four, and ~34× at Δx = 20 ft. The peak-deviation figures above are a consistency
+  > check against dynamic wave routing, not a measure of error — accuracy is
+  > established against closed-form solutions, not against another numerical
+  > method. The binding constraint is the node rather than the
+  > pipe: a junction's `MIN_SURFAREA` storage floor is a few feet of effective
+  > length against a conduit Δx of several hundred, so the manhole sets the
+  > explicit step. Choose the solver for conservation, shock capture and
+  > transcritical flow — not for speed.
+
+- **`FV_ORDER 2` — second-order MUSCL reconstruction.** MUSCL on the free
+  surface and velocity (not depth and discharge) with the bed taken from its
+  exact per-cell gradient, plus a centred bed source, so the still-water
+  property is preserved to machine precision at second order for all three
+  limiters. Cells whose ends differ in elevation by an appreciable fraction of
+  the water depth fall back to first order, so the option is safe to leave on.
+
+- **Local time stepping for the finite-volume solver (`FV_LTS`, on by
+  default).** Each control volume is assigned a power-of-two tier from its own
+  Courant limit and advances at its own rate, so one 5 ft pipe or one
+  surcharged manhole no longer sets the substep size for the whole network. On
+  a reach with a 40x length ratio this cuts face evaluations by 2.5x at the
+  same base step. Conservation across a tier interface is exact by
+  construction — a face books its flux into both incident volumes'
+  accumulators, so what leaves a fine cell is bit-for-bit what arrives in its
+  coarse neighbour. Tiers are graded so no face spans more than one level, and
+  volumes fire at the END of their windows so the flux they drain and the
+  sources they integrate cover the same span. Where tiering finds nothing to
+  separate the solver falls through to global stepping bit-for-bit, and it is
+  disabled outright when species are being transported, because the
+  flux-corrected transport limiter needs one synchronous sweep.
+  `FV_LTS_MAX_TIERS` caps the spread.
+
+- **Fixed: a model the finite-volume solver could not mesh ran with no routing
+  at all.** `initFv` bails on a mesh-build error leaving no solver, and every
+  subsequent step returned immediately — so the run completed, exited clean, and
+  reported a network through which no water had ever moved. The diagnostics were
+  collected and never read by anything. They now reach `ctx.errors`, and
+  `initialize()` fails. A `DUMMY`-shape conduit is enough to trigger it, and
+  those are common in real models.
+
+- **Fixed: storage-node evaporation and exfiltration were charged to the mass
+  balance but never removed from the water under `FLOW_ROUTING FV`.** The loss
+  is reported as node outflow and booked as a routing loss, while the solver
+  kept the volume — a continuity error scaling with the number of storage units
+  that lose.
+
+- **Fixed: conduit seepage was 43 200× too large under US units.** `[LOSSES]`
+  seepage arrives in in/hr in *both* unit systems while the solver consumes
+  ft/s, but the input-conversion pass short-circuits for US units on the
+  grounds that the input is already internal — true for lengths, areas and
+  flows, false for a rainfall-dimensioned rate. The loss then saturated at the
+  availability cap: a model whose only seepage was one conduit at 0.20 in/hr
+  showed −67 % routing continuity. Affects `KINWAVE`, `STEADY` and `FV`;
+  dynamic wave routing computes its losses on a separate path and is
+  unaffected.
+
+- **Fixed: `FLOW_ROUTING FV` lost junction storage from the routing mass
+  balance.** A plain junction reports zero contribution to routing storage by
+  legacy convention, which dynamic wave routing can afford because it never has
+  to hold water in a junction to stay stable. The finite-volume node *is* an
+  explicit control volume, so the water standing in it is real — and excluding
+  it produced a continuity error proportional to junction count: 0.00082
+  acre-feet per junction, which rounds to 0.000 % on a twelve-node model and
+  read 0.887 % on a five-hundred-node one. Junctions are now reported under FV
+  with the same relation the solver integrates. Dynamic wave routing is
+  untouched.
+
+- **Semi-implicit node coupling (`FV_NODE_COUPLING`, default
+  `SEMI_IMPLICIT`) — 2.9×.** A junction's `MIN_SURFAREA` storage floor is a few
+  feet of effective length against a conduit Δx of several hundred, so under
+  explicit coupling the manhole, not the pipe, set the stable substep for the
+  whole model. Each coupling face's mass flux is now linearized in the node head
+  through the characteristic relation |dQ/dH| = √(gAT). Conservation survives by
+  construction rather than by care: the correction is applied to the face flux,
+  which is the one quantity both the cell update and the node update read —
+  damping the node *head* instead would imply a volume change the incident cells
+  never saw. At equilibrium the correction is identically zero, so the two
+  couplings agree on the steady state they reach.
+
+- **The finite-volume depth inversion is 3.2× faster, at bit-identical
+  results.** `depthOfArea` — inverting A(h) for the depth the solver reports and
+  reconstructs from — was 87 % of solver time. The Illinois regula-falsi it used
+  does not converge superlinearly on this closure: measured 16 closure
+  evaluations per call on a circular pipe and 35 on a trapezoid. Newton with the
+  top width as derivative is fast but wrong, because for tabulated shapes width
+  and area are independent legacy tabulations rather than an exact derivative
+  pair — round-trip error 4.7e-4 ft on a 3 ft pipe, enough to break the
+  still-water property. Brent's method is superlinear on function values alone
+  and lands at 5.9 evaluations with full accuracy. Every peak-flow figure in the
+  benchmark is unchanged to three significant figures.
+
+- **`FV_TIME_INTEGRATION RK2` now integrates.** The key parsed, validated and
+  reported correctly but was never wired to the step — every run was forward
+  Euler. It is now Heun/SSP-RK2 applied to the whole operator, friction and
+  positivity limiting included in each stage, with the node update averaged
+  through VOLUME rather than head and the flux ledgers averaged rather than
+  summed. Mutually exclusive with local time stepping, which gives different
+  volumes different steps for the two stages to average over.
+
+- **Cell-resolved Eulerian scalar transport on the finite-volume mesh.** The
+  species flux is the same mass flux the water used, upwinded on the contact
+  speed, which makes solute mass conservation exact and keeps a uniform
+  concentration field uniform under any flow including reversal and drying.
+  First-order upwind, MUSCL and QUICKEST-ULTIMATE reconstructions, limited by
+  flux-corrected transport so the discrete maximum principle holds without
+  sacrificing conservation, and optional implicit longitudinal dispersion.
+
+- **`RouteModel.FV` in the Python bindings**, and `FV` in the MCP server's
+  routing-model reporting.
+
+### Changed
+
+- **One definition of every analytic cross-section formula.** The shape
+  geometry existed twice: once per element in the portable kernels
+  (`XSectKernels.hpp`, which the finite-volume solver and a future device
+  backend compile) and once as SoA loops in `XSectBatch.cpp`, which is what the
+  dynamic wave's `computeLinkGeometry` STEP B (widths) and STEP D (areas and
+  hydraulic radii) run. Both now call the same `xsect::shape` leaves, so the
+  two solvers' geometry cannot drift. Dynamic-wave output is byte-identical
+  across 105 decks — the 20 EPA QA parity models plus every DYNWAVE deck in the
+  unit corpus — in **both** the shipped fast-lookup configuration and the
+  bit-exact one, and the batch path is asserted equal to the shared kernels
+  element-wise at ULP zero over the full shape catalog × 401 depth stations.
+  That sweep also turns the fused circular area/hyd-radius kernel's
+  bit-identity claim, until now only a comment, into a gate.
+
+### Fixed
+
+- **`MIN_SURFAREA` was a project option the junction storage convention never
+  read.** Legacy keeps no junction storage at all (`node_getVolume` returns
+  `fullVolume*(d/fd)`, and `fullVolume` is 0 for a plain junction); this engine
+  books it deliberately at `MIN_SURFAREA * fullDepth` — but took the 12.566 ft²
+  **compile-time constant** rather than the option. The dynamic wave honoured
+  the option in its surface-area floor, so the asymmetry hid: DW output moved
+  with the setting while **FV output was byte-identical across 0.0001, 0.01 and
+  12.566**, because the FV node area *is* that volume divided by full depth.
+  A metric deck asking for `MIN_SURFAREA 12.566` (m²) got 12.566 ft² — the same
+  10.8× unit slip the dynamic wave's own floor was fixed for.
+
+  It matters most where nodes are an artifact of discretizing a channel rather
+  than real manholes. On the SWASHES 1D analytic chains, which ask for 0.01,
+  every node carried 1257× the intended storage. Fixing it improves FV's L1
+  depth error against the analytic solution by **2.75× on Ritter** (0.144 →
+  0.052), **2.81× on Stoker** (0.120 → 0.043) and **3.78× on Thacker planar**
+  (1.467 → 0.388) — FV is now the most accurate solver in the suite on all
+  three, ahead of both dynamic-wave columns and the 2D marcher. `lake-at-rest-
+  emerged` moves the other way (0.0051 → 0.0119): less node storage means less
+  damping at an emerged shoreline.
+
+  `full_volume` is now set once from the effective area, so `node::getVolume`
+  takes its `fullVolume > 0` branch and the mass balance, the dynamic wave and
+  the FV mesh all read one number. **Default behaviour is unchanged** —
+  `min_surf_area` defaults to 0, meaning "use the constant" — and 102 of 105
+  regression decks are byte-identical. The three that move are exactly the
+  three that set the option; all three have byte-identical `.out`, differing
+  only in one node's reported continuity (0.22 % → 0.23 %).
+
+- **Triangular conduit area disagreed with legacy in the last bit.** The batch
+  path spelled it `s_bot*y*y`; legacy spells it `y*y*sBot`. IEEE multiplication
+  is not associative, so those are different computations — for a plain
+  3 ft × 4 ft triangular channel they disagree at 130 of 401 depth stations.
+  It survived every parity run because **neither test corpus contains a single
+  TRIANGULAR conduit**: no deck could exercise it, and no deck can show the
+  fix. Adopting the shared formula puts DYNWAVE on legacy's spelling, and the
+  new element-wise gate covers the shape by name.
+
+### Notes
+
+- Finite-volume routing is **not** under the legacy bit-parity contract — it is
+  a different discretization, and is gated on analytic and engineering
+  tolerances instead. No dynamic-wave, kinematic-wave or steady-state result
+  moves.
+
+- The dynamic wave's STEP B/D geometry and the finite-volume solver's still
+  differ at the ULP level in the **shipped default** build, and sharing the
+  shape formulas does not change that. `SWMM_XSECT_FAST_LOOKUP` (on by default,
+  ~10 % faster routing) makes `xsect_batch` normalize by a precomputed
+  reciprocal and interpolate with `* inv_delta`, while `XsectEval` always
+  divides — the divergence lives in the normalize/lookup layer, below the shape
+  formulas. Build with `-DOPENSWMM_FAST_XSECT_LOOKUP=OFF` for the bit-exact
+  path the legacy parity contract governs.
+
 ## [6.0.0-alpha.3] — 2026-07-29
 
 ### Added
@@ -196,6 +507,21 @@ retroactive.
 
 ### Changed
 
+- **`FV_MIN_CELLS` now defaults to 4, and is a real floor.** It previously
+  defaulted to 1 and was applied only when `FV_CELL_LENGTH` was also set, so on
+  its own it did nothing — a parsed knob that needed a second knob to have any
+  effect. It now applies with or without a length target.
+
+  One cell per conduit was the default and should not have been. A conduit
+  meshed as a single cell has no interior gradient of its own and presents an
+  artificial bed step of half its fall at every manhole, so it under-conveys.
+  Measured on Example1, mean absolute peak-flow deviation from dynamic wave
+  against cells per conduit — 1: **37.1 %**, 2: 25.7 %, 4: **15.3 %**,
+  8: 7.6 %; worst link −75.8 % → −43.2 % → −22.6 %; wall-clock 1.0× → 2.2× →
+  5.4×. Four is the knee, not the answer: it more than halves the one-cell
+  error for about twice the cost. Raise it, or set `FV_CELL_LENGTH`, where peak
+  flows or in-conduit profiles matter.
+
 - **The validated 2D solver regime is now the default**, being the configuration measured fastest
   *and* hydrologically complete on the 13k-cell, 48-hour Bellinge multiscale benchmark:
   - `MIN_TIMESTEP` default `0.001` → `0` (no CVODE step floor). Any hard floor makes wetting-front
@@ -223,6 +549,57 @@ retroactive.
 - `swmm_pattern_remove` shares the `ObjectDeleter` code path instead of duplicating it.
 
 ### Fixed
+
+- **`FLOW_ROUTING FV` process coverage — a family of silent divergences.** The
+  finite-volume solver reduced the engine coupling to a four-field forcing
+  struct, so anything not expressible in those four arrays was unreachable from
+  the marching loop, and nothing checked for it. No FV test contained a pump,
+  orifice, weir, outlet, control rule, storage node or ponding, so deleting the
+  structure-flow field entirely would have passed all 57 of them. Each item
+  below produced a plausible-looking report of something that did not happen:
+
+  - Out-of-bounds write into dynamic-wave arrays that `Router::init` never
+    allocates under FV, whenever a model contained any non-conduit link.
+  - Mesh-build errors were discarded: a model the solver could not mesh ran to
+    completion with **zero routing** and exited clean.
+  - Storage-node losses were charged to the mass balance but never removed from
+    the water; conduit seepage under US units was **43 200× too large**
+    (`UCF(RAINFALL)`, skipped by the US early-out) and saturated at the
+    availability cap.
+  - `ALLOW_PONDING` and `SURCHARGE_DEPTH` were never read; a ponding node
+    reported no flooding at all; ponded storage never reached the mass balance
+    — the last of these a **DYNWAVE fix as much as an FV one**, worth 82.5 % of
+    routing continuity error on a single-junction pond.
+  - Flap gates on conduits and outfalls were ignored: a dry junction under an
+    8 ft outfall stage filled at 16.4 cfs with both gates set.
+  - Multi-barrel conduits reported `barrels ×` the flow of the single barrel
+    actually marched, **creating 3.4 % of the routed volume out of nothing**. A
+    cell is now the aggregate section of all barrels.
+  - Culvert inlet control was applied by overwriting `links.flow` after the node
+    ledger had been booked, so the cap existed only in the report — under
+    DYNWAVE it still does not hold the water back. FV now applies it as a
+    prescribed-discharge boundary at the culvert's upstream face.
+  - Force mains used Manning's equivalent *n* at all depths instead of switching
+    to Hazen-Williams / Darcy-Weisbach once pressurized.
+  - `FV_STRUCTURE_COUPLING` was parsed, written, C-API exposed and read
+    nowhere. Structure discharge was published as the last substep's sample
+    rather than the mean actually applied.
+  - `SAVE OUTFLOWS` wrote the interface file for the kinematic-wave node set.
+  - The report said "STEADY", classified every conduit 100 % dry, left the
+    Conduit Surcharge Summary permanently empty, and printed the explicit
+    substep count under "Average Iterations per Step".
+
+- **DYNWAVE conduit seepage was identically zero for every cross-section
+  shape.** `buildXSP` never populated `yw_max`, so the seepage clamp compared
+  the flow depth against 0 and drove the wetted width to 0. `[LOSSES]` seepage
+  applied only under KINWAVE/STEADY/FV, which build their parameters elsewhere.
+
+- **`[XSECTIONS]` and `[LOSSES]` rows were dropped for links declared later in
+  the file.** In the conventional layout `[XSECTIONS]` precedes
+  `[ORIFICES]`/`[WEIRS]`, so geometry for a regulator was routinely discarded
+  and the link ran at zero area and passed no flow under any head. Unresolved
+  rows are now replayed after the last section; one that still does not resolve
+  raises ERROR 209, as legacy does.
 
 - **Node convergence was tested on the mixed iterate, not the fixed-point residual (#97).**
   `updateNodeDepthsTeam()` tested `|nodes.depth - y_last| <= head_tol`, where `nodes.depth` is the

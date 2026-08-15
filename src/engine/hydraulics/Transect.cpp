@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file Transect.cpp
  * @brief Irregular transect — numerically identical to legacy transect.c.
@@ -5,13 +21,15 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "Transect.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <cstdio>   // env-gated A3 transect-table parity dump
+#include <cstdlib>
 
 namespace openswmm {
 namespace transect {
@@ -175,6 +193,22 @@ void buildTables(TransectData& td) {
     }
     // width at zero depth = width at first increment (legacy createTables:309)
     td.width_tbl[0] = td.width_tbl[1];
+
+    // --- A3 transect-table parity dump (env-gated), mirrors legacy transect.c
+    if (const char* p = std::getenv("SWMM_TRACE_TRANSECT")) {
+        if (*p) {
+            char fn[512];
+            std::snprintf(fn, sizeof(fn), "%s.ref.%s", p, td.name.c_str());
+            if (FILE* tf = std::fopen(fn, "w")) {
+                std::fprintf(tf, "yFull=%a aFull=%a rFull=%a wMax=%a\n",
+                             td.y_full, td.a_full, td.r_full, td.w_max);
+                for (int q = 0; q < N_TRANSECT_TBL; ++q)
+                    std::fprintf(tf, "%d,%a,%a,%a\n", q, td.area_tbl[q],
+                                 td.hrad_tbl[q], td.width_tbl[q]);
+                std::fclose(tf);
+            }
+        }
+    }
 }
 
 // ============================================================================

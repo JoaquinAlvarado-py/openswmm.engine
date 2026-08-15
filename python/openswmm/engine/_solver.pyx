@@ -1,10 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Caleb Buahin
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Engine lifecycle (Pythonic v1 surface)
 ======================================
 
 :author: Caleb Buahin
 :copyright: Copyright (c) 2026 Caleb Buahin
-:license: MIT
+:license: Apache-2.0
 
 The :class:`Solver` class is the entry point for running, inspecting, and
 editing a SWMM model from Python.
@@ -1163,10 +1179,19 @@ class SimulationOptions(MutableMapping):
         "SYS_FLOW_TOL", "LAT_FLOW_TOL", "START_DATE", "START_TIME",
         "END_DATE", "END_TIME", "REPORT_START_DATE", "REPORT_START_TIME",
         "SWEEP_START", "SWEEP_END", "DRY_DAYS", "REPORT_STEP",
-        "WET_STEP", "DRY_STEP", "ROUTING_STEP", "RULE_STEP",
+        "WET_STEP", "DRY_STEP", "ROUTING_STEP", "RULE_STEP", "MINIMUM_STEP",
         "INERTIAL_DAMPING", "NORMAL_FLOW_LIMITED", "MIN_SURFAREA",
         "MIN_SLOPE", "MAX_TRIALS", "HEAD_TOLERANCE", "THREADS",
         "TEMPDIR",
+        # Explicit finite-volume solver (FLOW_ROUTING FV). Readable and
+        # writable under any routing model, so a script can configure the
+        # solver before selecting it.
+        "FV_CELL_LENGTH", "FV_MIN_CELLS", "FV_CFL", "FV_RIEMANN", "FV_ORDER",
+        "FV_LIMITER", "FV_SCALAR_SCHEME", "FV_TIME_INTEGRATION",
+        "FV_SLOT_CELERITY", "FV_DISPERSION", "FV_STRUCTURE_COUPLING",
+        "FV_COMPACTION", "FV_BACKEND", "FV_MIN_PARALLEL_CELLS",
+        "FV_LTS", "FV_LTS_MAX_TIERS", "FV_CFL_CENSUS_INTERVAL",
+        "FV_NODE_COUPLING", "FV_NODE_DT", "FV_NODE_PICARD",
     )
 
     def __getitem__(self, key: str) -> str:

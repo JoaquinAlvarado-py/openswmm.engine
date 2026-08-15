@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file SurfaceRouter2D.hpp
  * @brief Top-level orchestrator for the optional 2D surface routing module.
@@ -16,7 +32,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_2D_SURFACE_ROUTER_HPP
@@ -294,9 +310,23 @@ private:
     double last_t_ = 0.0;
 
     /// One-shot guard: resolve deferred boundary timeseries/curve NAMES to
-    /// registry indices on the first advance (ctx.table_names is populated by
+    /// registry indices on the first advance (ctx.tables is populated by
     /// then), not at parse time.
     bool boundary_names_resolved_ = false;
+
+    /// Project-display-units → SI factor for SPECIFIED_STAGE boundary heads
+    /// (0.3048 for US FLOW_UNITS with a non-SI mesh file, else 1.0). Set in
+    /// initialize() alongside the mesh scaling; applied once to constant
+    /// heads after drainPendingRows() and at every TS lookup in
+    /// resolveBoundaryValues(). Also converts the SI head back to display
+    /// units for rating-curve stage-axis queries.
+    double bc_stage_scale_ = 1.0;
+
+    /// Display flow units → m³/s factor for SPECIFIED_FLOW / TS_FLOW /
+    /// RATING_CURVE per-metre discharges (from FLOW_UNITS; 1.0 for CMS).
+    /// Applied once to constant flows after drainPendingRows() and at every
+    /// TS / rating-curve lookup.
+    double bc_flow_scale_ = 1.0;
 #ifdef OPENSWMM_HAS_2D
     /// Time integrator, chosen at runtime: the serial ExplicitInertialSolver,
     /// or the Kokkos marcher plugin when installed/eligible (constructed in

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file test_postparse_resolver.cpp
  * @brief Slice IO-3 verification — every FilePathPair slot has its
@@ -25,7 +41,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include <gtest/gtest.h>
@@ -72,15 +88,11 @@ SimulationContext makeContextWithSlots() {
     ctx.options.temp_file = std::string("climate/temp.dat");
 
     // Timeseries — file-backed series, including the `:column` form.
-    // Mirror the production parser (TablesHandler): every table is registered
-    // in BOTH the name table and the table store so name→index lookup works.
-    ctx.table_names.add("TS_PLAIN");
+    // ctx.tables is the name authority (kind-aware find_timeseries).
     int t1 = ctx.tables.add("TS_PLAIN", TableType::TIMESERIES);
     ctx.tables[t1].file_path = std::string("rain.csv");
-    ctx.table_names.add("TS_COL");
     int t2 = ctx.tables.add("TS_COL", TableType::TIMESERIES);
     ctx.tables[t2].file_path = std::string("rainfall.csv:East_Gage");
-    ctx.table_names.add("TS_INLINE");
     int t3 = ctx.tables.add("TS_INLINE", TableType::TIMESERIES);  // empty
     (void)t3;
 
@@ -154,7 +166,7 @@ TEST(PostParseResolverIO3, ClimateTempFileResolved) {
 TEST(PostParseResolverIO3, TimeseriesPlainFileResolved) {
     auto ctx = makeContextWithSlots();
     resolve_external_file_slots(ctx, kAnchor);
-    int idx = ctx.table_names.find("TS_PLAIN");
+    int idx = ctx.find_timeseries("TS_PLAIN");
     ASSERT_GE(idx, 0);
     EXPECT_EQ(ctx.tables[idx].file_path.absolute, "/proj/sub/rain.csv");
 }
@@ -165,7 +177,7 @@ TEST(PostParseResolverIO3, TimeseriesColumnSuffixPreservedInAbsolute) {
     // decorator the same way it strips it from `.original`.
     auto ctx = makeContextWithSlots();
     resolve_external_file_slots(ctx, kAnchor);
-    int idx = ctx.table_names.find("TS_COL");
+    int idx = ctx.find_timeseries("TS_COL");
     ASSERT_GE(idx, 0);
     EXPECT_EQ(ctx.tables[idx].file_path.original,
               "rainfall.csv:East_Gage");
@@ -176,7 +188,7 @@ TEST(PostParseResolverIO3, TimeseriesColumnSuffixPreservedInAbsolute) {
 TEST(PostParseResolverIO3, InlineTimeseriesUnchanged) {
     auto ctx = makeContextWithSlots();
     resolve_external_file_slots(ctx, kAnchor);
-    int idx = ctx.table_names.find("TS_INLINE");
+    int idx = ctx.find_timeseries("TS_INLINE");
     ASSERT_GE(idx, 0);
     EXPECT_TRUE(ctx.tables[idx].file_path.original.empty());
     EXPECT_TRUE(ctx.tables[idx].file_path.absolute.empty());

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file TimestepController.cpp
  * @brief Explicit next-timestep computation — implementation.
@@ -7,7 +23,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "TimestepController.hpp"
@@ -39,11 +55,14 @@ double TimestepController::compute_next(
     //   4. Save results when NewRoutingTime >= ReportTime (no alignment)
     // ================================================================
 
-    // Step 1: CFL-limited step, clamped to user's fixed routing step
+    // Step 1: CFL-limited step, clamped to user's fixed routing step.
+    // PARITY dynwave.c:196/865 — the MINIMUM_STEP floor belongs ONLY to the
+    // variable-step (CourantFactor > 0) path and is applied inside
+    // DWSolver::getRoutingStep, where legacy also pre-clamps
+    // MinRouteStep = min(MinRouteStep, RouteStep) (dynwave_validate).
+    // Flooring here silently inflated a fixed ROUTING_STEP below 0.5 s
+    // (e.g. 0.05 s decks marched at 0.5 s while reporting 0.05 s).
     double dt = std::min(opt.routing_step, dt_cfl);
-
-    // Enforce minimum floor (from [OPTIONS] MINIMUM_STEP)
-    dt = std::max(dt, min_step);
 
     // Step 2: Adjust so total duration is not exceeded
     //         (matching legacy swmm5.c:975-979: nextRoutingTime > RoutingDuration

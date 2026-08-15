@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file ExplicitKokkosSurfaceSolver.hpp
  * @brief Kokkos (OpenMP/CUDA/HIP/SYCL) port of the explicit local-inertial
@@ -30,7 +46,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_2D_GPU_EXPLICIT_KOKKOS_SURFACE_SOLVER_HPP
@@ -81,7 +97,7 @@ private:
     DView d_edge_length_, d_mannings_n_;
     // InertialEdges mirror
     IView d_cL_, d_cR_, d_slotL_, d_slotR_, d_cell_ptr_, d_cell_edge_;
-    DView d_xi_, d_inv_dx_, d_zface_, d_nx_, d_ny_, d_mx_, d_my_;
+    DView d_xi_, d_inv_dx_, d_zface_, d_ze_lo_, d_ze_hi_, d_nx_, d_ny_, d_mx_, d_my_;
     DView d_n2_, d_sign_, d_lchar_;
 
     // ---- device state -----------------------------------------------------
@@ -97,6 +113,8 @@ private:
     // Boundary edges (non-WALL): built host-side at initialize.
     IView d_bc_cell_, d_bc_slot_, d_bc_type_;
     DView d_bc_accum_, d_bc_slope_, d_bc_head_, d_bc_flow_;
+    DView d_bc_q_;   ///< prognostic boundary-edge discharge (m²/s, inflow-
+                     ///< positive) — mirrors ExplicitInertialSolver::bc_q_
     std::vector<int> bc_cell_host_, bc_slot_host_;
 
     // Live junction exchange (windowless coupling).
@@ -124,11 +142,13 @@ private:
     std::vector<std::pair<double, int>> telemetry_;
     std::string telemetry_path_;
 
-    // ---- internals ---------------------------------------------------------
+    // ---- internals (public for nvcc extended-lambda access) ----------------
+public:
     void reconstructAllDev();
     void settleAccumulatorsDev();
     void lazySourcesDev(double t);
     void syncAndRebuild(double t);
+    void refreshDt0();   ///< tighten-only dt0_ between rebuilds (== serial)
     void collapseToGlobalDt();         ///< tail: everything to tier 0
     void fireFaces(int tier, double dt_f);
     void fireCells(int tier, double dt_c);
