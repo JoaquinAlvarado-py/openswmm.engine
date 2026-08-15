@@ -271,6 +271,25 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
     assert "F/bad" in captured.out
 
 
+def test_multi_worker_runs_produce_the_same_results_as_a_single_worker(
+    corpus_root, tmp_path, fake_engine,
+):
+    # `--jobs 8` is the documented production invocation. Every value in the
+    # job dict crosses a process boundary, so an unpicklable addition would
+    # break every real sweep while the single-worker path kept passing.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=2, limit=None)
+
+    runs = store.read_table(out, "runs")
+    executed = runs[runs["variant"].isin(schema.VARIANTS)]
+
+    assert len(executed) == 4
+    assert set(executed["variant"]) == {"A", "B"}
+    assert set(executed["status"]) == {schema.Status.OK}
+    assert executed["avg_iterations_per_step"].dropna().unique().tolist() == [2.5]
+
+
 #: FAKE_REPORT plus a Node Depth Summary, so `parse_tables` yields element
 #: rows. Kept separate from FAKE_REPORT so the scalar-only tests above keep
 #: exercising the minimal report.
