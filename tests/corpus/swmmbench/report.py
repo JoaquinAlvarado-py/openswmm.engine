@@ -227,7 +227,7 @@ MARKDOWN_STRINGS = {
         "caveat_kind_mismatch": [
             "- Las filas cuyo `iteration_metric_kind` difiere del de A se",
             "  excluyen de los deltas de iteraciones de esa variante (B - A,",
-            "  C - A de forma independiente): los subpasos de VF no son",
+            "  C - A de forma independiente): los subpasos de FV no son",
             "  iteraciones de Picard.",
         ],
         "caveat_time_series": [

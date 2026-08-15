@@ -170,6 +170,19 @@ def test_estimate_caveat_present_and_names_total_iterations_est_in_both_language
         assert "\n".join(report.MARKDOWN_STRINGS[lang]["caveat_estimate"]) in text
 
 
+def test_fv_scheme_identifier_is_not_translated_to_vf_in_spanish():
+    # `FV` is the engine's own identifier for the finite-volume routing
+    # scheme -- it appears as `fv_substeps` in `iteration_metric_kind`, as
+    # `ROUTING_MODEL FV` in decks, and as `FV` in the engine source. The
+    # Spanish kind-mismatch caveat sends the reader to check exactly that
+    # column, so the acronym must survive translation unchanged (the same
+    # way `avg_iterations_per_step` and `total_iterations_est` already do).
+    kind_mismatch = "\n".join(report.MARKDOWN_STRINGS["es"]["caveat_kind_mismatch"])
+
+    assert "FV" in kind_mismatch
+    assert "VF" not in kind_mismatch
+
+
 # ---------------------------------------------------------------------------
 # --lang reaches stage_report; default is es
 # ---------------------------------------------------------------------------
