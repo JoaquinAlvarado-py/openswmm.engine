@@ -53,15 +53,27 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
             value_b = record.get(schema.VARIANT_B)
             value_ref = record.get(schema.VARIANT_REF)
 
-            if metric in ITERATION_METRICS and not kinds.empty:
-                kind = kinds.loc[model_id] if model_id in kinds.index else None
-                if kind is not None:
-                    kind_a = kind.get(schema.VARIANT_A)
-                    kind_b = kind.get(schema.VARIANT_B)
-                    # Picard iterations and FV substeps are different counters.
-                    # Subtracting one from the other would be meaningless.
-                    if kind_a != kind_b:
-                        continue
+            # Picard iterations and FV substeps are different counters;
+            # subtracting one from the other would be meaningless. The
+            # exclusion is per-delta, not per-row, and only trips when BOTH
+            # kinds involved are actually known and differ -- a missing
+            # kind (e.g. B crashed or timed out) is not a mismatch, and must
+            # not cost the model its A-REF parity-debt delta.
+            kind_mismatch_b = False
+            kind_mismatch_ref = False
+            if (metric in ITERATION_METRICS and not kinds.empty
+                    and model_id in kinds.index):
+                kind = kinds.loc[model_id]
+                kind_a = kind.get(schema.VARIANT_A)
+                kind_b = kind.get(schema.VARIANT_B)
+                kind_ref = kind.get(schema.VARIANT_REF)
+                kind_mismatch_b = (pd.notna(kind_a) and pd.notna(kind_b)
+                                    and kind_a != kind_b)
+                # The reference is EPA SWMM 5.2, which always reports Picard
+                # iterations; an FV-routed A run is equally incommensurable
+                # against it.
+                kind_mismatch_ref = (pd.notna(kind_a) and pd.notna(kind_ref)
+                                      and kind_a != kind_ref)
 
             rows.append({
                 "model_id": model_id,
@@ -71,9 +83,11 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
                 "value_b": value_b,
                 "value_ref": value_ref,
                 "delta_b_minus_a": (value_b - value_a)
-                    if pd.notna(value_a) and pd.notna(value_b) else pd.NA,
+                    if pd.notna(value_a) and pd.notna(value_b)
+                    and not kind_mismatch_b else pd.NA,
                 "delta_a_minus_ref": (value_a - value_ref)
-                    if pd.notna(value_a) and pd.notna(value_ref) else pd.NA,
+                    if pd.notna(value_a) and pd.notna(value_ref)
+                    and not kind_mismatch_ref else pd.NA,
             })
 
     return pd.DataFrame(rows)

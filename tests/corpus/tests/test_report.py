@@ -48,14 +48,41 @@ def test_a_model_without_a_reference_still_yields_the_feature_delta():
     assert pd.isna(row["delta_a_minus_ref"])
 
 
-def test_iteration_deltas_across_mismatched_metric_kinds_are_dropped():
+def test_kind_mismatch_nulls_only_the_b_delta_and_keeps_the_row():
     runs = _runs()
     runs.loc[runs.variant == "B", "iteration_metric_kind"] = schema.ITER_FV
 
     deltas = report.build_deltas(runs, METRICS)
     iterations = deltas[deltas.metric == "avg_iterations_per_step"]
+    row = iterations.iloc[0]
 
-    assert iterations.empty
+    assert len(iterations) == 1
+    assert pd.isna(row["delta_b_minus_a"])
+    # A and REF still share a counter (both "picard"), so parity debt is
+    # still measurable even though the A-B comparison is not.
+    assert row["delta_a_minus_ref"] == pytest.approx(0.2)
+
+
+def test_a_minus_ref_survives_a_missing_b_variant():
+    runs = _runs()
+    runs = runs[runs.variant != "B"]
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_b_minus_a"])
+    assert row["delta_a_minus_ref"] == pytest.approx(0.2)
+
+
+def test_a_ref_kind_mismatch_drops_only_the_ref_delta():
+    runs = _runs()
+    runs.loc[runs.variant == "REF", "iteration_metric_kind"] = schema.ITER_FV
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_a_minus_ref"])
+    assert row["delta_b_minus_a"] == pytest.approx(-2.0)
 
 
 def test_markdown_names_the_estimate_as_an_estimate(tmp_path):
