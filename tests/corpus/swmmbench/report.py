@@ -1,8 +1,10 @@
-"""Materialise the two comparison axes and a human-readable summary.
+"""Materialise the comparison axes and a human-readable summary.
 
-`B - A` isolates the effect of the new options. `A - REF` measures parity
-debt against EPA SWMM 5.2. Keeping them side by side rather than collapsed
-is the reason the A/B/C matrix exists.
+`B - A` isolates Anderson acceleration. `C - A` isolates semi-implicit
+(Crank-Nicolson) node continuity. `A - REF` measures parity debt against EPA
+SWMM 5.2. Keeping all of them side by side rather than collapsed is the
+reason the A/B/C matrix exists: folding two feature changes into one variant
+would make an observed shift unattributable between their two causes.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ ITERATION_METRICS = {"avg_iterations_per_step", "pct_steps_not_converging"}
 
 
 def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
-    """One row per (model, metric) with A, B, REF values and both deltas."""
+    """One row per (model, metric) with A, B, C, REF values and all deltas."""
     if runs.empty:
         return pd.DataFrame()
 
@@ -51,6 +53,7 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
         for model_id, record in wide.iterrows():
             value_a = record.get(schema.VARIANT_A)
             value_b = record.get(schema.VARIANT_B)
+            value_c = record.get(schema.VARIANT_C)
             value_ref = record.get(schema.VARIANT_REF)
 
             # Picard iterations and FV substeps are different counters;
@@ -60,15 +63,19 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
             # kind (e.g. B crashed or timed out) is not a mismatch, and must
             # not cost the model its A-REF parity-debt delta.
             kind_mismatch_b = False
+            kind_mismatch_c = False
             kind_mismatch_ref = False
             if (metric in ITERATION_METRICS and not kinds.empty
                     and model_id in kinds.index):
                 kind = kinds.loc[model_id]
                 kind_a = kind.get(schema.VARIANT_A)
                 kind_b = kind.get(schema.VARIANT_B)
+                kind_c = kind.get(schema.VARIANT_C)
                 kind_ref = kind.get(schema.VARIANT_REF)
                 kind_mismatch_b = (pd.notna(kind_a) and pd.notna(kind_b)
                                     and kind_a != kind_b)
+                kind_mismatch_c = (pd.notna(kind_a) and pd.notna(kind_c)
+                                    and kind_a != kind_c)
                 # The reference is EPA SWMM 5.2, which always reports Picard
                 # iterations; an FV-routed A run is equally incommensurable
                 # against it.
@@ -81,10 +88,14 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
                 "metric": metric,
                 "value_a": value_a,
                 "value_b": value_b,
+                "value_c": value_c,
                 "value_ref": value_ref,
                 "delta_b_minus_a": (value_b - value_a)
                     if pd.notna(value_a) and pd.notna(value_b)
                     and not kind_mismatch_b else pd.NA,
+                "delta_c_minus_a": (value_c - value_a)
+                    if pd.notna(value_a) and pd.notna(value_c)
+                    and not kind_mismatch_c else pd.NA,
                 "delta_a_minus_ref": (value_a - value_ref)
                     if pd.notna(value_a) and pd.notna(value_ref)
                     and not kind_mismatch_ref else pd.NA,
@@ -105,40 +116,52 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
         lines.append("")
 
     if not deltas.empty:
-        lines += ["## B - A by metric (feature effect)", "",
-                  "| metric | models | mean | median | min | max |",
-                  "| --- | --- | --- | --- | --- | --- |"]
-        # `metric` here is plain object dtype (built row-by-row in
-        # build_deltas), so groupby's default observed=False is harmless.
-        grouped = deltas.dropna(subset=["delta_b_minus_a"]).groupby("metric")
-        for metric, group in grouped:
-            column = group["delta_b_minus_a"].astype(float)
-            lines.append(
-                f"| {metric} | {len(column)} | {column.mean():.4f} | "
-                f"{column.median():.4f} | {column.min():.4f} | {column.max():.4f} |"
-            )
-        lines.append("")
+        # B - A isolates Anderson acceleration; C - A isolates semi-implicit
+        # (Crank-Nicolson) node continuity. Kept as two separate sections
+        # rather than columns of one table so neither axis reads as derived
+        # from, or secondary to, the other.
+        for delta_col, heading in (
+            ("delta_b_minus_a", "## B - A by metric (Anderson acceleration effect)"),
+            ("delta_c_minus_a", "## C - A by metric (Crank-Nicolson continuity effect)"),
+        ):
+            lines += [heading, "",
+                      "| metric | models | mean | median | min | max |",
+                      "| --- | --- | --- | --- | --- | --- |"]
+            # `metric` here is plain object dtype (built row-by-row in
+            # build_deltas), so groupby's default observed=False is harmless.
+            grouped = deltas.dropna(subset=[delta_col]).groupby("metric")
+            for metric, group in grouped:
+                column = group[delta_col].astype(float)
+                lines.append(
+                    f"| {metric} | {len(column)} | {column.mean():.4f} | "
+                    f"{column.median():.4f} | {column.min():.4f} | {column.max():.4f} |"
+                )
+            lines.append("")
 
-        lines += ["## Iteration shift by family", "",
-                  "| family | models | mean abs B-A iterations |",
-                  "| --- | --- | --- |"]
         iterations = deltas[deltas.metric == "avg_iterations_per_step"]
-        # `deltas["family"]` is object dtype in the direct build_deltas ->
-        # write_markdown pipeline (build_deltas reconstructs it from plain
-        # Python scalars), so this groupby is unaffected either way here.
-        # But `deltas` can also be re-read from its own persisted dataset
-        # (stage_report writes it partitioned by family), where pandas
-        # restores `family` as a `category` dtype. groupby on a categorical
-        # defaults to observed=False and materialises EVERY category,
-        # including ones with zero rows in the (already-filtered)
-        # `iterations` frame, as spurious empty-group rows. observed=True
-        # avoids that in both cases.
-        for family, group in iterations.groupby("family", observed=True):
-            column = group["delta_b_minus_a"].dropna().astype(float).abs()
-            if column.empty:
-                continue
-            lines.append(f"| {family} | {len(column)} | {column.mean():.4f} |")
-        lines.append("")
+        for delta_col, heading in (
+            ("delta_b_minus_a", "## Iteration shift by family (B - A)"),
+            ("delta_c_minus_a", "## Iteration shift by family (C - A)"),
+        ):
+            lines += [heading, "",
+                      "| family | models | mean abs iterations |",
+                      "| --- | --- | --- |"]
+            # `deltas["family"]` is object dtype in the direct build_deltas ->
+            # write_markdown pipeline (build_deltas reconstructs it from
+            # plain Python scalars), so this groupby is unaffected either
+            # way here. But `deltas` can also be re-read from its own
+            # persisted dataset (stage_report writes it partitioned by
+            # family), where pandas restores `family` as a `category`
+            # dtype. groupby on a categorical defaults to observed=False and
+            # materialises EVERY category, including ones with zero rows in
+            # the (already-filtered) `iterations` frame, as spurious
+            # empty-group rows. observed=True avoids that in both cases.
+            for family, group in iterations.groupby("family", observed=True):
+                column = group[delta_col].dropna().astype(float).abs()
+                if column.empty:
+                    continue
+                lines.append(f"| {family} | {len(column)} | {column.mean():.4f} |")
+            lines.append("")
 
     lines += [
         "## Caveats",
@@ -148,9 +171,9 @@ def write_markdown(deltas: pd.DataFrame, runs: pd.DataFrame, path: Path) -> Path
         "  publishes only a two-decimal mean. Its error grows on",
         "  variable-time-step models. Use `avg_iterations_per_step` for any",
         "  conclusion that matters.",
-        "- Rows whose `iteration_metric_kind` differs between A and B are",
-        "  excluded from iteration deltas: FV substeps are not Picard",
-        "  iterations.",
+        "- Rows whose `iteration_metric_kind` differs from A's are excluded",
+        "  from that variant's iteration deltas (B - A, C - A independently):",
+        "  FV substeps are not Picard iterations.",
         "- Time series are compared only between our own runs. The external",
         "  anchor is summary-level.",
         "",
@@ -169,7 +192,7 @@ ELEMENT_KEY = ["model_id", "family", "element_type", "element_id", "metric"]
 
 
 def build_element_deltas(elements: pd.DataFrame) -> pd.DataFrame:
-    """Per-element A/B/REF values and both deltas."""
+    """Per-element A/B/C/REF values and all deltas."""
     if elements.empty:
         return pd.DataFrame()
 
@@ -190,19 +213,23 @@ def build_element_deltas(elements: pd.DataFrame) -> pd.DataFrame:
         index=ELEMENT_KEY, columns="variant", values="value", aggfunc="first"
     ).reset_index()
 
-    for variant in (schema.VARIANT_A, schema.VARIANT_B, schema.VARIANT_REF):
+    for variant in (schema.VARIANT_A, schema.VARIANT_B, schema.VARIANT_C,
+                    schema.VARIANT_REF):
         if variant not in wide.columns:
             wide[variant] = pd.NA
 
     wide = wide.rename(columns={
         schema.VARIANT_A: "value_a",
         schema.VARIANT_B: "value_b",
+        schema.VARIANT_C: "value_c",
         schema.VARIANT_REF: "value_ref",
     })
     wide["delta_b_minus_a"] = wide["value_b"] - wide["value_a"]
+    wide["delta_c_minus_a"] = wide["value_c"] - wide["value_a"]
     wide["delta_a_minus_ref"] = wide["value_a"] - wide["value_ref"]
-    return wide[ELEMENT_KEY + ["value_a", "value_b", "value_ref",
-                               "delta_b_minus_a", "delta_a_minus_ref"]]
+    return wide[ELEMENT_KEY + ["value_a", "value_b", "value_c", "value_ref",
+                               "delta_b_minus_a", "delta_c_minus_a",
+                               "delta_a_minus_ref"]]
 
 
 def topology_status(elements: pd.DataFrame) -> pd.DataFrame:

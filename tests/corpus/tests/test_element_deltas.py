@@ -15,6 +15,7 @@ def test_element_deltas_pair_by_element_and_metric():
     frame = _elements([
         {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
         {"element_id": "J1", "metric": "node_max_depth", "variant": "B", "value": 4.5},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "C", "value": 3.7},
         {"element_id": "J1", "metric": "node_max_depth", "variant": "REF", "value": 3.9},
     ])
 
@@ -22,6 +23,7 @@ def test_element_deltas_pair_by_element_and_metric():
 
     assert row["element_id"] == "J1"
     assert row["delta_b_minus_a"] == pytest.approx(0.5)
+    assert row["delta_c_minus_a"] == pytest.approx(-0.3)
     assert row["delta_a_minus_ref"] == pytest.approx(0.1)
 
 
@@ -55,6 +57,20 @@ def test_overlapping_topology_is_not_flagged():
     ])
 
     assert report.topology_status(frame).empty
+
+
+def test_topology_status_ignores_variant_c_and_still_compares_a_to_ref():
+    # C rows must not participate in the A-REF topology comparison in either
+    # direction: neither masking a real mismatch nor manufacturing one.
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "C", "value": 3.7},
+        {"element_id": "OTHER", "metric": "node_max_depth", "variant": "REF", "value": 3.0},
+    ])
+
+    status = report.topology_status(frame).set_index("model_id")
+
+    assert status.loc["EPA/m1", "status"] == schema.Status.REF_TOPOLOGY_MISMATCH
 
 
 def test_a_model_with_no_reference_elements_is_not_flagged():
