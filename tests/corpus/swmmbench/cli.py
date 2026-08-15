@@ -300,9 +300,25 @@ def stage_diff(out_dir: Path, rel_tol: float = 1e-9) -> None:
     _flush_diff_batch(out_dir, rows, pending)
 
 
+def stage_report(out_dir: Path) -> None:
+    from . import report
+
+    out_dir = Path(out_dir)
+    runs = store.read_table(out_dir, "runs")
+    if runs.empty:
+        print("no runs to report")
+        return
+
+    deltas = report.build_deltas(runs, report.DEFAULT_METRICS)
+    if not deltas.empty:
+        store.write_table(deltas, out_dir, "deltas", partition_by=["family"])
+    path = report.write_markdown(deltas, runs, out_dir / "summary.md")
+    print(f"wrote {path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="swmmbench")
-    parser.add_argument("stage", choices=["inventory", "run", "diff", "check"])
+    parser.add_argument("stage", choices=["inventory", "run", "diff", "report", "check"])
     parser.add_argument("--corpus-root", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--engine", nargs="+", default=None,
@@ -329,6 +345,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.stage == "diff":
         stage_diff(args.out, args.rel_tol)
+        return 0
+
+    if args.stage == "report":
+        stage_report(args.out)
         return 0
 
     if not args.engine:
