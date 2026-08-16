@@ -35,6 +35,11 @@ Crank-Nicolson), not from `D - A` alone, which conflates two causes. Do not
 otherwise combine two of these features into one variant: doing so would
 make an observed shift unattributable between their causes.
 
+Because D completes the grid, A/B/C/D is a full **2x2 factorial** over
+`ANDERSON_ACCEL` x `NODE_CONTINUITY`, and the harness publishes its
+interaction, `(D - C) - (B - A)`, alongside the simple effects -- see
+`delta_interaction` below.
+
 `VIRTUAL_JUNCTION_MOMENTUM BASIC`, `DPS_CELERITY 25.0`, `DPS_ALPHA 3.0` and
 `DPS_DECAY_TIME 0.5` are pinned identically in every variant (the engine's
 own defaults, `SimulationOptions.hpp:248-262`). They are inert under EXTRAN
@@ -78,7 +83,7 @@ python -m swmmbench check     --corpus-root /path/to/1729-SWMM5-Models --out ./r
 | `inventory` | the corpus tree | `models` | `--corpus-root`, `--out` |
 | `run` | `models`, the corpus tree | `runs`, `scalars`, `elements` | `--corpus-root`, `--out`, `--engine`, `--jobs`, `--timeout`, `--limit` |
 | `diff` | `runs`, the retained A/B/C/D/E `.out` sets | `ts_diff` | `--out`, `--abs-tol` |
-| `report` | `runs`, `elements` | `deltas`, `element_deltas`, `topology_status`, `summary.md` | `--out`, `--lang` |
+| `report` | `runs`, `elements`, `ts_diff` | `deltas`, `element_deltas`, `topology_status`, `summary.md` | `--out`, `--lang` |
 | `check` | the corpus tree | nothing | `--corpus-root`, `--out` |
 
 `--lang` (`es` or `en`, default `es`) selects the language of `summary.md`'s
@@ -86,7 +91,8 @@ prose -- section headings, table column headers, and the Caveats bullets --
 and of the `report` stage's own console messages. Metric names, status
 values, family names, variant letters, the hardness bucket labels
 (`<= 2`, `2-4`, `> 4`), the surcharge strata (`active`, `inactive`) and the
-`B - A` / `C - A` / `D - C` / `D - A` / `E - A` / `A - REF` axis notation are
+`B - A` / `C - A` / `D - C` / `D - A` / `E - A` / `A - REF` /
+`(D - C) - (B - A)` axis notation are
 data, not prose, and are identical in both languages so the report stays
 cross-referenceable against the Parquet columns and the code regardless of
 `--lang`. The default is `es` for this harness's own operator; pass
@@ -223,6 +229,36 @@ comparison axis:
 | `delta_d_minus_a` | joint Anderson + Crank-Nicolson (two causes, not attributable) |
 | `delta_e_minus_a` | Dynamic Preissmann Slot |
 | `delta_a_minus_ref` | parity debt against EPA SWMM 5.2 |
+| `delta_interaction` | **`(D - C) - (B - A)`** -- the 2x2 factorial interaction |
+
+A/B/C/D is a full **2x2 factorial** over `ANDERSON_ACCEL` x
+`NODE_CONTINUITY`, and `delta_interaction` is the one measurement the five
+simple effects cannot give: *does switching to semi-implicit continuity
+change how effective Anderson acceleration is?* `B - A` measures Anderson
+under `EXPLICIT`, `D - C` measures it under `SEMI_IMPLICIT`, and only their
+difference -- `(D - C) - (B - A)`, equivalently `D - C - B + A` -- says
+whether the operator changed the answer.
+
+**Sign convention.** It is a signed change in the metric itself, in that
+metric's own units, not a score. It is **negative when Anderson moves the
+metric further down under `SEMI_IMPLICIT` than under `EXPLICIT`** -- so for
+`avg_iterations_per_step`, `pct_steps_not_converging` and `wall_ms`, where
+lower is better, a negative interaction means **Anderson helps more under
+Crank-Nicolson**, and a positive one means it helps less. Negative is the
+expected direction, because `DWSolver::computeAASkipFlags` disables Anderson
+at every surcharged node under `EXPLICIT`/`EXTRAN` and not under
+`SEMI_IMPLICIT`: `B - A` measures Anderson with its most valuable case
+switched off. For the `continuity_error_*` metrics the sign is directional in
+the error, not in its magnitude. A near-zero interaction is a finding too --
+evidence that the skip flags do not matter on this corpus -- which is why it
+is quantified rather than assumed.
+
+`delta_interaction` is computed from `delta_d_minus_c` and `delta_b_minus_a`,
+not from the four raw values, so it is null exactly when either constituent
+pairing is: an operand missing, or the pairing rejected by one of the
+commensurability screens below. There is no fifth screen to drift out of step
+with the four, and a case the screens reject cannot re-enter through the
+interaction.
 
 Both tables are recomputed and **replaced** on every `report`, so the
 `case_id_*` columns are how a published number stays traceable: each one
@@ -266,6 +302,17 @@ section:
   their variant's intent, broken down by variant and option, and an explicit
   statement when there are none. The console warning is seen once by one
   operator; `summary.md` is the artifact that gets kept.
+- **incomplete time-series overlap** -- how many models produced a `ts_diff`
+  comparison whose two runs did not cover the same reporting grid, broken
+  down by `comparison` with the worst `coverage_fraction` beside it. See
+  *Time-series coverage* below. A store with no `ts_diff` coverage columns is
+  reported as **not assessed**, never as complete.
+- **Anderson x Node Continuity interaction** -- `delta_interaction` per
+  metric (iterations, non-convergence, runtime and continuity error), with
+  the sign convention stated in the section itself, because a bare number
+  cannot carry it. An empty table says so in words: the interaction is null
+  whenever either simple effect is, and *not measured* is not *no
+  interaction*.
 - **routing model** -- the iteration-shift sections show `DYNWAVE` rows only.
 - **withheld pairings** -- the routing-model guard is deliberately stricter
   than the kind guard, so the report itemises what it cost, counted per
@@ -319,6 +366,42 @@ ts_diff[ts_diff["comparison"] == "D_minus_C"]   # incremental Anderson under Cra
 A comparison has two sources, so a `ts_diff` row carries `case_id_left` and
 `case_id_right` -- in the label's own `X_minus_Y` order -- rather than one
 `case_id` that would have to pick a side.
+
+#### Time-series coverage
+
+A comparison is reduced over the timestamps its two runs **share**, and
+nothing else. If run A covered 0-24 h and run B stopped at 12 h, only the
+shared 12 h were compared -- and if those agreed, `max_abs` reads as an
+excellent result over half a run that silently failed. Every `ts_diff` row
+therefore carries the evidence of what it was computed over:
+
+| column | meaning |
+| --- | --- |
+| `n_periods_left` / `n_periods_right` | distinct timestamps each side reported. Both, because *shorter* is not *truncated*: either side can be the short one. |
+| `n_common` | timestamps present in **both**, i.e. the periods actually reduced over. There is no separate `n_periods`. |
+| `coverage_fraction` | `n_common` divided by the number of **distinct timestamps appearing in either series** (the union) -- not by either side's own length, and not by a span in hours. `1.0` exactly when the two grids are identical; `None` when neither side reported anything. |
+| `start_time_match` / `end_time_match` | whether the first / last reported instants coincide. |
+| `time_grid_match` | whether the two sets of timestamps are equal. This is what separates *same span, different sampling* (both ends match, the grid does not) from *same grid* (all three hold). |
+
+An incomplete overlap is a **benchmark anomaly**, not merely a number: it is
+counted, attributed by `comparison`, and stated plainly in `summary.md`
+alongside the option-echo anomalies and the withheld-iteration ledger.
+
+Such a pairing still **publishes** its `max_abs`, `max_rel` and `rmse`.
+Withholding them was the alternative, and it was rejected: an exact agreement
+up to the point one run stopped is a real finding, and it is precisely the
+evidence that identifies the truncation as the whole story -- deleting it
+would leave an operator with a missing number and no explanation. What is
+withheld instead is the *conclusion*: the numbers describe the shared
+sub-span only, `coverage_fraction` sits on the same row saying how much of
+one, and `summary.md` names every affected comparison so none of them can be
+read as a full one by default. Check `coverage_fraction` before quoting any
+row's numbers.
+
+A missing coverage value is treated as **unknown**, never as incomplete --
+the same rule a missing option echo follows. A `ts_diff` written before these
+columns existed is reported as *not assessed* rather than counted as a
+corpus-wide anomaly.
 
 `D_minus_C` is stored directly, and it has to be: **do not try to form it by
 subtracting `C_minus_A` from `D_minus_A`.** A `ts_diff` row holds `max_abs`,

@@ -224,6 +224,195 @@ def test_d_minus_c_survives_a_missing_a_variant():
 
 
 # ---------------------------------------------------------------------------
+# The 2x2 factorial interaction: (D - C) - (B - A)
+# ---------------------------------------------------------------------------
+
+
+def _anderson_helps_more_under_crank_nicolson():
+    """`_runs()` with D lowered so Anderson pays off MORE under SEMI_IMPLICIT.
+
+    A=4.0, B=2.0 -> `B - A` = -2.0 (Anderson under EXPLICIT).
+    C=3.0, D=0.5 -> `D - C` = -2.5 (Anderson under SEMI_IMPLICIT).
+    Interaction = -2.5 - (-2.0) = -0.5: negative, which for a
+    lower-is-better metric is *Anderson helps more under Crank-Nicolson*.
+    """
+    runs = _runs()
+    runs.loc[runs.variant == "D", "avg_iterations_per_step"] = 0.5
+    return runs
+
+
+def test_the_interaction_is_negative_when_anderson_helps_more_under_crank_nicolson():
+    # The whole point of having variant D: `computeAASkipFlags` disables
+    # Anderson at every surcharged node under EXPLICIT/EXTRAN and not under
+    # SEMI_IMPLICIT, so the two simple effects measure different regimes and
+    # only their difference says whether the operator changed the answer.
+    deltas = report.build_deltas(_anderson_helps_more_under_crank_nicolson(),
+                                 METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert row["delta_b_minus_a"] == pytest.approx(-2.0)
+    assert row["delta_d_minus_c"] == pytest.approx(-2.5)
+    assert row["delta_interaction"] == pytest.approx(-0.5)
+    assert row["delta_interaction"] < 0
+
+
+def test_the_interaction_uses_the_d_minus_c_and_b_minus_a_operands_in_that_order():
+    # Pins BOTH the operands and the direction. `_runs()` gives
+    # (D - C) - (B - A) = -1.5 - (-2.0) = +0.5. The plausible mistakes each
+    # produce a different number: (B - A) - (D - C) is -0.5,
+    # (D - A) - (C - A) is -1.5, and D - C - B - A is -9.5.
+    deltas = report.build_deltas(_runs(), METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert row["delta_interaction"] == pytest.approx(0.5)
+    # ... and it is exactly `D - C - B + A` on the raw values.
+    assert row["delta_interaction"] == pytest.approx(
+        row["value_d"] - row["value_c"] - row["value_b"] + row["value_a"])
+
+
+@pytest.mark.parametrize("missing", ["A", "B", "C", "D"])
+def test_the_interaction_is_null_when_any_of_its_four_operands_is_missing(missing):
+    # All four are load-bearing: a crashed A costs the interaction even
+    # though `D - C` alone survives it.
+    runs = _runs()
+    runs = runs[runs.variant != missing]
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_interaction"])
+
+
+def test_the_interaction_is_null_when_the_routing_screen_rejects_b_minus_a():
+    # A KINWAVE B run makes `B - A` incommensurable. The interaction must not
+    # slip past a screen its constituent pairing was rejected by -- it reuses
+    # the already-screened delta rather than the raw values, so it cannot.
+    runs = _runs()
+    runs.loc[runs.variant == "B", "reported_routing_model"] = "KINWAVE"
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_b_minus_a"])
+    assert row["delta_d_minus_c"] == pytest.approx(-1.5)  # still computable
+    assert pd.isna(row["delta_interaction"])
+
+
+def test_the_interaction_is_null_when_the_option_echo_screen_rejects_d_minus_c():
+    # A D run that actually executed with ANDERSON_ACCEL off differs from C
+    # in nothing, so `D - C ~ 0` is withheld -- and an interaction built from
+    # it would publish "Crank-Nicolson cancels Anderson's benefit" out of a
+    # broken deck.
+    runs = _anderson_echoes(_runs())
+    runs.loc[runs.variant == "D", "reported_anderson_accel"] = "NO"
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_d_minus_c"])
+    assert row["delta_b_minus_a"] == pytest.approx(-2.0)  # still computable
+    assert pd.isna(row["delta_interaction"])
+
+
+def test_the_interaction_is_null_when_the_kind_screen_rejects_a_constituent():
+    runs = _runs()
+    runs.loc[runs.variant == "C", "iteration_metric_kind"] = schema.ITER_FV
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_d_minus_c"])
+    assert pd.isna(row["delta_interaction"])
+
+
+def test_a_row_is_still_emitted_when_the_interaction_is_null():
+    runs = _runs()
+    runs = runs[runs.variant != "D"]
+
+    deltas = report.build_deltas(runs, METRICS)
+    iterations = deltas[deltas.metric == "avg_iterations_per_step"]
+
+    assert len(iterations) == 1
+    assert iterations.iloc[0]["value_a"] == pytest.approx(4.0)
+
+
+def test_the_interaction_column_is_not_a_pairwise_delta_spec():
+    # `iteration_exclusions` walks DELTA_SPECS looking up `value_<left>` and
+    # `value_<right>`; the interaction has four operands and no such pair, so
+    # it must stay out of that tuple while still being a published column.
+    assert report.INTERACTION_COLUMN in report.DELTA_COLUMNS
+    assert report.INTERACTION_COLUMN not in [c for c, _, _ in report.DELTA_SPECS]
+
+
+def test_the_interaction_reaches_the_element_level_table():
+    frame = pd.DataFrame([
+        {"model_id": "EPA/m1", "family": "EPA", "element_type": "NODE",
+         "element_id": "J1", "metric": "node_max_depth",
+         "variant": variant, "value": value}
+        for variant, value in (("A", 4.0), ("B", 2.0), ("C", 3.0), ("D", 0.5))
+    ])
+
+    (row,) = report.build_element_deltas(frame).to_dict("records")
+
+    assert row["delta_interaction"] == pytest.approx(-0.5)
+
+
+def test_the_element_level_interaction_is_null_without_all_four_operands():
+    frame = pd.DataFrame([
+        {"model_id": "EPA/m1", "family": "EPA", "element_type": "NODE",
+         "element_id": "J1", "metric": "node_max_depth",
+         "variant": variant, "value": value}
+        for variant, value in (("A", 4.0), ("C", 3.0), ("D", 0.5))
+    ])
+
+    (row,) = report.build_element_deltas(frame).to_dict("records")
+
+    assert pd.isna(row["delta_interaction"])
+
+
+def test_the_interaction_section_states_its_sign_convention_in_both_languages(
+    tmp_path,
+):
+    # A bare number cannot carry the convention: a reader seeing `-0.5` has
+    # no way to tell whether it means "Anderson helps more under
+    # Crank-Nicolson" or the reverse. The section must say which.
+    runs = _anderson_helps_more_under_crank_nicolson()
+    deltas = report.build_deltas(runs, METRICS)
+
+    for lang in ("en", "es"):
+        path = report.write_markdown(
+            deltas, runs, tmp_path / f"interaction_{lang}.md", lang=lang)
+        text = path.read_text(encoding="utf-8")
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(text, strings["interaction_heading"])
+
+        assert "\n".join(strings["interaction_sign"]) in section
+        assert "\n".join(strings["interaction_intro"]) in section
+        # The axis notation is data, not prose: verbatim in both languages.
+        assert report.INTERACTION_AXIS in strings["interaction_heading"]
+        # ... and the computed number is in the table, not just the prose.
+        assert "| avg_iterations_per_step | 1 | -0.5000 |" in section
+        assert "\n".join(strings["interaction_empty"]) not in section
+
+
+def test_an_unmeasurable_interaction_says_so_rather_than_printing_nothing(tmp_path):
+    # Every constituent delta withheld -> an empty table, which reads as "the
+    # two factors do not interact" unless the report says otherwise.
+    runs = _runs()
+    runs["reported_routing_model"] = None
+    deltas = report.build_deltas(runs, ["avg_iterations_per_step"])
+
+    for lang in ("en", "es"):
+        path = report.write_markdown(
+            deltas, runs, tmp_path / f"empty_{lang}.md", lang=lang)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(
+            path.read_text(encoding="utf-8"), strings["interaction_heading"])
+
+        assert "\n".join(strings["interaction_empty"]) in section
+
+
+# ---------------------------------------------------------------------------
 # Commensurability: surcharge method against the anchor
 # ---------------------------------------------------------------------------
 
@@ -979,6 +1168,151 @@ def test_the_anomaly_summary_folds_many_models_into_one_broken_deck():
 
 def test_the_anomaly_summary_of_an_empty_frame_is_empty_not_an_error():
     assert report.anomaly_summary(pd.DataFrame()).empty
+
+
+# ---------------------------------------------------------------------------
+# Time-series comparisons computed over an incomplete overlap
+# ---------------------------------------------------------------------------
+
+
+def _ts_diff_rows(*, model_id="EPA/m1", comparison="B_minus_A",
+                  coverage=1.0, grid_match=True, n=1):
+    """`ts_diff` rows as `cli.stage_diff` writes them, with coverage evidence."""
+    return pd.DataFrame([
+        {"model_id": model_id, "family": model_id.split("/")[0],
+         "comparison": comparison, "element_type": "NODE",
+         "element_id": f"n{i}", "attribute": "INVERT_DEPTH",
+         "max_abs": 0.0, "max_rel": 0.0, "rmse": 0.0,
+         "n_periods_left": 24, "n_periods_right": 12,
+         "n_common": int(round(coverage * 24)),
+         "coverage_fraction": coverage,
+         "start_time_match": True, "end_time_match": grid_match,
+         "time_grid_match": grid_match}
+        for i in range(n)
+    ])
+
+
+def test_a_truncated_pairing_is_counted_as_an_anomaly_not_just_a_column():
+    anomalies = report.coverage_anomalies(
+        _ts_diff_rows(coverage=0.5, grid_match=False, n=4))
+
+    assert len(anomalies) == 1
+    row = anomalies.iloc[0]
+    assert row["comparison"] == "B_minus_A"
+    # One stopped run, not four failures: models and series are counted apart
+    # so a truncation cannot masquerade as a corpus-wide catastrophe.
+    assert row["models"] == 1
+    assert row["series"] == 4
+    assert row["min_coverage"] == pytest.approx(0.5)
+
+
+def test_full_coverage_produces_no_anomaly():
+    assert report.coverage_anomalies(_ts_diff_rows()).empty
+
+
+def test_a_ts_diff_without_coverage_columns_is_not_assessed_rather_than_clean():
+    # A store written before the columns existed has no evidence either way;
+    # calling it clean would be a claim it cannot support.
+    legacy = _ts_diff_rows().drop(
+        columns=["coverage_fraction", "time_grid_match"])
+
+    assert report.coverage_anomalies(legacy).empty
+    assert report.coverage_was_assessed(legacy) is False
+    assert report.coverage_was_assessed(_ts_diff_rows()) is True
+    assert report.coverage_was_assessed(pd.DataFrame()) is False
+    assert report.coverage_was_assessed(None) is False
+
+
+def test_coverage_anomalies_on_an_empty_frame_is_an_empty_table_not_an_error():
+    assert report.coverage_anomalies(pd.DataFrame()).empty
+
+
+def test_the_same_span_sampled_differently_is_flagged_even_with_matching_ends():
+    # `time_grid_match` False with `coverage_fraction` below 1: the pairing
+    # compared only every other reporting period, which is not a full
+    # comparison however well the endpoints line up.
+    rows = _ts_diff_rows(coverage=0.6, grid_match=False)
+    rows["end_time_match"] = True
+
+    anomalies = report.coverage_anomalies(rows)
+
+    assert anomalies.iloc[0]["min_coverage"] == pytest.approx(0.6)
+
+
+def test_a_grid_mismatch_without_a_fraction_is_still_counted(tmp_path):
+    # Either column alone is enough to flag the pairing; a missing
+    # `coverage_fraction` renders as `n/a` rather than as a fabricated 0.
+    rows = _ts_diff_rows(grid_match=False).drop(columns=["coverage_fraction"])
+    runs = _runs()
+    deltas = report.build_deltas(runs, METRICS)
+
+    anomalies = report.coverage_anomalies(rows)
+
+    assert anomalies.iloc[0]["models"] == 1
+    assert pd.isna(anomalies.iloc[0]["min_coverage"])
+
+    path = report.write_markdown(deltas, runs, tmp_path / "na.md", lang="en",
+                                 ts_diff=rows)
+    section = _markdown_section(
+        path.read_text(encoding="utf-8"),
+        report.MARKDOWN_STRINGS["en"]["coverage_anomaly_heading"])
+
+    assert "| B_minus_A | 1 | 1 | n/a |" in section
+
+
+def test_a_truncated_pairing_reaches_the_summary_in_both_languages(tmp_path):
+    runs = _runs()
+    deltas = report.build_deltas(runs, METRICS)
+    ts_diff = pd.concat([
+        _ts_diff_rows(comparison="B_minus_A", coverage=0.5, grid_match=False,
+                      n=3),
+        _ts_diff_rows(comparison="C_minus_A"),
+    ], ignore_index=True)
+
+    for lang in ("en", "es"):
+        path = report.write_markdown(deltas, runs, tmp_path / f"cov_{lang}.md",
+                                     lang=lang, ts_diff=ts_diff)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(path.read_text(encoding="utf-8"),
+                                    strings["coverage_anomaly_heading"])
+
+        assert "| B_minus_A | 1 | 3 | 0.5000 |" in section
+        # The clean comparison must not be listed as an anomaly.
+        assert "C_minus_A" not in section
+        assert "\n".join(strings["coverage_anomaly_total"]).format(
+            n_models=1, n_comparisons=1) in section
+        assert "\n".join(strings["coverage_anomaly_none"]) not in section
+        assert "\n".join(strings["coverage_not_assessed"]) not in section
+
+
+def test_a_fully_covered_store_states_it_rather_than_omitting_the_section(tmp_path):
+    runs = _runs()
+    deltas = report.build_deltas(runs, METRICS)
+
+    for lang in ("en", "es"):
+        path = report.write_markdown(deltas, runs, tmp_path / f"ok_{lang}.md",
+                                     lang=lang, ts_diff=_ts_diff_rows())
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(path.read_text(encoding="utf-8"),
+                                    strings["coverage_anomaly_heading"])
+
+        assert "\n".join(strings["coverage_anomaly_none"]) in section
+        assert "\n".join(strings["coverage_not_assessed"]) not in section
+
+
+def test_no_ts_diff_at_all_reports_not_assessed_never_complete(tmp_path):
+    runs = _runs()
+    deltas = report.build_deltas(runs, METRICS)
+
+    for lang in ("en", "es"):
+        path = report.write_markdown(deltas, runs, tmp_path / f"na_{lang}.md",
+                                     lang=lang)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(path.read_text(encoding="utf-8"),
+                                    strings["coverage_anomaly_heading"])
+
+        assert "\n".join(strings["coverage_not_assessed"]) in section
+        assert "\n".join(strings["coverage_anomaly_none"]) not in section
 
 
 # ---------------------------------------------------------------------------

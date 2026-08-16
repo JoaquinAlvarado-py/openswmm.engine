@@ -11,6 +11,19 @@ from swmmbench import cli, corpus, outdiff, report, rptparse, schema, store
 
 DECK = "[TITLE]\nt\n\n[OPTIONS]\nFLOW_UNITS CFS\n"
 
+#: One `outdiff.diff_out_files` row, as the real reducer would return it --
+#: including every `outdiff.COVERAGE_FIELDS` entry, so the fakes below
+#: exercise the same `ts_diff` schema the engine-backed path writes. Spelled
+#: once so a field added to the reducer is added here, not in four places.
+FAKE_DIFF_ROW = {
+    "element_type": "NODE", "element_id": "n1", "attribute": "INVERT_DEPTH",
+    "max_abs": 1.0, "max_rel": 1.0, "rmse": 1.0,
+    "first_div_period": None, "first_div_time": None,
+    "n_periods_left": 1, "n_periods_right": 1, "n_common": 1,
+    "coverage_fraction": 1.0, "start_time_match": True,
+    "end_time_match": True, "time_grid_match": True,
+}
+
 FAKE_REPORT = """  EPA STORM WATER MANAGEMENT MODEL - VERSION 5.2 (Build 5.2.4)
 
   ****************
@@ -205,10 +218,7 @@ def _diff_runs_fixture(tmp_path):
 def _fake_diff_out_files_raising_for_bad(a_out, b_out, abs_tol):
     if "bad" in str(a_out):
         raise RuntimeError("truncated .out file")
-    return [{"element_type": "NODE", "element_id": "n1",
-             "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
-             "rmse": 1.0, "first_div_period": None, "first_div_time": None,
-             "n_periods": 1}]
+    return [dict(FAKE_DIFF_ROW)]
 
 
 def test_diff_stage_does_not_raise_when_one_models_diff_raises(
@@ -292,10 +302,7 @@ def _fake_diff_out_files_raising_when(fail_needle):
     def fake(a_out, other_out, abs_tol):
         if fail_needle in str(other_out):
             raise RuntimeError(f"truncated {fail_needle} .out file")
-        return [{"element_type": "NODE", "element_id": "n1",
-                 "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
-                 "rmse": 1.0, "first_div_period": None, "first_div_time": None,
-                 "n_periods": 1}]
+        return [dict(FAKE_DIFF_ROW)]
     return fake
 
 
@@ -416,10 +423,7 @@ def _fake_diff_out_files_raising_only_for_d_minus_c(base_out, other_out, abs_tol
     (first) argument is the C `.out`."""
     if "_C" in str(base_out) and "_D" in str(other_out):
         raise RuntimeError("truncated .out file")
-    return [{"element_type": "NODE", "element_id": "n1",
-             "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
-             "rmse": 1.0, "first_div_period": None, "first_div_time": None,
-             "n_periods": 1}]
+    return [dict(FAKE_DIFF_ROW)]
 
 
 def test_c_out_survives_c_minus_a_when_d_minus_c_has_not_flushed(
@@ -660,10 +664,7 @@ def _partial_diff_runs_fixture(tmp_path, present_variants):
 
 
 def _fake_diff_out_files_always_succeeding(a_out, other_out, abs_tol):
-    return [{"element_type": "NODE", "element_id": "n1",
-             "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
-             "rmse": 1.0, "first_div_period": None, "first_div_time": None,
-             "n_periods": 1}]
+    return [dict(FAKE_DIFF_ROW)]
 
 
 def test_a_missing_c_run_still_yields_b_minus_a(tmp_path, monkeypatch):
@@ -1394,3 +1395,89 @@ def test_an_interruption_after_a_flush_leaves_the_flushed_rows_resumable(
     # Resumed, not redone: the survivors were recognised by their case_id.
     assert runs["case_id"].nunique() == 12
     assert set(store.read_table(out, "scalars")["case_id"]) == set(runs["case_id"])
+
+
+# ---------------------------------------------------------------------------
+# `ts_diff` carries the coverage evidence, in a stable schema
+# ---------------------------------------------------------------------------
+
+
+def test_the_diff_stage_persists_every_coverage_field(tmp_path, monkeypatch):
+    # The evidence is only useful if it survives the write: a `ts_diff` that
+    # drops `coverage_fraction` cannot tell a full comparison from one over
+    # half a run, which is the whole point of collecting it.
+    out = tmp_path / "out"
+    runs, _bad, _good = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+
+    assert set(outdiff.COVERAGE_FIELDS) <= set(ts_diff.columns)
+    assert ts_diff["coverage_fraction"].notna().all()
+    assert report.coverage_anomalies(ts_diff).empty
+
+
+def _fake_diff_row_with_coverage(**overrides):
+    def fake(a_out, other_out, abs_tol):
+        return [{**FAKE_DIFF_ROW, **overrides}]
+    return fake
+
+
+def test_a_truncated_comparison_survives_the_store_as_an_anomaly(
+    tmp_path, monkeypatch,
+):
+    out = tmp_path / "out"
+    runs, _bad, _good = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_row_with_coverage(
+                            n_periods_right=12, n_common=12,
+                            coverage_fraction=0.5, end_time_match=False,
+                            time_grid_match=False))
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    anomalies = report.coverage_anomalies(store.read_table(out, "ts_diff"))
+
+    assert set(anomalies["comparison"]) == {
+        "B_minus_A", "C_minus_A", "D_minus_A", "E_minus_A", "D_minus_C",
+    }
+    assert (anomalies["min_coverage"] == 0.5).all()
+
+
+def test_a_batch_with_no_coverage_at_all_still_writes_a_matching_fragment(
+    tmp_path, monkeypatch,
+):
+    # A row set carrying none of the coverage fields (or carrying them all
+    # null) must not infer Arrow's `null` type and stop matching the
+    # fragments around it -- the same hazard `_run_frame` conforms `runs`
+    # against.
+    out = tmp_path / "out"
+    runs, _bad, _good = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+
+    bare = {k: v for k, v in FAKE_DIFF_ROW.items()
+            if k not in outdiff.COVERAGE_FIELDS}
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        lambda a, b, abs_tol: [dict(bare)])
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    second = tmp_path / "second"
+    second.mkdir()
+    runs2, _bad2, _good2 = _diff_runs_fixture(second)
+    store.write_table(runs2, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+
+    assert set(outdiff.COVERAGE_FIELDS) <= set(ts_diff.columns)
+    # The bare batch is unknown, not incomplete: absence is no evidence.
+    assert ts_diff["coverage_fraction"].isna().any()
+    assert ts_diff["coverage_fraction"].notna().any()
+    assert report.coverage_anomalies(ts_diff).empty

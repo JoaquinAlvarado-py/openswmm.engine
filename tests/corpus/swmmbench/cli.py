@@ -605,6 +605,48 @@ def corpus_is_clean(corpus_root: Path) -> tuple[bool, list[str]]:
 #: pick a side; both are carried, matching the label's own `X_minus_Y` order.
 TS_DIFF_CASE_COLUMNS = ("case_id_left", "case_id_right")
 
+#: `ts_diff`'s coverage evidence, by the dtype each is written as. Every one
+#: of them is nullable -- an empty overlap has no `coverage_fraction`, and two
+#: empty series have no grids to compare -- and a whole batch can legitimately
+#: be null in any of them. Stated rather than inferred for exactly the reason
+#: `RUN_COLUMNS` is: an all-null batch infers Arrow's `null` type and its
+#: fragment stops matching the ones around it, so the dataset no longer reads
+#: back as one table.
+#:
+#: `Int64` and `boolean` (not `int64`/`bool`) because both must hold `<NA>`;
+#: `time_grid_match` in particular must be able to say "unknown" rather than
+#: being coerced to `False`, which the summary would then count as an anomaly.
+TS_DIFF_COVERAGE_DTYPES = {
+    "n_periods_left": "Int64",
+    "n_periods_right": "Int64",
+    "n_common": "Int64",
+    "coverage_fraction": "float64",
+    "start_time_match": "boolean",
+    "end_time_match": "boolean",
+    "time_grid_match": "boolean",
+}
+
+
+def _ts_diff_frame(rows: list[dict]) -> pd.DataFrame:
+    """One batch of `ts_diff` rows, conformed to its nullable column dtypes.
+
+    Conformed for the same reason `_run_frame` conforms `runs`: a batch in
+    which neither side had a `case_id` (a store written before the column
+    existed), or in which every row's coverage happened to be unknown, would
+    otherwise infer Arrow's `null` type and stop matching the fragments
+    around it.
+    """
+    frame = pd.DataFrame(rows)
+    for column in TS_DIFF_CASE_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = None
+        frame[column] = frame[column].astype("string")
+    for column, dtype in TS_DIFF_COVERAGE_DTYPES.items():
+        if column not in frame.columns:
+            frame[column] = None
+        frame[column] = frame[column].astype(dtype)
+    return frame
+
 
 def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> None:
     """Persist accumulated diff rows, then delete the `.out` files behind them.
@@ -614,16 +656,8 @@ def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> N
     deleting source data whose derived rows were never written (irrecoverable).
     """
     if rows:
-        frame = pd.DataFrame(rows)
-        # Conformed for the same reason `_run_frame` conforms `runs`: a batch
-        # in which neither side had a `case_id` (a store written before the
-        # column existed) would otherwise infer Arrow's `null` type and stop
-        # matching the fragments around it.
-        for column in TS_DIFF_CASE_COLUMNS:
-            if column not in frame.columns:
-                frame[column] = None
-            frame[column] = frame[column].astype("string")
-        store.write_table(frame, out_dir, "ts_diff", partition_by=["family"])
+        store.write_table(_ts_diff_frame(rows), out_dir, "ts_diff",
+                          partition_by=["family"])
     for path in pending:
         path.unlink(missing_ok=True)
 
@@ -979,8 +1013,14 @@ def stage_report(out_dir: Path, lang: str = "es") -> int:
     # `elements` is passed so the summary's surcharge-activity stratum can
     # use per-node flooding totals as well as `pct_steps_not_converging`;
     # without it the proxy silently degrades to the scalar signal alone.
+    #
+    # `ts_diff` is passed for the incomplete-overlap anomaly section. It is
+    # read here rather than inside `write_markdown` so the stage stays the one
+    # place that touches the store; an absent table is an empty frame, which
+    # the section reports as *coverage not assessed* -- never as complete.
+    ts_diff = store.read_table(out_dir, "ts_diff")
     path = report.write_markdown(deltas, runs, out_dir / "summary.md",
-                                 lang=lang, elements=elements)
+                                 lang=lang, elements=elements, ts_diff=ts_diff)
     print(f"wrote {path}")
     return 0
 

@@ -171,6 +171,73 @@ def test_report_on_an_empty_store_says_so_without_failing(tmp_path):
     assert cli.stage_report(tmp_path / "empty") == 0
 
 
+def test_the_interaction_axis_is_published_by_the_stage(store_dir):
+    cli.stage_report(store_dir)
+
+    deltas = store.read_table(store_dir, "deltas")
+    row = deltas[(deltas.model_id == "EPA/m1")
+                 & (deltas.metric == "avg_iterations_per_step")].iloc[0]
+
+    # A=4.0, B=3.0, C=3.6, D=2.4 -> (D - C) - (B - A) = -1.2 - (-1.0) = -0.2.
+    assert row["delta_interaction"] == pytest.approx(-0.2)
+
+    text = (store_dir / "summary.md").read_text(encoding="utf-8")
+    assert report.MARKDOWN_STRINGS["es"]["interaction_heading"] in text
+
+
+# ---------------------------------------------------------------------------
+# Time-series coverage reaches the summary from the store
+# ---------------------------------------------------------------------------
+
+
+def _ts_diff(coverage: float) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "model_id": "EPA/m1", "family": "EPA", "comparison": "D_minus_C",
+        "element_type": "NODE", "element_id": "n1",
+        "attribute": "INVERT_DEPTH", "max_abs": 0.0, "max_rel": 0.0,
+        "rmse": 0.0, "n_periods_left": 24,
+        "n_periods_right": int(round(coverage * 24)),
+        "n_common": int(round(coverage * 24)), "coverage_fraction": coverage,
+        "start_time_match": True, "end_time_match": coverage == 1.0,
+        "time_grid_match": coverage == 1.0,
+    }])
+
+
+def test_the_stage_carries_an_incomplete_overlap_into_the_summary(store_dir):
+    # A near-perfect `max_abs` over half a run must not be published as a
+    # full comparison; the stage reads `ts_diff` so the summary can say so.
+    store.write_table(_ts_diff(0.5), store_dir, "ts_diff", partition_by=["family"])
+
+    cli.stage_report(store_dir)
+
+    text = (store_dir / "summary.md").read_text(encoding="utf-8")
+    strings = report.MARKDOWN_STRINGS["es"]
+
+    assert "| D_minus_C | 1 | 1 | 0.5000 |" in text
+    assert "\n".join(strings["coverage_anomaly_none"]) not in text
+
+
+def test_a_store_with_full_coverage_says_so(store_dir):
+    store.write_table(_ts_diff(1.0), store_dir, "ts_diff", partition_by=["family"])
+
+    cli.stage_report(store_dir)
+
+    text = (store_dir / "summary.md").read_text(encoding="utf-8")
+    strings = report.MARKDOWN_STRINGS["es"]
+
+    assert "\n".join(strings["coverage_anomaly_none"]) in text
+    assert "\n".join(strings["coverage_not_assessed"]) not in text
+
+
+def test_a_store_with_no_ts_diff_reports_coverage_as_unassessed(store_dir):
+    cli.stage_report(store_dir)
+
+    text = (store_dir / "summary.md").read_text(encoding="utf-8")
+
+    assert "\n".join(
+        report.MARKDOWN_STRINGS["es"]["coverage_not_assessed"]) in text
+
+
 # ---------------------------------------------------------------------------
 # Mixed engine builds
 # ---------------------------------------------------------------------------
