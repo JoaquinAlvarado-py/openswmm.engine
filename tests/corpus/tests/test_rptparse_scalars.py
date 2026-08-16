@@ -63,6 +63,49 @@ def test_fv_substeps_are_not_reported_as_picard_iterations(fv):
     assert scalars["iteration_metric_kind"] == schema.ITER_FV
 
 
+def test_a_kinwave_iteration_count_is_not_labelled_picard():
+    # The engine prints `Average Iterations per Step` for EVERY routing
+    # model and relabels it only under FV, so the label alone cannot mean
+    # Picard. Claiming `picard` here would be worse than claiming nothing:
+    # report.build_deltas's kind guard only trips when the two sides
+    # DISAGREE, so two KINWAVE runs would agree on a meaningless label and
+    # their difference would be published as an iteration shift.
+    report_text = """
+  ****************
+  Analysis Options
+  ****************
+  Flow Routing Method ...... KINWAVE
+
+  *************************
+  Routing Time Step Summary
+  *************************
+  Average Time Step           :    10.00 sec
+  Average Iterations per Step :     2.50
+"""
+    scalars = rptparse.parse_scalars(report_text)
+
+    # The number is still recorded -- it is a real thing the engine printed.
+    assert scalars["avg_iterations_per_step"] == pytest.approx(2.50)
+    assert scalars["iteration_metric_kind"] is None
+
+
+def test_a_steady_iteration_count_is_not_labelled_picard():
+    report_text = """
+  Flow Routing Method ...... STEADY
+  Average Iterations per Step :     1.00
+"""
+    assert rptparse.parse_scalars(report_text)["iteration_metric_kind"] is None
+
+
+def test_an_iteration_count_with_no_routing_echo_is_not_labelled_picard():
+    # No echo means no evidence the counter is Picard-shaped. Unlike a
+    # missing kind in the report layer, this absence is NOT given the
+    # benefit of the doubt.
+    report_text = "  Average Iterations per Step :     2.50\n"
+
+    assert rptparse.parse_scalars(report_text)["iteration_metric_kind"] is None
+
+
 def test_not_applicable_convergence_parses_to_none_never_zero(fv):
     scalars = rptparse.parse_scalars(fv)
 

@@ -35,5 +35,14 @@ VARIANTS = (VARIANT_A, VARIANT_B, VARIANT_C, VARIANT_D, VARIANT_E)
 # writer relabels it under FV routing (DefaultReportPlugin.cpp:1194-1203) and
 # explicit substeps are not Picard iterations, so they must never share a
 # column without this discriminator.
+#
+# The discriminator is NOT derivable from the label alone: the unrelabelled
+# "Average Iterations per Step" is printed under KINWAVE and STEADY too,
+# where the counter has no Picard meaning. `iteration_metric_kind` is
+# therefore left None for those runs -- see rptparse.parse_scalars.
 ITER_PICARD = "picard"
 ITER_FV = "fv_substeps"
+
+#: The value `Flow Routing Method` echoes for the dynamic wave solver -- the
+#: only routing model under which a Picard iteration count means anything.
+ROUTING_DYNWAVE = "DYNWAVE"

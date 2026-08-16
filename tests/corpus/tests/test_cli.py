@@ -14,6 +14,7 @@ FAKE_REPORT = """  EPA STORM WATER MANAGEMENT MODEL - VERSION 5.2 (Build 5.2.4)
   ****************
   Analysis Options
   ****************
+  Flow Routing Method ...... DYNWAVE
   Starting Date ............ 01/01/2002 00:00:00
   Ending Date .............. 01/01/2002 01:00:00
 

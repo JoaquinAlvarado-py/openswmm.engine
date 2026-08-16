@@ -138,8 +138,24 @@ def parse_scalars(text: str) -> dict:
             out[_TIME_STEP_FIELDS[label]] = _number(value)
         elif label == "Average Iterations per Step":
             out["avg_iterations_per_step"] = _number(value)
-            out["iteration_metric_kind"] = schema.ITER_PICARD
+            # The engine prints this line for EVERY routing model; only FV
+            # relabels it to "Average Substeps per Step". So the label alone
+            # does NOT mean Picard: a KINWAVE or STEADY run prints it too,
+            # carrying a counter with no Picard meaning. Claiming `picard`
+            # there would be worse than claiming nothing, because
+            # report.build_deltas's kind guard only trips when the two sides
+            # DISAGREE -- two KINWAVE runs would agree on a meaningless label
+            # and their difference would be published as an iteration shift.
+            # `reported_routing_model` is filled by the dotted-line pass
+            # above, which runs first, so it is available here.
+            model = (out["reported_routing_model"] or "").strip().upper()
+            if model == schema.ROUTING_DYNWAVE:
+                out["iteration_metric_kind"] = schema.ITER_PICARD
         elif label == "Average Substeps per Step":
+            # This label IS unambiguous: the report writer emits it only
+            # under FV routing, so no routing-model cross-check is needed
+            # (and an FV report that omits the Analysis Options block still
+            # gets the right kind).
             out["avg_iterations_per_step"] = _number(value)
             out["iteration_metric_kind"] = schema.ITER_FV
         elif label == "% of Steps Not Converging":
