@@ -323,6 +323,80 @@ def dynwave_models(runs: pd.DataFrame) -> set:
     return set(routed["model_id"])
 
 
+#: Why a pairing that had BOTH operand values still produced no iteration
+#: delta. Data values, verbatim in both languages.
+#:
+#: The two are kept apart because they mean opposite things to an operator.
+#: `not_dynwave` is expected and healthy -- a KINWAVE, STEADY or FV run has
+#: no Picard iteration count to compare, and excluding it is the harness
+#: working. `routing_unknown` is actionable: nothing recorded what routed
+#: the run, so the delta was withheld for lack of provenance rather than
+#: because the feature did nothing. Collapsing them into one "excluded"
+#: number would hide the second inside the first.
+EXCLUSION_NOT_DYNWAVE = "not_dynwave"
+EXCLUSION_ROUTING_UNKNOWN = "routing_unknown"
+
+EXCLUSION_COLUMNS = ["cause", "pairings", "models"]
+
+
+def iteration_exclusions(
+    deltas: pd.DataFrame,
+    runs: pd.DataFrame,
+    metric: str = "avg_iterations_per_step",
+) -> pd.DataFrame:
+    """Iteration deltas withheld by the routing-model guard, by cause.
+
+    Counted per **(model, comparison) pairing**, not per model: the thing
+    that was not produced is a delta, and one model contributes six of them.
+    A per-model count would report `1` where six headline numbers went
+    missing. The distinct model count is carried alongside so a reader can
+    still see how concentrated the loss is.
+
+    Only pairings that WOULD otherwise have been computed are counted -- both
+    operand values present, and the delta null. A pairing whose operand is
+    simply missing (a crashed variant) was never withheld by this guard and
+    is not evidence of anything about routing provenance.
+
+    A pairing where every *known* routing model is `DYNWAVE` but one is
+    absent counts as `routing_unknown`; one where any known routing model is
+    something else counts as `not_dynwave`, because that pairing would have
+    been excluded even with complete provenance. Pairings whose two sides are
+    both known `DYNWAVE` are not counted at all: they were dropped by the
+    iteration-kind or anchor-surcharge guard, which have their own caveats.
+    """
+    if deltas.empty or "metric" not in deltas.columns:
+        return pd.DataFrame(columns=EXCLUSION_COLUMNS)
+
+    routing = _pivot(runs, "reported_routing_model")
+    frame = deltas[deltas["metric"] == metric]
+    hits: dict[str, list] = {EXCLUSION_NOT_DYNWAVE: [],
+                             EXCLUSION_ROUTING_UNKNOWN: []}
+
+    for _, row in frame.iterrows():
+        for column, left, right in DELTA_SPECS:
+            if column not in row.index:
+                continue
+            values = [row.get(f"value_{side.lower()}") for side in (left, right)]
+            if any(value is None or pd.isna(value) for value in values):
+                continue
+            if pd.notna(row.get(column)):
+                continue
+
+            models = [_lookup(routing, row["model_id"], side)
+                      for side in (left, right)]
+            known = [str(model).strip().upper() for model in models
+                     if model is not None and not pd.isna(model)]
+            if any(model != DYNWAVE for model in known):
+                hits[EXCLUSION_NOT_DYNWAVE].append(row["model_id"])
+            elif len(known) < 2:
+                hits[EXCLUSION_ROUTING_UNKNOWN].append(row["model_id"])
+
+    rows = [{"cause": cause, "pairings": len(models),
+             "models": len(set(models))}
+            for cause, models in hits.items() if models]
+    return pd.DataFrame(rows, columns=EXCLUSION_COLUMNS)
+
+
 #: Per-element metrics that evidence flooding, i.e. a node whose hydraulic
 #: grade rose above the ground and spilled. Either being positive for any
 #: node of a model is taken as surcharge activity.
@@ -422,6 +496,34 @@ MARKDOWN_STRINGS = {
         "iter_shift_e_heading": "## Iteration shift by family and hardness (E - A)",
         "family_header": "| family | hardness | models | mean abs iterations |",
         "family_sep": "| --- | --- | --- | --- |",
+        "iter_excluded_heading": "## Iteration deltas withheld, by cause",
+        "iter_excluded_header": "| cause | pairings | models |",
+        "iter_excluded_sep": "| --- | --- | --- |",
+        "iter_excluded_intro": [
+            "Counted per (model, comparison) pairing, over pairings that had",
+            "both operand values and would otherwise have been computed.",
+            "`not_dynwave` is expected and healthy: a KINWAVE, STEADY or FV run",
+            "has no Picard iteration count to compare.",
+        ],
+        "iter_excluded_none": [
+            "No iteration delta was withheld by the routing-model guard.",
+        ],
+        "iter_unknown_note": [
+            "**Some pairings were skipped for lack of a recorded routing",
+            "model, not because the feature did nothing.** No",
+            "`reported_routing_model` was recorded for at least one side, so",
+            "there is no evidence the counter means Picard iterations at all",
+            "and the delta was withheld rather than guessed. This usually",
+            "means a store written before that column existed, or a report the",
+            "parser could not read. Re-run those models before drawing any",
+            "conclusion from the iteration sections.",
+        ],
+        "iter_empty_note": [
+            "**The iteration-shift sections above are empty: not one iteration",
+            "delta survived.** Read that as *nothing was measured*, never as",
+            "*the feature has no effect* -- the causes are itemised in the",
+            "table above, and an absent measurement refutes nothing.",
+        ],
         "surcharge_heading": "## D and E by surcharge activity",
         "surcharge_header": "| axis | surcharge | metric | models | mean | median |",
         "surcharge_sep": "| --- | --- | --- | --- | --- | --- |",
@@ -506,6 +608,35 @@ MARKDOWN_STRINGS = {
         "iter_shift_e_heading": "## Cambio de iteraciones por familia y dificultad (E - A)",
         "family_header": "| familia | dificultad | modelos | media de iteraciones absolutas |",
         "family_sep": "| --- | --- | --- | --- |",
+        "iter_excluded_heading": "## Deltas de iteraciones retenidos, por causa",
+        "iter_excluded_header": "| causa | pares | modelos |",
+        "iter_excluded_sep": "| --- | --- | --- |",
+        "iter_excluded_intro": [
+            "Contados por par (modelo, comparación), sobre los pares que tenían",
+            "ambos valores operandos y que de otro modo se habrían calculado.",
+            "`not_dynwave` es esperado y sano: una corrida KINWAVE, STEADY o FV",
+            "no tiene un conteo de iteraciones de Picard que comparar.",
+        ],
+        "iter_excluded_none": [
+            "El filtro de modelo de ruteo no retuvo ningún delta de iteraciones.",
+        ],
+        "iter_unknown_note": [
+            "**Algunos pares se omitieron por falta de un modelo de ruteo",
+            "registrado, no porque la característica no hiciera nada.** No se",
+            "registró `reported_routing_model` para al menos uno de los lados,",
+            "así que no hay evidencia de que el contador signifique iteraciones",
+            "de Picard, y el delta se retuvo en vez de adivinarse. Esto suele",
+            "indicar un almacén escrito antes de que existiera esa columna, o un",
+            "informe que el parser no pudo leer. Vuelva a correr esos modelos",
+            "antes de concluir nada de las secciones de iteraciones.",
+        ],
+        "iter_empty_note": [
+            "**Las secciones de cambio de iteraciones de arriba están vacías: no",
+            "sobrevivió ni un delta de iteraciones.** Léalo como *no se midió",
+            "nada*, nunca como *la característica no tiene efecto*: las causas",
+            "están detalladas en la tabla de arriba, y una medición ausente no",
+            "refuta nada.",
+        ],
         "surcharge_heading": "## D y E por actividad de sobrecarga",
         "surcharge_header": "| axis | surcharge | métrica | modelos | media | mediana |",
         "surcharge_sep": "| --- | --- | --- | --- | --- | --- |",
@@ -678,6 +809,7 @@ def write_markdown(
             hardness = pd.Series(index=iterations.index, dtype="object")
         iterations = iterations.assign(_hardness=hardness)
 
+        emitted = 0
         for delta_col, heading_key in ITER_SECTIONS:
             lines += [strings[heading_key], "",
                       strings["family_header"], strings["family_sep"]]
@@ -699,7 +831,16 @@ def write_markdown(
                         continue
                     lines.append(f"| {family} | {bucket} | {len(column)} | "
                                  f"{column.mean():.4f} |")
+                    emitted += 1
             lines.append("")
+
+        # The routing-model guard is deliberately stricter than the
+        # iteration-kind one, and that strictness must not be silent: an
+        # operator reading an empty iteration section concludes "the feature
+        # has no effect", which is the same misreading the surcharge-activity
+        # stratum exists to prevent. So the withheld pairings are counted and
+        # itemised, and an entirely empty set of sections says so outright.
+        lines += _exclusion_section(deltas, runs, strings, emitted)
 
         lines += _surcharge_section(deltas, runs, elements, strings)
 
@@ -715,6 +856,45 @@ def write_markdown(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def _exclusion_section(
+    deltas: pd.DataFrame,
+    runs: pd.DataFrame,
+    strings: dict,
+    emitted: int,
+) -> list[str]:
+    """Iteration deltas the routing-model guard withheld, itemised by cause.
+
+    `emitted` is how many rows the iteration-shift sections actually printed;
+    zero means nothing was measured at all, which the report must state in
+    words rather than leaving four bare empty tables to be read as a result.
+    """
+    excluded = iteration_exclusions(deltas, runs)
+    lines = [strings["iter_excluded_heading"], ""]
+    lines += strings["iter_excluded_intro"]
+    lines.append("")
+
+    if excluded.empty:
+        lines += strings["iter_excluded_none"]
+        lines.append("")
+    else:
+        lines += [strings["iter_excluded_header"], strings["iter_excluded_sep"]]
+        for _, row in excluded.iterrows():
+            lines.append(f"| {row['cause']} | {row['pairings']} | "
+                         f"{row['models']} |")
+        lines.append("")
+
+        unknown = excluded[excluded["cause"] == EXCLUSION_ROUTING_UNKNOWN]
+        if not unknown.empty:
+            lines += strings["iter_unknown_note"]
+            lines.append("")
+
+    if not emitted:
+        lines += strings["iter_empty_note"]
+        lines.append("")
+
+    return lines
 
 
 def _surcharge_section(

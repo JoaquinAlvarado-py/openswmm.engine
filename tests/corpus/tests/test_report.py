@@ -509,6 +509,135 @@ def test_hardness_buckets_partition_the_models_in_the_report(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Withheld iteration deltas are counted, not silently absent
+# ---------------------------------------------------------------------------
+
+
+def _exclusions(runs):
+    return report.iteration_exclusions(
+        report.build_deltas(runs, METRICS), runs
+    ).set_index("cause")
+
+
+def test_a_store_with_no_routing_model_reports_unknown_provenance(tmp_path):
+    # The strictness of the routing guard must not be silent: a store
+    # predating `reported_routing_model` yields zero iteration deltas, and
+    # empty sections read as "the feature has no effect" -- the exact
+    # misreading the surcharge stratification exists to prevent.
+    runs = _runs()
+    runs["reported_routing_model"] = None
+
+    counts = _exclusions(runs)
+
+    assert report.EXCLUSION_NOT_DYNWAVE not in counts.index
+    # Six axes for the one model, every one of them withheld.
+    assert counts.loc[report.EXCLUSION_ROUTING_UNKNOWN, "pairings"] == 6
+    assert counts.loc[report.EXCLUSION_ROUTING_UNKNOWN, "models"] == 1
+
+    for lang in ("en", "es"):
+        text = _write_stratified(tmp_path, lang=lang, runs=runs)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(text, strings["iter_excluded_heading"])
+
+        assert f"| {report.EXCLUSION_ROUTING_UNKNOWN} | 6 | 1 |" in section
+        assert "\n".join(strings["iter_unknown_note"]) in section
+        assert "\n".join(strings["iter_excluded_none"]) not in section
+
+
+def test_a_kinwave_model_is_counted_as_a_healthy_exclusion(tmp_path):
+    # `_stratified_runs` has two DYNWAVE models and one KINWAVE one. The
+    # KINWAVE model loses all six axes; nothing is unknown.
+    runs = _stratified_runs()
+
+    counts = _exclusions(runs)
+
+    assert counts.loc[report.EXCLUSION_NOT_DYNWAVE, "pairings"] == 6
+    assert counts.loc[report.EXCLUSION_NOT_DYNWAVE, "models"] == 1
+    assert report.EXCLUSION_ROUTING_UNKNOWN not in counts.index
+
+    text = _write_stratified(tmp_path, runs=runs)
+    strings = report.MARKDOWN_STRINGS["en"]
+    section = _markdown_section(text, strings["iter_excluded_heading"])
+
+    # An expected exclusion must not raise the actionable alarm.
+    assert f"| {report.EXCLUSION_NOT_DYNWAVE} | 6 | 1 |" in section
+    assert "\n".join(strings["iter_unknown_note"]) not in section
+    assert "\n".join(strings["iter_empty_note"]) not in section
+
+
+def test_the_two_exclusion_causes_are_reported_separately(tmp_path):
+    # One KINWAVE model (healthy) and one model with no routing echo at all
+    # (actionable). Collapsing them into a single count would hide the
+    # second inside the first.
+    runs = _stratified_runs()
+    runs.loc[runs.model_id == "EASY/m1", "reported_routing_model"] = None
+
+    counts = _exclusions(runs)
+
+    assert counts.loc[report.EXCLUSION_NOT_DYNWAVE, "pairings"] == 6
+    assert counts.loc[report.EXCLUSION_ROUTING_UNKNOWN, "pairings"] == 6
+    assert set(counts["models"]) == {1}
+
+    for lang in ("en", "es"):
+        text = _write_stratified(tmp_path, lang=lang, runs=runs)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(text, strings["iter_excluded_heading"])
+
+        assert f"| {report.EXCLUSION_NOT_DYNWAVE} | 6 | 1 |" in section
+        assert f"| {report.EXCLUSION_ROUTING_UNKNOWN} | 6 | 1 |" in section
+        assert "\n".join(strings["iter_unknown_note"]) in section
+
+
+def test_entirely_empty_iteration_sections_say_so(tmp_path):
+    runs = _runs()
+    runs["reported_routing_model"] = None
+
+    for lang in ("en", "es"):
+        text = _write_stratified(tmp_path, lang=lang, runs=runs)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(text, strings["iter_excluded_heading"])
+
+        assert "\n".join(strings["iter_empty_note"]) in section
+        # The iteration sections themselves carry no data row.
+        for key in ("iter_shift_b_heading", "iter_shift_d_heading"):
+            body = _markdown_section(text, strings[key])
+            rows = [line for line in body.splitlines()
+                    if line.startswith("| ") and "---" not in line]
+            assert rows == [strings["family_header"]]
+
+
+def test_a_fully_measurable_store_reports_no_withheld_pairings(tmp_path):
+    text = _write_stratified(tmp_path, runs=_runs())
+    strings = report.MARKDOWN_STRINGS["en"]
+    section = _markdown_section(text, strings["iter_excluded_heading"])
+
+    assert _exclusions(_runs()).empty
+    assert "\n".join(strings["iter_excluded_none"]) in section
+    assert "\n".join(strings["iter_empty_note"]) not in section
+
+
+def test_a_missing_operand_is_not_counted_as_a_routing_exclusion():
+    # A crashed variant was never withheld by the routing guard; counting it
+    # would blame provenance for an absence with a different cause.
+    runs = _runs()
+    runs = runs[runs.variant != "D"]
+
+    assert _exclusions(runs).empty
+
+
+def test_a_kind_mismatch_between_two_dynwave_runs_is_not_a_routing_exclusion():
+    # It has its own caveat; attributing it to routing would double-count.
+    runs = _runs()
+    runs.loc[runs.variant == "B", "iteration_metric_kind"] = schema.ITER_FV
+
+    assert _exclusions(runs).empty
+
+
+def test_exclusions_on_an_empty_frame_are_an_empty_table_not_an_error():
+    assert report.iteration_exclusions(pd.DataFrame(), pd.DataFrame()).empty
+
+
+# ---------------------------------------------------------------------------
 # Surcharge activity
 # ---------------------------------------------------------------------------
 

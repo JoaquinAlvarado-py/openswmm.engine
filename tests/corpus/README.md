@@ -189,6 +189,17 @@ plus iteration-shift tables stratified two ways and a D/E surcharge-activity
 section:
 
 - **routing model** -- the iteration-shift sections show `DYNWAVE` rows only.
+- **withheld pairings** -- the routing-model guard is deliberately stricter
+  than the kind guard, so the report itemises what it cost, counted per
+  (model, comparison) pairing: `not_dynwave` (expected and healthy -- a
+  KINWAVE/STEADY/FV run has no Picard count to compare) and
+  `routing_unknown` (actionable -- no `reported_routing_model` was recorded
+  for one side, typically a store written before that column existed or an
+  unreadable report). Only pairings that had both operand values and would
+  otherwise have been computed are counted. If the iteration sections come
+  out entirely empty the report says so outright, because four bare empty
+  tables read as "the feature has no effect" when what happened is that
+  nothing was measured.
 - **hardness** -- split by variant A's `avg_iterations_per_step` into
   `<= 2`, `2-4` and `> 4` (closed on the right; the three partition the
   reals). Anderson cannot help a model that already converges in two
