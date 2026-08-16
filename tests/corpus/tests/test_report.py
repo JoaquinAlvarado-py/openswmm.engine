@@ -229,12 +229,17 @@ def test_d_minus_c_survives_a_missing_a_variant():
 
 
 def _guard(runs, metric, left, right, model_id="EPA/m1"):
-    """Whether build_deltas would form `left - right` for `metric`."""
+    """Whether build_deltas would form `left - right` for `metric`.
+
+    Built the way `build_deltas` builds it -- the option echoes come from
+    `report.echo_pivots`, the same mapping `option_anomalies` reads -- so the
+    helper cannot pass a pairing the real pipeline would reject.
+    """
     return report._commensurable(
         metric, model_id, left, right,
         report._pivot(runs, "iteration_metric_kind"),
         report._pivot(runs, "reported_routing_model"),
-        report._pivot(runs, "reported_surcharge_method"),
+        report.echo_pivots(runs),
     )
 
 
@@ -277,6 +282,110 @@ def test_a_missing_surcharge_echo_is_not_a_mismatch():
     row = deltas[deltas.metric == "continuity_error_flow"].iloc[0]
 
     assert row["delta_a_minus_ref"] == pytest.approx(0.01)
+
+
+# ---------------------------------------------------------------------------
+# Commensurability: the echoed option value against the variant's own intent
+# ---------------------------------------------------------------------------
+
+
+def _anderson_echoes(runs):
+    """`_runs()` with every executed row echoing its variant's ANDERSON_ACCEL."""
+    runs = runs.copy()
+    runs["reported_anderson_accel"] = runs["variant"].map(
+        {variant: options["ANDERSON_ACCEL"]
+         for variant, options in report.variants.OPTIONS.items()}
+    )
+    return runs
+
+
+def test_an_e_run_that_actually_executed_under_extran_publishes_no_delta():
+    # The conclusion-inverting failure this screen exists for. The engine
+    # silently ignores an unrecognised option value, so a broken E deck runs
+    # as plain EXTRAN -- making `E - A` a subtraction of two IDENTICAL
+    # configurations, published as ~0 and read as "the Dynamic Preissmann
+    # Slot has no effect" when the slot was never enabled at all.
+    runs = _runs()
+    runs.loc[runs.variant == "E", "reported_surcharge_method"] = "EXTRAN"
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_e_minus_a"])
+    # Only E's pairings are affected; the rest of the row is untouched, and
+    # the row itself survives with its values intact.
+    assert row["value_e"] == pytest.approx(5.0)
+    assert row["delta_b_minus_a"] == pytest.approx(-2.0)
+    assert row["delta_d_minus_c"] == pytest.approx(-1.5)
+
+
+def test_a_d_run_that_echoes_anderson_off_publishes_no_delta():
+    # D's whole value is `D - C`: Anderson under the C1-smooth operator. A D
+    # run that actually executed with ANDERSON_ACCEL off differs from C in
+    # nothing, so `D - C ~ 0` would read as "Anderson does not help there".
+    runs = _anderson_echoes(_runs())
+    runs.loc[runs.variant == "D", "reported_anderson_accel"] = "NO"
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert pd.isna(row["delta_d_minus_c"])
+    assert pd.isna(row["delta_d_minus_a"])
+    # B - A still measures Anderson under EXPLICIT/EXTRAN, and C - A still
+    # measures Crank-Nicolson; neither reads D's echo.
+    assert row["delta_b_minus_a"] == pytest.approx(-2.0)
+    assert row["delta_c_minus_a"] == pytest.approx(-1.0)
+
+
+def test_the_intent_screen_applies_to_every_metric_not_just_iterations():
+    # A misconfigured run corrupts its continuity error exactly as
+    # thoroughly as its iteration count.
+    runs = _runs()
+    runs.loc[runs.variant == "E", "reported_surcharge_method"] = "EXTRAN"
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "continuity_error_flow"].iloc[0]
+
+    assert pd.isna(row["delta_e_minus_a"])
+    assert row["delta_b_minus_a"] == pytest.approx(0.02)
+
+
+def test_a_missing_echo_is_not_a_contradiction():
+    # A KINWAVE/STEADY/FV run never prints the DYNWAVE-only Analysis Options
+    # block at all. Absence is no evidence, and must not cost a computable
+    # delta -- the same rule the kind and anchor-surcharge screens follow.
+    runs = _anderson_echoes(_runs())
+    runs.loc[runs.variant == "E", "reported_surcharge_method"] = None
+    runs.loc[runs.variant == "D", "reported_anderson_accel"] = None
+
+    deltas = report.build_deltas(runs, METRICS)
+    row = deltas[deltas.metric == "avg_iterations_per_step"].iloc[0]
+
+    assert row["delta_e_minus_a"] == pytest.approx(1.0)
+    assert row["delta_d_minus_c"] == pytest.approx(-1.5)
+
+
+def test_the_reference_anchor_is_not_screened_against_a_variant_intent():
+    # REF is a third-party report the harness never configured, so it has no
+    # intent to contradict. Its own confound is the anchor-surcharge screen,
+    # which is what must catch a reference run under another method.
+    runs = _runs()
+    runs.loc[runs.variant == "REF", "reported_surcharge_method"] = "EXTRAN"
+
+    assert _guard(runs, "continuity_error_flow",
+                  schema.VARIANT_A, schema.VARIANT_REF) is True
+
+
+def test_the_intent_screen_and_the_anomaly_report_read_one_mapping():
+    # Defence in depth only holds if the two cannot drift: the same
+    # OPTION_ECHO_COLUMNS mapping drives the warning and the withholding.
+    runs = _runs()
+    runs.loc[runs.variant == "E", "reported_surcharge_method"] = "EXTRAN"
+
+    anomalies = report.option_anomalies(runs)
+
+    assert set(anomalies["variant"]) == {schema.VARIANT_E}
+    assert pd.isna(report.build_deltas(runs, METRICS)["delta_e_minus_a"]).all()
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +747,57 @@ def test_exclusions_on_an_empty_frame_are_an_empty_table_not_an_error():
 
 
 # ---------------------------------------------------------------------------
+# A computed delta with no baseline to stratify it by
+# ---------------------------------------------------------------------------
+
+
+def test_a_d_minus_c_whose_a_run_crashed_is_neither_dropped_nor_unaccounted(tmp_path):
+    # `D - C` reads C and D only, so a crashed baseline still leaves a valid,
+    # non-null delta. Bucketing by `value_a` alone used to drop it from the
+    # D - C table AND from the exclusion ledger (which counts null deltas
+    # only), so a real measurement vanished from both.
+    runs = _runs()
+    runs = runs[runs.variant != "A"]
+
+    counts = _exclusions(runs)
+
+    assert counts.loc[report.EXCLUSION_NO_BASELINE, "pairings"] == 1
+    assert counts.loc[report.EXCLUSION_NO_BASELINE, "models"] == 1
+
+    for lang in ("en", "es"):
+        text = _write_stratified(tmp_path, lang=lang, runs=runs)
+        strings = report.MARKDOWN_STRINGS[lang]
+
+        # Kept in the table too, under an explicit `unknown` hardness bucket
+        # rather than filed under a stratum it did not earn.
+        section = _markdown_section(text, strings["iter_shift_d_heading"])
+        assert f"| EPA | {report.HARDNESS_UNKNOWN} | 1 | 1.5000 |" in section
+
+        ledger = _markdown_section(text, strings["iter_excluded_heading"])
+        assert f"| {report.EXCLUSION_NO_BASELINE} | 1 | 1 |" in ledger
+        # Something WAS measured, so the nothing-survived note must not fire.
+        assert "\n".join(strings["iter_empty_note"]) not in ledger
+
+
+def test_a_kinwave_baseline_does_not_lend_its_iteration_count_as_a_bucket():
+    # A KINWAVE A run still prints an `Average Iterations per Step` line;
+    # stratifying on it would sort the model by a number that counts nothing
+    # Picard-shaped. Such a model is `unknown`, not `2-4`.
+    runs = _runs()
+    runs.loc[runs.variant == "A", "reported_routing_model"] = "KINWAVE"
+    deltas = report.build_deltas(runs, METRICS)
+    iterations = deltas[deltas.metric == "avg_iterations_per_step"]
+
+    hardness = report.reported_hardness(iterations, report.dynwave_models(runs))
+
+    assert list(hardness) == [report.HARDNESS_UNKNOWN]
+
+
+def test_a_stratifiable_model_is_not_counted_as_missing_a_baseline():
+    assert report.EXCLUSION_NO_BASELINE not in _exclusions(_runs()).index
+
+
+# ---------------------------------------------------------------------------
 # Surcharge activity
 # ---------------------------------------------------------------------------
 
@@ -690,6 +850,67 @@ def test_surcharge_activity_is_read_from_the_baseline_run(tmp_path):
     assert report.surcharge_active_models(other) == set()
 
 
+def _one_active_model_without_a_c_run():
+    """A surcharge-active model whose C run crashed.
+
+    `pct_steps_not_converging > 0` on variant A puts it in the `active`
+    stratum, but with no C row there is no `D - C` delta to put in it -- so
+    that axis is empty while `D - A` and `E - A` are fully populated.
+    """
+    rows = []
+    for variant, offset in (("A", 0.0), ("B", -0.5), ("D", -0.8), ("E", 0.3)):
+        rows.append({
+            "model_id": "SUR/m1", "family": "SUR", "variant": variant,
+            "status": "ok",
+            "avg_iterations_per_step": 6.0 + offset,
+            "continuity_error_flow": 0.1 + offset / 100.0,
+            "pct_steps_not_converging": 2.0 if variant == "A" else 0.0,
+            "iteration_metric_kind": "picard",
+            "reported_routing_model": "DYNWAVE",
+            "reported_surcharge_method":
+                "DYNAMIC_SLOT" if variant == "E" else "EXTRAN",
+        })
+    return pd.DataFrame(rows)
+
+
+def test_an_axis_with_no_active_row_says_so_even_when_another_axis_has_rows(
+    tmp_path,
+):
+    # The global note fires only when the active set itself is empty. A store
+    # with surcharge-active models can still produce no `active` row for one
+    # axis -- and that axis would then print `inactive` rows alone, which is
+    # the exact misreading the announcement exists to block.
+    runs = _one_active_model_without_a_c_run()
+
+    for lang in ("en", "es"):
+        text = _write_stratified(tmp_path, lang=lang, runs=runs)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(text, strings["surcharge_heading"])
+        note = "\n".join(strings["surcharge_axis_empty"])
+
+        assert note.format(axis="D - C") in section
+        # The other two axes are populated, so their notes must NOT fire.
+        assert f"| D - A | {report.SURCHARGE_ACTIVE} |" in section
+        assert f"| E - A | {report.SURCHARGE_ACTIVE} |" in section
+        assert note.format(axis="D - A") not in section
+        assert note.format(axis="E - A") not in section
+        # The store HAS active models, so the global "none" note is wrong here.
+        assert "\n".join(strings["surcharge_none"]) not in section
+
+
+def test_the_per_axis_note_does_not_repeat_the_global_one(tmp_path):
+    # With no surcharge-active model at all, the global note already says it
+    # once; three per-axis repetitions would bury it.
+    text = _write_stratified(tmp_path)
+    strings = report.MARKDOWN_STRINGS["en"]
+    section = _markdown_section(text, strings["surcharge_heading"])
+
+    assert "\n".join(strings["surcharge_none"]) in section
+    for axis, _column in report.SURCHARGE_SECTIONS:
+        assert "\n".join(strings["surcharge_axis_empty"]).format(
+            axis=axis) not in section
+
+
 def test_flooding_elements_widen_the_surcharge_proxy():
     runs = _stratified_runs()
 
@@ -703,6 +924,61 @@ def test_flooding_elements_widen_the_surcharge_proxy():
 
 def test_empty_input_produces_an_empty_frame_not_an_error():
     assert report.build_deltas(pd.DataFrame(), METRICS).empty
+
+
+# ---------------------------------------------------------------------------
+# The anomaly section reaches the deliverable, not just the console
+# ---------------------------------------------------------------------------
+
+
+def test_the_summary_counts_the_runs_whose_echo_contradicts_intent(tmp_path):
+    # `summary.md` is the artifact people keep and share; a console warning
+    # is seen once, by one operator. The one signal that catches a silently
+    # ignored option must survive into the document.
+    runs = _runs()
+    runs.loc[runs.variant == "E", "reported_surcharge_method"] = "EXTRAN"
+
+    for lang in ("en", "es"):
+        text = _write_stratified(tmp_path, lang=lang, runs=runs)
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(text, strings["anomaly_heading"])
+
+        # Broken down by variant AND option: which deck failed, and which
+        # option the engine actually resolved differently.
+        assert f"| {schema.VARIANT_E} | SURCHARGE_METHOD | 1 | 1 |" in section
+        assert "\n".join(strings["anomaly_total"]).format(n=1, n_models=1) in section
+        assert "\n".join(strings["anomaly_none"]) not in section
+
+
+def test_a_store_with_no_anomaly_says_so_rather_than_omitting_the_section(tmp_path):
+    # An absent section is indistinguishable from a harness that never
+    # looked, so the clean case is stated outright.
+    for lang in ("en", "es"):
+        text = _write_stratified(tmp_path, lang=lang, runs=_runs())
+        strings = report.MARKDOWN_STRINGS[lang]
+        section = _markdown_section(text, strings["anomaly_heading"])
+
+        assert "\n".join(strings["anomaly_none"]) in section
+        assert "SURCHARGE_METHOD" not in section
+
+
+def test_the_anomaly_summary_folds_many_models_into_one_broken_deck():
+    anomalies = pd.DataFrame([
+        {"model_id": f"EPA/m{n}", "variant": schema.VARIANT_E,
+         "option": "SURCHARGE_METHOD", "expected": "DYNAMIC_SLOT",
+         "reported": "EXTRAN"}
+        for n in range(3)
+    ])
+
+    summary = report.anomaly_summary(anomalies)
+
+    assert len(summary) == 1
+    assert summary.iloc[0]["runs"] == 3
+    assert summary.iloc[0]["models"] == 3
+
+
+def test_the_anomaly_summary_of_an_empty_frame_is_empty_not_an_error():
+    assert report.anomaly_summary(pd.DataFrame()).empty
 
 
 # ---------------------------------------------------------------------------

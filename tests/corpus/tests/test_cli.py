@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from swmmbench import cli, outdiff, schema, store
+from swmmbench import cli, outdiff, rptparse, schema, store
 
 DECK = "[TITLE]\nt\n\n[OPTIONS]\nFLOW_UNITS CFS\n"
 
@@ -761,6 +761,90 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
     assert "D_minus_C" in captured.out
 
 
+def _many_model_diff_fixture(tmp_path, n_models):
+    """`n_models` models, each with an `.out` for all five variants.
+
+    All five so every comparison resolves and every file is releasable --
+    the batching, not the retention rule, is what these tests are about.
+    """
+    paths = {}
+    rows = []
+    for index in range(n_models):
+        model_id = f"F/m{index}"
+        for variant in schema.VARIANTS:
+            path = tmp_path / f"batch_{index}_{variant}.out"
+            path.write_bytes(b"not really a binary .out file")
+            paths[(model_id, variant)] = path
+            rows.append({"model_id": model_id, "family": "F",
+                         "variant": variant, "status": schema.Status.OK,
+                         "out_path": str(path)})
+    return pd.DataFrame(rows), paths
+
+
+def test_a_batch_boundary_flushes_without_losing_rows_or_stranding_files(
+    tmp_path, monkeypatch,
+):
+    # The boundary path is unreachable with real fixtures: every diff fixture
+    # holds two models against FLUSH_BATCH_SIZE = 50, so only the final
+    # remainder flush ever ran. Patching the constant crosses a real boundary
+    # (three models, batches of two) instead of building fifty models.
+    out = tmp_path / "out"
+    runs, paths = _many_model_diff_fixture(tmp_path, n_models=3)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(cli, "FLUSH_BATCH_SIZE", 2)
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    assert cli.stage_diff(out, abs_tol=1e-9) == 0
+
+    ts_diff = store.read_table(out, "ts_diff")
+    # Nothing lost across the boundary: every model's rows are persisted.
+    assert set(ts_diff["model_id"]) == {"F/m0", "F/m1", "F/m2"}
+    assert set(ts_diff["comparison"]) == {
+        "B_minus_A", "C_minus_A", "D_minus_A", "E_minus_A", "D_minus_C",
+    }
+    # Two writes, not one: the boundary flush plus the remainder. A single
+    # file would mean the boundary never fired and the test proved nothing.
+    assert len(list((out / "ts_diff").rglob("*.parquet"))) == 2
+    # And every `.out` behind an already-flushed batch is released.
+    assert not any(path.exists() for path in paths.values())
+
+
+def test_a_batch_boundary_never_deletes_an_out_file_before_its_rows_are_written(
+    tmp_path, monkeypatch,
+):
+    # The ordering the whole batching scheme rests on: rows are flushed to
+    # disk BEFORE any file behind them is unlinked, at a boundary exactly as
+    # in the remainder. `.out` files are regenerable by re-running the model;
+    # the diff rows derived from them are not.
+    out = tmp_path / "out"
+    runs, paths = _many_model_diff_fixture(tmp_path, n_models=3)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(cli, "FLUSH_BATCH_SIZE", 2)
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    observed = []
+    original = cli.store.write_table
+
+    def spy(frame, out_dir, name, partition_by=None):
+        if name == "ts_diff":
+            observed.append((set(frame["model_id"]),
+                             [p for p in paths.values() if p.exists()]))
+        return original(frame, out_dir, name, partition_by=partition_by)
+
+    monkeypatch.setattr(cli.store, "write_table", spy)
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    assert len(observed) == 2
+    for models, alive in observed:
+        # Every file this flush's rows were derived from is still on disk at
+        # the moment of the write.
+        for model_id in models:
+            for variant in schema.VARIANTS:
+                assert paths[(model_id, variant)] in alive
+
+
 def test_multi_worker_runs_produce_the_same_results_as_a_single_worker(
     corpus_root, tmp_path, fake_engine,
 ):
@@ -851,6 +935,31 @@ def test_scalar_rows_carry_the_engine_version(corpus_root, tmp_path, fake_engine
 
     assert "engine_version" in scalars.columns
     assert scalars["engine_version"].notna().all()
+
+
+def test_the_scalars_value_column_is_numeric(corpus_root, tmp_path, fake_engine):
+    # `scalars` is long-format: one `value` column for every metric. Melting a
+    # string-valued key into it (a version banner, a timestamp, a routing-model
+    # or option echo) mixes types in one Arrow column and the write fails
+    # outright, taking the whole `run` stage with it.
+    #
+    # `NON_METRIC_SCALARS` is a DENYLIST, so this guarantee is not structural:
+    # a future string-valued addition to `rptparse.SCALAR_KEYS` that nobody
+    # remembers to list there re-breaks it. Pinned here rather than left as an
+    # incidental property of today's key set.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+
+    scalars = store.read_table(out, "scalars")
+
+    assert not scalars.empty
+    assert pd.api.types.is_numeric_dtype(scalars["value"])
+    # ... and stated against the key sets themselves, so the assertion still
+    # bites for a key no fixture report happens to populate.
+    melted = set(rptparse.SCALAR_KEYS) - cli.NON_METRIC_SCALARS
+    assert set(scalars["metric"]) == melted
+    assert not (melted & cli.NON_METRIC_SCALARS)
 
 
 # ---------------------------------------------------------------------------

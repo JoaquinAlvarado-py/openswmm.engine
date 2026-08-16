@@ -183,11 +183,24 @@ either operand is missing, or when the pairing is not commensurable:
   written against the echoes it also catches a corpus reference run under a
   surcharge method other than ours. It deliberately does not apply to
   `E - A`: that delta moving the surcharge method is the point of variant E.
+- **echoed option value vs. the variant's own intent** -- a delta is dropped
+  when either operand's `reported_node_continuity`,
+  `reported_anderson_accel` or `reported_surcharge_method` contradicts what
+  that variant's deck asked for. The engine silently ignores an unrecognised
+  option value, so an E run that actually executed under `EXTRAN` would make
+  `E - A` a subtraction of two identical configurations and publish it as
+  ~0 -- "the slot has no effect" when the slot was never enabled. A missing
+  echo is not a contradiction, and REF has no intent to contradict. This is
+  defence in depth on the anomaly report below: same mapping, both ends.
 
 `summary.md` publishes a per-metric table for each of the five feature axes,
 plus iteration-shift tables stratified two ways and a D/E surcharge-activity
 section:
 
+- **option anomalies** -- how many runs echoed an option value contradicting
+  their variant's intent, broken down by variant and option, and an explicit
+  statement when there are none. The console warning is seen once by one
+  operator; `summary.md` is the artifact that gets kept.
 - **routing model** -- the iteration-shift sections show `DYNWAVE` rows only.
 - **withheld pairings** -- the routing-model guard is deliberately stricter
   than the kind guard, so the report itemises what it cost, counted per
@@ -196,15 +209,22 @@ section:
   `routing_unknown` (actionable -- no `reported_routing_model` was recorded
   for one side, typically a store written before that column existed or an
   unreadable report). Only pairings that had both operand values and would
-  otherwise have been computed are counted. If the iteration sections come
+  otherwise have been computed are counted. A third line,
+  `no_baseline_row`, counts the opposite case: a delta that WAS computed but
+  has no variant A baseline to stratify it by (a `D - C` whose A run
+  crashed reads C and D only, and is perfectly valid). Those appear in the
+  iteration-shift tables under the `unknown` hardness bucket, so nothing
+  computed ever vanishes from both the table and the accounting. If the
+  iteration sections come
   out entirely empty the report says so outright, because four bare empty
   tables read as "the feature has no effect" when what happened is that
   nothing was measured.
 - **hardness** -- split by variant A's `avg_iterations_per_step` into
   `<= 2`, `2-4` and `> 4` (closed on the right; the three partition the
-  reals). Anderson cannot help a model that already converges in two
-  iterations, and this corpus is dominated by small decks, so a single
-  unstratified mean understates the feature exactly where it should pay off.
+  reals), plus `unknown` for a pairing with no usable A baseline. Anderson
+  cannot help a model that already converges in two iterations, and this
+  corpus is dominated by small decks, so a single unstratified mean
+  understates the feature exactly where it should pay off.
 - **surcharge activity** -- D and E act on the free-surface/surcharge
   transition, so their rows are split by whether the model actually
   surcharges. The proxy is variant A's `pct_steps_not_converging > 0`, or
@@ -216,7 +236,10 @@ section:
   no model (or fewer than three) is surcharge-active, the report **says so
   in words** rather than printing a near-zero `active` mean -- "the feature
   was not exercised" and "the feature has no effect" are different
-  conclusions, and a markdown table cannot tell them apart on its own.
+  conclusions, and a markdown table cannot tell them apart on its own. The
+  announcement is also made **per axis**: a store can hold fifty
+  surcharge-active models and still produce no `active` row for `D - C`, and
+  that axis would otherwise print `inactive` rows alone with no note.
 
 `ts_diff` carries all five time-series comparisons in one table, distinguished
 by its `comparison` column (`B_minus_A`, `C_minus_A`, `D_minus_A`,

@@ -511,7 +511,8 @@ STAGE_REPORT_STRINGS = {
         "anomaly_warning": (
             "WARNING: {n} run(s) across {n_models} model(s) report an option "
             "value that contradicts their variant's intent (the engine may "
-            "have silently ignored the option):"
+            "have silently ignored the option); every delta with such a run "
+            "on either side is withheld, and summary.md counts them:"
         ),
         "anomaly_row": "  {model_id} ({variant}): {option} expected {expected!r}, engine reported {reported!r}",
     },
@@ -525,7 +526,9 @@ STAGE_REPORT_STRINGS = {
         "anomaly_warning": (
             "ADVERTENCIA: {n} corrida(s) en {n_models} modelo(s) reportan un "
             "valor de opción que contradice la intención de su variante (el "
-            "motor pudo haber ignorado la opción silenciosamente):"
+            "motor pudo haber ignorado la opción silenciosamente); todo delta "
+            "con una corrida así en cualquiera de sus lados se retiene, y "
+            "summary.md los cuenta:"
         ),
         "anomaly_row": "  {model_id} ({variant}): {option} esperado {expected!r}, motor reportó {reported!r}",
     },
@@ -567,6 +570,11 @@ def stage_report(out_dir: Path, lang: str = "es") -> int:
     # because OptionsHandler.cpp silently ignores an unrecognised
     # NODE_CONTINUITY/ANDERSON_ACCEL value -- a typo would otherwise read as
     # "the feature has no effect" across the whole corpus.
+    #
+    # Printed here AND counted in summary.md (report.write_markdown recomputes
+    # it from `runs`), because this console line is seen once by whoever ran
+    # the stage while the summary is the artifact that gets kept and shared.
+    # `report.build_deltas` reads the same mapping and withholds the deltas.
     anomalies = report.option_anomalies(runs)
     if not anomalies.empty:
         n_models = anomalies["model_id"].nunique()

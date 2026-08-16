@@ -107,6 +107,69 @@ def _same(left, right) -> bool | None:
     return str(left).strip().upper() == str(right).strip().upper()
 
 
+#: Options whose engine-reported value can be checked against the variant's
+#: stated intent, keyed by the `runs` column that carries the echo
+#: (DefaultReportPlugin.cpp prints all three under the DYNWAVE-only Analysis
+#: Options block; rptparse.parse_scalars reads them into these columns).
+#: OptionsHandler.cpp silently ignores an unrecognised value for any of them
+#: -- no `else`, no warning -- so `options_applied` (what the harness's deck
+#: asked for) cannot alone prove the engine actually did it. Without this
+#: check, a typo in an option name or value would read as "the feature has
+#: no effect" across the whole corpus instead of as a broken deck.
+#:
+#: Defined here rather than beside `option_anomalies` because BOTH consume
+#: it: `option_anomalies` reports the contradiction to the operator, and
+#: `_commensurable` withholds the deltas computed from a contradicting run.
+#: One mapping, so a column renamed on one side cannot drift from the other.
+OPTION_ECHO_COLUMNS = {
+    "NODE_CONTINUITY": "reported_node_continuity",
+    "ANDERSON_ACCEL": "reported_anderson_accel",
+    "SURCHARGE_METHOD": "reported_surcharge_method",
+}
+
+#: The echo column the anchor-surcharge screen reads. Named through the
+#: mapping rather than spelled a second time.
+SURCHARGE_ECHO_COLUMN = OPTION_ECHO_COLUMNS["SURCHARGE_METHOD"]
+
+
+def echo_pivots(runs: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """model_id x variant tables for every option echo, keyed by column."""
+    return {column: _pivot(runs, column)
+            for column in OPTION_ECHO_COLUMNS.values()}
+
+
+def _contradicts_intent(model_id, variant: str,
+                        echoes: dict[str, pd.DataFrame]) -> bool:
+    """True when `variant`'s run echoed a value its own deck did not ask for.
+
+    The same mapping and the same comparison `option_anomalies` uses, so the
+    warning it prints and the deltas withheld here can never disagree.
+
+    REF is not screened: it is a third-party report the harness never
+    configured, so it has no intent to contradict. Its own confound -- a
+    reference run under a different surcharge method -- is what the
+    anchor-surcharge screen exists for.
+
+    A MISSING echo is never a contradiction: a KINWAVE, STEADY or FV run
+    never prints the DYNWAVE-only Analysis Options block at all, and a run
+    that failed before the block was written prints nothing either. Absence
+    is no evidence, and must not cost a computable delta.
+    """
+    intended = variants.OPTIONS.get(variant)
+    if not intended:
+        return False
+    for option, column in OPTION_ECHO_COLUMNS.items():
+        expected = intended.get(option)
+        if expected is None:
+            continue
+        reported = _lookup(echoes.get(column, pd.DataFrame()), model_id, variant)
+        if reported is None or pd.isna(reported):
+            continue
+        if str(reported).strip().upper() != str(expected).strip().upper():
+            return True
+    return False
+
+
 def _commensurable(
     metric: str,
     model_id,
@@ -114,11 +177,11 @@ def _commensurable(
     right: str,
     kinds: pd.DataFrame,
     routing: pd.DataFrame,
-    surcharge: pd.DataFrame,
+    echoes: dict[str, pd.DataFrame],
 ) -> bool:
     """True when `left - right` is a subtraction of two like quantities.
 
-    Three confounds are screened, each per-delta rather than per-row so one
+    Four confounds are screened, each per-delta rather than per-row so one
     bad pairing never costs an unrelated computable one:
 
     1. **Iteration counter kind.** Picard iterations and FV substeps are
@@ -138,6 +201,17 @@ def _commensurable(
        a corpus reference that happens to have been run under a different
        surcharge method than ours. It must NOT apply to `E - A`: that delta
        moving the surcharge method is the entire point of variant E.
+    4. **Echoed option value against the variant's own intent.** Defence in
+       depth on top of the `option_anomalies` warning, which only prints.
+       OptionsHandler.cpp silently ignores an unrecognised option value, so a
+       broken E deck runs as plain EXTRAN -- and `delta_e_minus_a` would then
+       be a subtraction of two IDENTICAL configurations, published as ~0 and
+       read as "the Dynamic Preissmann Slot has no effect" when the truth is
+       "the slot was never enabled". A conclusion-inverting failure, so the
+       delta is withheld rather than published. Applies to every metric, not
+       only the iteration ones: a misconfigured run corrupts its continuity
+       error just as thoroughly. A missing echo is not a contradiction, and
+       REF has no intent to contradict (see `_contradicts_intent`).
     """
     if metric in ITERATION_METRICS:
         if _same(_lookup(kinds, model_id, left),
@@ -151,8 +225,13 @@ def _commensurable(
                 return False
 
     if schema.VARIANT_REF in (left, right):
+        surcharge = echoes.get(SURCHARGE_ECHO_COLUMN, pd.DataFrame())
         if _same(_lookup(surcharge, model_id, left),
                  _lookup(surcharge, model_id, right)) is False:
+            return False
+
+    for variant in (left, right):
+        if _contradicts_intent(model_id, variant, echoes):
             return False
 
     return True
@@ -173,7 +252,7 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
 
     kinds = _pivot(runs, "iteration_metric_kind")
     routing = _pivot(runs, "reported_routing_model")
-    surcharge = _pivot(runs, "reported_surcharge_method")
+    echoes = echo_pivots(runs)
 
     families = runs.groupby("model_id")["family"].first()
     rows: list[dict] = []
@@ -196,7 +275,7 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
                 value_left, value_right = values[left], values[right]
                 usable = (pd.notna(value_left) and pd.notna(value_right)
                           and _commensurable(metric, model_id, left, right,
-                                             kinds, routing, surcharge))
+                                             kinds, routing, echoes))
                 row[column] = (value_left - value_right) if usable else pd.NA
 
             rows.append(row)
@@ -207,21 +286,10 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Engine-echoed option values vs. variant intent
 # ---------------------------------------------------------------------------
-
-#: Options whose engine-reported value can be checked against the variant's
-#: stated intent, keyed by the `runs` column that carries the echo
-#: (DefaultReportPlugin.cpp prints all three under the DYNWAVE-only Analysis
-#: Options block; rptparse.parse_scalars reads them into these columns).
-#: OptionsHandler.cpp silently ignores an unrecognised value for any of them
-#: -- no `else`, no warning -- so `options_applied` (what the harness's deck
-#: asked for) cannot alone prove the engine actually did it. Without this
-#: check, a typo in an option name or value would read as "the feature has
-#: no effect" across the whole corpus instead of as a broken deck.
-OPTION_ECHO_COLUMNS = {
-    "NODE_CONTINUITY": "reported_node_continuity",
-    "ANDERSON_ACCEL": "reported_anderson_accel",
-    "SURCHARGE_METHOD": "reported_surcharge_method",
-}
+#
+# `OPTION_ECHO_COLUMNS` is defined above, next to `_commensurable`: the same
+# mapping drives both the operator-facing report below and the withholding of
+# any delta computed from a contradicting run.
 
 ANOMALY_COLUMNS = ["model_id", "variant", "option", "expected", "reported"]
 
@@ -239,6 +307,11 @@ def option_anomalies(runs: pd.DataFrame) -> pd.DataFrame:
     A row with no echo (FV/STEADY/KINWAVE routing never prints the block at
     all) is not an anomaly: there is nothing to contradict, so it is silently
     skipped rather than flagged.
+
+    Reporting is only half the defence: `_commensurable` reads the same
+    `OPTION_ECHO_COLUMNS` mapping and withholds every delta computed from a
+    run listed here, so a silently-ignored option cannot be published as a
+    near-zero effect while this table names it.
     """
     if runs.empty:
         return pd.DataFrame(columns=ANOMALY_COLUMNS)
@@ -269,6 +342,31 @@ def option_anomalies(runs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=ANOMALY_COLUMNS)
 
 
+ANOMALY_SUMMARY_COLUMNS = ["variant", "option", "runs", "models"]
+
+
+def anomaly_summary(anomalies: pd.DataFrame) -> pd.DataFrame:
+    """`option_anomalies` folded to one row per (variant, option).
+
+    Broken down by variant AND option because the two answer different
+    questions: which variant's deck failed to take effect (E alone points at
+    the Dynamic Preissmann Slot; every variant at once points at the deck
+    writer), and which option the engine actually resolved differently. A
+    single total would answer neither.
+
+    Counted per run and per distinct model, for the same reason the exclusion
+    ledger separates pairings from models: one broken deck applied to four
+    hundred models is one bug, and a reader must be able to see that.
+    """
+    if anomalies.empty:
+        return pd.DataFrame(columns=ANOMALY_SUMMARY_COLUMNS)
+
+    grouped = anomalies.groupby(["variant", "option"], observed=True)
+    frame = grouped.agg(runs=("model_id", "size"),
+                        models=("model_id", "nunique")).reset_index()
+    return frame.sort_values(["variant", "option"], ignore_index=True)
+
+
 # ---------------------------------------------------------------------------
 # Stratification
 # ---------------------------------------------------------------------------
@@ -287,6 +385,18 @@ HARDNESS_BUCKETS = (
 )
 
 HARDNESS_LABELS = [label for label, _ in HARDNESS_BUCKETS]
+
+#: The bucket for a pairing that is computable but cannot be stratified: no
+#: variant A row at all (a crashed baseline), an A run that was not routed by
+#: DYNWAVE, or an A run with no iteration count. `D - C` needs neither an A
+#: value nor an A run to be valid -- it reads C and D only -- so bucketing it
+#: by `value_a` alone would silently drop a real measurement from the table.
+#: A status-like data value, verbatim in both languages.
+HARDNESS_UNKNOWN = "unknown"
+
+#: Bucket order in the iteration-shift tables: the three hardness strata,
+#: then the unstratifiable remainder last so it never displaces a real one.
+REPORTED_HARDNESS_LABELS = HARDNESS_LABELS + [HARDNESS_UNKNOWN]
 
 
 def hardness_bucket(value) -> str | None:
@@ -323,18 +433,56 @@ def dynwave_models(runs: pd.DataFrame) -> set:
     return set(routed["model_id"])
 
 
+def reported_hardness(iterations: pd.DataFrame, routed: set) -> pd.Series:
+    """The hardness bucket each iteration-delta row is filed under.
+
+    `hardness_bucket(value_a)` when the model HAS a usable baseline --
+    a variant A run this store knows was routed by DYNWAVE, carrying an
+    iteration count -- and `HARDNESS_UNKNOWN` otherwise.
+
+    The `routed` gate is not redundant with a present `value_a`: a KINWAVE
+    A run still prints an `Average Iterations per Step` line, so bucketing on
+    its value would sort a model by a number that counts nothing Picard-
+    shaped. Such a model lands in `unknown` rather than in a hardness stratum
+    it did not earn.
+
+    One function so the tables and the exclusion ledger agree by
+    construction: every pairing the tables file under `unknown` is exactly
+    the set the ledger reports as `no_baseline_row`.
+    """
+    if iterations.empty:
+        return pd.Series(dtype="object")
+    values = (iterations["value_a"] if "value_a" in iterations.columns
+              else pd.Series(pd.NA, index=iterations.index))
+    buckets = [
+        (hardness_bucket(value) if model_id in routed else None) or HARDNESS_UNKNOWN
+        for model_id, value in zip(iterations["model_id"], values)
+    ]
+    return pd.Series(buckets, index=iterations.index, dtype="object")
+
+
 #: Why a pairing that had BOTH operand values still produced no iteration
-#: delta. Data values, verbatim in both languages.
+#: delta -- plus one cause (`no_baseline_row`) for a pairing that WAS
+#: computed but could not be stratified. Data values, verbatim in both
+#: languages.
 #:
-#: The two are kept apart because they mean opposite things to an operator.
-#: `not_dynwave` is expected and healthy -- a KINWAVE, STEADY or FV run has
-#: no Picard iteration count to compare, and excluding it is the harness
-#: working. `routing_unknown` is actionable: nothing recorded what routed
-#: the run, so the delta was withheld for lack of provenance rather than
-#: because the feature did nothing. Collapsing them into one "excluded"
+#: The three are kept apart because they mean different things to an
+#: operator. `not_dynwave` is expected and healthy -- a KINWAVE, STEADY or FV
+#: run has no Picard iteration count to compare, and excluding it is the
+#: harness working. `routing_unknown` is actionable: nothing recorded what
+#: routed the run, so the delta was withheld for lack of provenance rather
+#: than because the feature did nothing. Collapsing them into one "excluded"
 #: number would hide the second inside the first.
+#:
+#: `no_baseline_row` is neither: the delta EXISTS and is published. `D - C`
+#: reads C and D only, so a model whose A run crashed still yields a valid
+#: one -- it simply cannot be sorted into a hardness stratum defined by
+#: variant A. It is listed here so a pairing that is real but unstratifiable
+#: is visible in the accounting instead of merely appearing in an `unknown`
+#: row someone has to notice.
 EXCLUSION_NOT_DYNWAVE = "not_dynwave"
 EXCLUSION_ROUTING_UNKNOWN = "routing_unknown"
+EXCLUSION_NO_BASELINE = "no_baseline_row"
 
 EXCLUSION_COLUMNS = ["cause", "pairings", "models"]
 
@@ -344,7 +492,8 @@ def iteration_exclusions(
     runs: pd.DataFrame,
     metric: str = "avg_iterations_per_step",
 ) -> pd.DataFrame:
-    """Iteration deltas withheld by the routing-model guard, by cause.
+    """Iteration deltas withheld by the routing-model guard, by cause, plus
+    the computed ones that could not be stratified.
 
     Counted per **(model, comparison) pairing**, not per model: the thing
     that was not produced is a delta, and one model contributes six of them.
@@ -362,17 +511,30 @@ def iteration_exclusions(
     something else counts as `not_dynwave`, because that pairing would have
     been excluded even with complete provenance. Pairings whose two sides are
     both known `DYNWAVE` are not counted at all: they were dropped by the
-    iteration-kind or anchor-surcharge guard, which have their own caveats.
+    iteration-kind, anchor-surcharge or option-echo guard, which have their
+    own caveats.
+
+    `no_baseline_row` is the one cause counted over deltas that WERE
+    computed: the pairing produced a number, but the model has no DYNWAVE
+    variant A baseline to stratify it by, so the iteration-shift tables file
+    it under the `unknown` hardness bucket. Without this line a `D - C` from
+    a model whose A run crashed would be published in a bucket named
+    `unknown` and appear in no accounting at all.
     """
     if deltas.empty or "metric" not in deltas.columns:
         return pd.DataFrame(columns=EXCLUSION_COLUMNS)
 
     routing = _pivot(runs, "reported_routing_model")
     frame = deltas[deltas["metric"] == metric]
+    # Read positionally, not by label: `deltas` can arrive with a
+    # non-unique index (a frame re-read from its partitioned dataset and
+    # concatenated), where a label lookup would return a Series.
+    hardness = list(reported_hardness(frame, dynwave_models(runs)))
     hits: dict[str, list] = {EXCLUSION_NOT_DYNWAVE: [],
-                             EXCLUSION_ROUTING_UNKNOWN: []}
+                             EXCLUSION_ROUTING_UNKNOWN: [],
+                             EXCLUSION_NO_BASELINE: []}
 
-    for _, row in frame.iterrows():
+    for position, (_, row) in enumerate(frame.iterrows()):
         for column, left, right in DELTA_SPECS:
             if column not in row.index:
                 continue
@@ -380,6 +542,11 @@ def iteration_exclusions(
             if any(value is None or pd.isna(value) for value in values):
                 continue
             if pd.notna(row.get(column)):
+                # Computed, so nothing was withheld -- but a pairing with no
+                # baseline to stratify against still has to be accounted for
+                # somewhere, or it is only ever visible as an `unknown` row.
+                if hardness[position] == HARDNESS_UNKNOWN:
+                    hits[EXCLUSION_NO_BASELINE].append(row["model_id"])
                 continue
 
             models = [_lookup(routing, row["model_id"], side)
@@ -483,6 +650,25 @@ MARKDOWN_STRINGS = {
         "coverage_heading": "## Coverage",
         "coverage_header": "| status | runs |",
         "coverage_sep": "| --- | --- |",
+        "anomaly_heading": "## Option echoes contradicting variant intent",
+        "anomaly_header": "| variant | option | runs | models |",
+        "anomaly_sep": "| --- | --- | --- | --- |",
+        "anomaly_intro": [
+            "The engine silently ignores an unrecognised option value, so a",
+            "deck that failed to take effect would otherwise read as *the",
+            "feature has no effect* across the whole corpus. Every run below",
+            "echoed a value its own deck did not ask for; every delta with",
+            "such a run on either side is withheld rather than published.",
+        ],
+        "anomaly_total": [
+            "**{n} run(s) across {n_models} model(s) echoed an option value",
+            "contradicting their variant's intent.** Treat the affected axes",
+            "as unmeasured, not as measured-and-flat, and fix the deck before",
+            "reading anything else here.",
+        ],
+        "anomaly_none": [
+            "No run echoed an option value contradicting its variant's intent.",
+        ],
         "b_minus_a_heading": "## B - A by metric (Anderson acceleration effect)",
         "c_minus_a_heading": "## C - A by metric (Crank-Nicolson continuity effect)",
         "d_minus_c_heading": "## D - C by metric (incremental Anderson under Crank-Nicolson)",
@@ -503,7 +689,11 @@ MARKDOWN_STRINGS = {
             "Counted per (model, comparison) pairing, over pairings that had",
             "both operand values and would otherwise have been computed.",
             "`not_dynwave` is expected and healthy: a KINWAVE, STEADY or FV run",
-            "has no Picard iteration count to compare.",
+            "has no Picard iteration count to compare. `no_baseline_row` is the",
+            "one line counted over deltas that WERE computed: the pairing (a",
+            "`D - C` whose A run crashed, say) produced a number, but has no",
+            "variant A baseline to stratify it by, so it appears in the",
+            "iteration-shift tables under the `unknown` hardness bucket.",
         ],
         "iter_excluded_none": [
             "No iteration delta was withheld by the routing-model guard.",
@@ -550,6 +740,15 @@ MARKDOWN_STRINGS = {
             "them is anecdote, not evidence; the `active` rows below are shown",
             "for inspection, not for a conclusion.",
         ],
+        "surcharge_axis_empty": [
+            "**The {axis} axis has no `active` row: this store has",
+            "surcharge-active models, but not one of them produced a {axis}",
+            "delta.** Nothing was measured on that axis where D and E actually",
+            "act, so read its `inactive` rows -- and its silence -- as *not",
+            "measured*, never as *no effect*. The announcement is per axis",
+            "because one axis can come up empty while its neighbours are fully",
+            "populated.",
+        ],
         "caveats_heading": "## Caveats",
         "caveat_estimate": [
             "- `total_iterations_est` is a derived **estimate**",
@@ -585,6 +784,15 @@ MARKDOWN_STRINGS = {
             "  written against the echoes, so it also catches a reference run",
             "  under a surcharge method other than ours.",
         ],
+        "caveat_option_echo": [
+            "- A delta is dropped when either side's `reported_*` echo",
+            "  contradicts what its variant's deck asked for. The engine",
+            "  silently ignores an unrecognised option value, so an E run that",
+            "  actually executed under `EXTRAN` would make `E - A` a",
+            "  subtraction of two identical configurations and publish it as",
+            "  ~0. A missing echo is not a contradiction; REF has no intent to",
+            "  contradict.",
+        ],
         "caveat_time_series": [
             "- Time series are compared only between our own runs. The external",
             "  anchor is summary-level.",
@@ -595,6 +803,27 @@ MARKDOWN_STRINGS = {
         "coverage_heading": "## Cobertura",
         "coverage_header": "| estado | corridas |",
         "coverage_sep": "| --- | --- |",
+        "anomaly_heading": "## Ecos de opciones que contradicen la intención de la variante",
+        "anomaly_header": "| variante | opción | corridas | modelos |",
+        "anomaly_sep": "| --- | --- | --- | --- |",
+        "anomaly_intro": [
+            "El motor ignora silenciosamente un valor de opción no reconocido,",
+            "así que un deck que no tuvo efecto se leería como *la",
+            "característica no tiene efecto* en todo el corpus. Cada corrida de",
+            "abajo reportó un valor que su propio deck no pidió; todo delta con",
+            "una corrida así en cualquiera de sus lados se retiene en vez de",
+            "publicarse.",
+        ],
+        "anomaly_total": [
+            "**{n} corrida(s) en {n_models} modelo(s) reportaron un valor de",
+            "opción que contradice la intención de su variante.** Trate los",
+            "ejes afectados como no medidos, no como medidos-y-planos, y",
+            "corrija el deck antes de leer cualquier otra cosa aquí.",
+        ],
+        "anomaly_none": [
+            "Ninguna corrida reportó un valor de opción que contradiga la "
+            "intención de su variante.",
+        ],
         "b_minus_a_heading": "## B - A por métrica (efecto de la aceleración de Anderson)",
         "c_minus_a_heading": "## C - A por métrica (efecto de continuidad de Crank-Nicolson)",
         "d_minus_c_heading": "## D - C por métrica (Anderson incremental sobre Crank-Nicolson)",
@@ -616,6 +845,11 @@ MARKDOWN_STRINGS = {
             "ambos valores operandos y que de otro modo se habrían calculado.",
             "`not_dynwave` es esperado y sano: una corrida KINWAVE, STEADY o FV",
             "no tiene un conteo de iteraciones de Picard que comparar.",
+            "`no_baseline_row` es la única línea contada sobre deltas que SÍ se",
+            "calcularon: el par (por ejemplo un `D - C` cuya corrida A falló)",
+            "produjo un número, pero no tiene una línea base de la variante A",
+            "para estratificarlo, así que aparece en las tablas de cambio de",
+            "iteraciones bajo el bucket de dificultad `unknown`.",
         ],
         "iter_excluded_none": [
             "El filtro de modelo de ruteo no retuvo ningún delta de iteraciones.",
@@ -638,7 +872,7 @@ MARKDOWN_STRINGS = {
             "refuta nada.",
         ],
         "surcharge_heading": "## D y E por actividad de sobrecarga",
-        "surcharge_header": "| axis | surcharge | métrica | modelos | media | mediana |",
+        "surcharge_header": "| eje | sobrecarga | métrica | modelos | media | mediana |",
         "surcharge_sep": "| --- | --- | --- | --- | --- | --- |",
         "surcharge_proxy": [
             "Un modelo cuenta como `active` cuando su corrida de la variante A",
@@ -663,6 +897,15 @@ MARKDOWN_STRINGS = {
             "**Solo {n} modelo(s) con sobrecarga activa en este almacén.**",
             "Cualquier media sobre ellos es anécdota, no evidencia; las filas",
             "`active` de abajo se muestran para inspección, no para concluir.",
+        ],
+        "surcharge_axis_empty": [
+            "**El eje {axis} no tiene ninguna fila `active`: este almacén sí",
+            "tiene modelos con sobrecarga activa, pero ninguno de ellos produjo",
+            "un delta {axis}.** No se midió nada en ese eje donde D y E",
+            "realmente actúan, así que lea sus filas `inactive` -- y su",
+            "silencio -- como *no medido*, nunca como *sin efecto*. El aviso es",
+            "por eje porque un eje puede quedar vacío mientras sus vecinos",
+            "están llenos.",
         ],
         "caveats_heading": "## Advertencias",
         "caveat_estimate": [
@@ -701,6 +944,15 @@ MARKDOWN_STRINGS = {
             "  regla se escribe contra los ecos, de modo que también detecta una",
             "  referencia corrida con un método de sobrecarga distinto al",
             "  nuestro.",
+        ],
+        "caveat_option_echo": [
+            "- Un delta se descarta cuando el eco `reported_*` de cualquiera de",
+            "  los dos lados contradice lo que pidió el deck de su variante. El",
+            "  motor ignora silenciosamente un valor de opción no reconocido,",
+            "  así que una corrida E que en realidad se ejecutó bajo `EXTRAN`",
+            "  haría de `E - A` una resta de dos configuraciones idénticas y la",
+            "  publicaría como ~0. Un eco ausente no es una contradicción; REF",
+            "  no tiene intención que contradecir.",
         ],
         "caveat_time_series": [
             "- Las series temporales se comparan solo entre nuestras propias",
@@ -773,6 +1025,13 @@ def write_markdown(
             lines.append(f"| {status} | {count} |")
         lines.append("")
 
+    # Unconditional, and early: the one signal that catches a silently
+    # ignored option belongs in the artifact people keep, not only in the
+    # console of whoever happened to run the stage. A store with no anomaly
+    # says so outright -- an absent section would be indistinguishable from
+    # a harness that never looked.
+    lines += _anomaly_section(runs, strings)
+
     if not deltas.empty:
         # One section per axis rather than columns of one table, so no axis
         # reads as derived from, or secondary to, another. D gets both of
@@ -795,19 +1054,18 @@ def write_markdown(
                     )
             lines.append("")
 
-        # Only DYNWAVE baselines participate: a KINWAVE or STEADY run still
-        # prints an iteration count, and pooling those into a median makes
-        # the median describe a quantity nobody named. `build_deltas`
-        # already nulls those deltas; filtering here as well keeps the
-        # section's contract stated where a reader can see it.
+        # Only DYNWAVE baselines are STRATIFIED: a KINWAVE or STEADY run
+        # still prints an iteration count, and bucketing on it would sort a
+        # model by a number that counts nothing Picard-shaped. But the row is
+        # no longer dropped for it. `build_deltas` has already nulled every
+        # delta whose two sides are not both known DYNWAVE, so a row that
+        # survives to here carries a real measurement -- and a `D - C` needs
+        # no A run at all. Dropping such a row for want of an A baseline lost
+        # a computed delta from the table AND from the exclusion ledger; it
+        # is filed under `unknown` hardness instead, and counted there.
         iterations = deltas[deltas.metric == "avg_iterations_per_step"]
-        routed = dynwave_models(runs)
-        iterations = iterations[iterations["model_id"].isin(routed)]
-        if "value_a" in iterations.columns:
-            hardness = iterations["value_a"].map(hardness_bucket)
-        else:
-            hardness = pd.Series(index=iterations.index, dtype="object")
-        iterations = iterations.assign(_hardness=hardness)
+        iterations = iterations.assign(
+            _hardness=reported_hardness(iterations, dynwave_models(runs)))
 
         emitted = 0
         for delta_col, heading_key in ITER_SECTIONS:
@@ -824,7 +1082,7 @@ def write_markdown(
             # the (already-filtered) `iterations` frame, as spurious
             # empty-group rows. observed=True avoids that in both cases.
             for family, group in iterations.groupby("family", observed=True):
-                for bucket in HARDNESS_LABELS:
+                for bucket in REPORTED_HARDNESS_LABELS:
                     column = _delta_column(
                         group[group["_hardness"] == bucket], delta_col).abs()
                     if column.empty:
@@ -850,12 +1108,46 @@ def write_markdown(
     lines += strings["caveat_routing_model"]
     lines += strings["caveat_hardness"]
     lines += strings["caveat_surcharge_ref"]
+    lines += strings["caveat_option_echo"]
     lines += strings["caveat_time_series"]
     lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def _anomaly_section(runs: pd.DataFrame, strings: dict) -> list[str]:
+    """Runs whose engine-reported option value contradicts variant intent.
+
+    The console warning `stage_report` prints is seen once, by one operator;
+    `summary.md` is the artifact that gets kept and shared. A silently
+    ignored option is the failure most likely to invert a conclusion -- an E
+    deck that never took effect publishes `E - A ~ 0` -- so the count belongs
+    in the document, broken down by variant and option, and the absence of
+    any anomaly is stated rather than left to be inferred from a missing
+    table.
+    """
+    anomalies = option_anomalies(runs) if not runs.empty else pd.DataFrame()
+    lines = [strings["anomaly_heading"], ""]
+    lines += strings["anomaly_intro"]
+    lines.append("")
+
+    if anomalies.empty:
+        lines += strings["anomaly_none"]
+        lines.append("")
+        return lines
+
+    lines += [line.format(n=len(anomalies),
+                          n_models=anomalies["model_id"].nunique())
+              for line in strings["anomaly_total"]]
+    lines.append("")
+    lines += [strings["anomaly_header"], strings["anomaly_sep"]]
+    for _, row in anomaly_summary(anomalies).iterrows():
+        lines.append(f"| {row['variant']} | {row['option']} | "
+                     f"{row['runs']} | {row['models']} |")
+    lines.append("")
+    return lines
 
 
 def _exclusion_section(
@@ -909,6 +1201,13 @@ def _surcharge_section(
     only an `inactive` mean would read as "the feature has no effect", when
     what actually happened is that the feature was never exercised -- and a
     markdown table cannot tell those apart on its own.
+
+    The announcement is made PER AXIS as well as globally. A store can hold
+    fifty surcharge-active models and still produce no `active` row for
+    `D - C` -- every one of those deltas null for its own reason -- and the
+    global note, which only fires when the active set itself is empty, would
+    stay silent while that axis printed `inactive` rows alone: exactly the
+    misreading this section exists to block.
     """
     active = surcharge_active_models(runs, elements) & set(deltas["model_id"])
     lines = [strings["surcharge_heading"], ""]
@@ -927,7 +1226,9 @@ def _surcharge_section(
         (SURCHARGE_ACTIVE, deltas[deltas["model_id"].isin(active)]),
         (SURCHARGE_INACTIVE, deltas[~deltas["model_id"].isin(active)]),
     )
+    empty_axes: list[str] = []
     for axis, delta_col in SURCHARGE_SECTIONS:
+        emitted = 0
         for stratum, subset in strata:
             if subset.empty or delta_col not in subset.columns:
                 continue
@@ -939,7 +1240,19 @@ def _surcharge_section(
                     f"| {axis} | {stratum} | {metric} | {len(column)} | "
                     f"{column.mean():.4f} | {column.median():.4f} |"
                 )
+                if stratum == SURCHARGE_ACTIVE:
+                    emitted += 1
+        if active and not emitted:
+            empty_axes.append(axis)
     lines.append("")
+
+    # After the table, so the notes never interrupt it. Only when the store
+    # HAS surcharge-active models: when it has none, the global note above
+    # already says so once, and repeating it per axis would bury it.
+    for axis in empty_axes:
+        lines += [line.format(axis=axis) for line in strings["surcharge_axis_empty"]]
+        lines.append("")
+
     return lines
 
 

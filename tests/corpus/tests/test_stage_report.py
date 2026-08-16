@@ -271,3 +271,28 @@ def test_report_stays_silent_when_every_run_echoes_its_intended_option(
     captured = capsys.readouterr().out
     assert "NODE_CONTINUITY" not in captured
     assert "ANDERSON_ACCEL" not in captured
+
+
+def test_the_stage_carries_the_anomaly_into_the_summary_not_just_the_console(
+    tmp_path,
+):
+    # The console line scrolls away; `summary.md` is what gets shared.
+    out = tmp_path / "out"
+    store.write_table(_option_echo_runs(c_reported_node_continuity="EXPLICIT"),
+                      out, "runs", partition_by=["family"])
+
+    cli.stage_report(out)
+
+    text = (out / "summary.md").read_text(encoding="utf-8")
+    strings = report.MARKDOWN_STRINGS["es"]
+
+    assert strings["anomaly_heading"] in text
+    assert f"| {schema.VARIANT_C} | NODE_CONTINUITY | 1 | 1 |" in text
+
+
+def test_a_clean_store_states_the_absence_of_anomalies_in_the_summary(store_dir):
+    cli.stage_report(store_dir)
+
+    text = (store_dir / "summary.md").read_text(encoding="utf-8")
+
+    assert "\n".join(report.MARKDOWN_STRINGS["es"]["anomaly_none"]) in text
