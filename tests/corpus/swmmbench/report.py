@@ -144,7 +144,11 @@ def option_anomalies(runs: pd.DataFrame) -> pd.DataFrame:
             continue
         for _, row in executed.iterrows():
             reported = row.get(echo_column)
-            if reported is None or (isinstance(reported, float) and pd.isna(reported)):
+            # `pd.isna` alone covers None, float NaN, NaT and `pd.NA` -- the
+            # narrower `isinstance(reported, float)` guard missed `pd.NA`,
+            # which would stringify to "<NA>" and flag a false anomaly on
+            # every row whose echo column happened to hold it.
+            if reported is None or pd.isna(reported):
                 continue
             expected = variants.OPTIONS.get(row["variant"], {}).get(option)
             if expected is None:

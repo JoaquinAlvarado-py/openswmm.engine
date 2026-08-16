@@ -140,6 +140,11 @@ def test_d_differs_from_c_only_in_anderson_accel():
     c = variants.OPTIONS[schema.VARIANT_C]
     d = variants.OPTIONS[schema.VARIANT_D]
 
+    # Equal key sets first: `for k in c` alone would silently ignore a key
+    # present in D but absent from C, so a stray extra option in D would
+    # read as "differs only in ANDERSON_ACCEL".
+    assert set(c) == set(d)
+
     differing = {k for k in c if c[k] != d[k]}
 
     assert differing == {"ANDERSON_ACCEL"}
@@ -150,6 +155,8 @@ def test_d_differs_from_c_only_in_anderson_accel():
 def test_e_differs_from_a_only_in_surcharge_method():
     a = variants.OPTIONS[schema.VARIANT_A]
     e = variants.OPTIONS[schema.VARIANT_E]
+
+    assert set(a) == set(e)
 
     differing = {k for k in a if a[k] != e[k]}
 
