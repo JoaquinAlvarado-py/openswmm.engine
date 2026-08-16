@@ -535,6 +535,25 @@ def coverage_anomalies(ts_diff: pd.DataFrame) -> pd.DataFrame:
             .sort_values("comparison", ignore_index=True))
 
 
+def coverage_anomaly_models(ts_diff: pd.DataFrame) -> int:
+    """Distinct models with at least one incomplete-overlap comparison.
+
+    NOT the sum of `coverage_anomalies`'s `models` column. That column is a
+    per-comparison count, and one truncated run truncates every comparison it
+    takes part in, so summing it reports a single stopped simulation as
+    "5 model(s)" -- inflating the headline by up to the number of comparisons
+    while the table beneath it says 1 five times over. Counted across
+    comparisons here, from the same mask the table is built from, so the
+    headline and the table are two views of one set rather than two
+    computations that can disagree.
+    """
+    if ts_diff is None or ts_diff.empty:
+        return 0
+    if not {"comparison", "model_id"} <= set(ts_diff.columns):
+        return 0
+    return int(ts_diff[_incomplete_coverage(ts_diff)]["model_id"].nunique())
+
+
 def coverage_was_assessed(ts_diff: pd.DataFrame) -> bool:
     """True when `ts_diff` carries coverage evidence at all.
 
@@ -1536,7 +1555,11 @@ def _coverage_section(ts_diff: pd.DataFrame | None, strings: dict) -> list[str]:
         lines.append("")
         return lines
 
-    lines += [line.format(n_models=int(anomalies["models"].sum()),
+    # Distinct models ACROSS the comparisons, not the sum of the table's
+    # per-comparison counts: a single truncated run is flagged by every
+    # comparison it takes part in, and summing them would announce one
+    # stopped simulation as five models.
+    lines += [line.format(n_models=coverage_anomaly_models(ts_diff),
                           n_comparisons=len(anomalies))
               for line in strings["coverage_anomaly_total"]]
     lines.append("")

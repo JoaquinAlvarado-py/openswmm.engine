@@ -2,12 +2,14 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from swmmbench import cli, corpus, outdiff, report, rptparse, schema, store
+from swmmbench import (cli, corpus, outdiff, report, rptparse, schema, store,
+                       variants)
 
 DECK = "[TITLE]\nt\n\n[OPTIONS]\nFLOW_UNITS CFS\n"
 
@@ -1252,6 +1254,160 @@ def test_a_non_git_corpus_sweeps_with_the_dependency_marked_unpinned(
     assert set(runs["corpus_commit"]) == {corpus.UNPINNED_CORPUS}
 
 
+def test_a_rewritten_deck_re_runs_even_when_the_corpus_is_unpinned(
+    corpus_root, tmp_path, fake_engine,
+):
+    # `UNPINNED_CORPUS` is a CONSTANT, so with it as the whole dependency
+    # identity nothing about the corpus could ever invalidate a resumed
+    # sweep: an operator could rewrite a deck, re-run `inventory` and `run`,
+    # and be told every case was already done while `runs` kept the stale
+    # `inp_sha256`. The deck's own hash is folded in behind the sentinel.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+
+    (corpus_root / "EPA" / "m1.inp").write_text(
+        DECK + "IGNORE_RAINFALL       YES\n", encoding="latin-1")
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+
+    runs = store.read_table(out, "runs")
+    edited = runs[runs["model_id"] == "EPA/m1"]
+    untouched = runs[runs["model_id"] == "LID/m2"]
+
+    # The edited model re-ran all five variants and its anchor; the model
+    # nobody touched was still recognised as done.
+    assert len(edited) == 12
+    assert edited["case_id"].nunique() == 12
+    assert edited["inp_sha256"].nunique() == 2
+    assert len(untouched) == 6
+    # And the degraded identity still cannot masquerade as a pin.
+    assert set(runs["corpus_commit"]) == {corpus.UNPINNED_CORPUS}
+
+
+def test_an_unchanged_unpinned_corpus_still_resumes(
+    corpus_root, tmp_path, fake_engine,
+):
+    # The other half: folding the deck hash in must not make every sweep
+    # re-run everything.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+    before = len(store.read_table(out, "runs"))
+
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+
+    assert len(store.read_table(out, "runs")) == before
+
+
+def test_a_degraded_dependency_identity_never_equals_a_commit():
+    pinned = corpus.dependency_id("git:1111", "abcd")
+    unpinned = corpus.dependency_id(corpus.UNPINNED_CORPUS, "abcd")
+
+    # A commit already covers the deck and every file it references, so
+    # nothing is folded in behind it.
+    assert pinned == "git:1111"
+    assert unpinned.startswith(corpus.UNPINNED_CORPUS)
+    assert not unpinned.startswith(corpus.GIT_COMMIT_PREFIX)
+    assert unpinned != corpus.dependency_id(corpus.UNPINNED_CORPUS, "efgh")
+
+
+def test_the_run_stage_itself_warns_that_a_sweep_is_unpinned(
+    corpus_root, tmp_path, fake_engine, capsys,
+):
+    # `inventory` and `run` are separate invocations in the documented
+    # workflow, and `run` prefers the identity already recorded on `models`,
+    # so it never called `commit_sha` and printed nothing at all -- leaving
+    # the operator kicking off a multi-hour sweep the one person not told.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    capsys.readouterr()  # discard whatever `inventory` said
+
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+
+    printed = capsys.readouterr().out
+    assert cli.UNPINNED_SWEEP_WARNING in printed
+    # It says what is degraded and what follows from it, not merely that
+    # something is.
+    assert corpus.UNPINNED_CORPUS in printed
+    assert "republish" in printed
+
+
+@requires_git
+def test_a_pinned_sweep_does_not_warn(git_corpus, tmp_path, fake_engine, capsys):
+    out = tmp_path / "out"
+    cli.stage_inventory(git_corpus, out)
+    capsys.readouterr()
+
+    cli.stage_run(git_corpus, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+
+    assert cli.UNPINNED_SWEEP_WARNING not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# The variant's option set is part of the case identity
+# ---------------------------------------------------------------------------
+
+
+def test_editing_a_variants_option_set_re_runs_that_variant_alone(
+    corpus_root, tmp_path, fake_engine, monkeypatch,
+):
+    # `variants.OPTIONS` has been edited several times in this project's
+    # life. Keyed on the letter alone, a `B` run recorded before an edit and
+    # a `B` run after it are one case, so the second reads as "already done"
+    # and two materially different units of work share an id.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+    before = len(store.read_table(out, "runs"))
+
+    monkeypatch.setitem(variants.OPTIONS, schema.VARIANT_B,
+                        {**variants.OPTIONS[schema.VARIANT_B],
+                         "DPS_ALPHA": "9.0"})
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1,
+                  limit=None)
+
+    runs = store.read_table(out, "runs")
+
+    # Exactly B re-ran, once per model: the other variants' option sets did
+    # not move, so over-invalidation is not the fix either.
+    assert len(runs) == before + 2
+    assert runs[runs["variant"] == schema.VARIANT_B]["case_id"].nunique() == 4
+    for variant in (schema.VARIANT_A, schema.VARIANT_C, schema.VARIANT_D,
+                    schema.VARIANT_E, schema.VARIANT_REF):
+        assert runs[runs["variant"] == variant]["case_id"].nunique() == 2, variant
+
+
+def test_an_option_set_fingerprint_tracks_the_values_not_their_order():
+    base = variants.options_id(schema.VARIANT_A)
+
+    assert base == variants.options_id(schema.VARIANT_A)
+    assert base != variants.options_id(schema.VARIANT_B)
+    assert base.startswith(variants.OPTIONS_ID_PREFIX)
+    # REF is parsed, never run with options, so nothing about `OPTIONS`
+    # should ever re-read the anchors.
+    assert variants.options_id(schema.VARIANT_REF) == variants.options_id("nope")
+
+
+def test_reordering_an_option_set_leaves_every_existing_case_valid(monkeypatch):
+    before = variants.options_id(schema.VARIANT_A)
+    reordered = dict(reversed(list(variants.OPTIONS[schema.VARIANT_A].items())))
+    monkeypatch.setitem(variants.OPTIONS, schema.VARIANT_A, reordered)
+
+    assert variants.options_id(schema.VARIANT_A) == before
+
+    monkeypatch.setitem(variants.OPTIONS, schema.VARIANT_A,
+                        {**reordered, "DPS_ALPHA": "9.0"})
+    assert variants.options_id(schema.VARIANT_A) != before
+
+
 # ---------------------------------------------------------------------------
 # `case_id` travels to every derived table
 # ---------------------------------------------------------------------------
@@ -1481,3 +1637,110 @@ def test_a_batch_with_no_coverage_at_all_still_writes_a_matching_fragment(
     assert ts_diff["coverage_fraction"].isna().any()
     assert ts_diff["coverage_fraction"].notna().any()
     assert report.coverage_anomalies(ts_diff).empty
+
+
+def test_an_all_agreeing_batch_does_not_poison_a_later_divergent_one(
+    tmp_path, monkeypatch,
+):
+    # A flush in which every comparison agreed within tolerance has no first
+    # divergence at all, so `first_div_period` and `first_div_time` are null
+    # across the whole batch -- entirely ordinary on a corpus of small decks,
+    # and certain for a single-model batch. Unconformed, that fragment infers
+    # Arrow's `null` type, and a later fragment carrying an actual divergence
+    # writes `int64` and `timestamp`; the DATASET then stops reading, with
+    # `Unsupported cast from int64 to null`, taking the whole report stage
+    # (which reads `ts_diff` unconditionally) down with it.
+    out = tmp_path / "out"
+    runs, _bad, _good = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+
+    # The AGREEING batch is written FIRST, deliberately: that is the order
+    # that used to fail. Written the other way round the bug is invisible,
+    # so a test that happened to do so would pass against it.
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    first_batch = store.read_table(out, "ts_diff")
+    assert not first_batch.empty
+    assert first_batch["first_div_period"].isna().all()
+    assert first_batch["first_div_time"].isna().all()
+
+    second = tmp_path / "second"
+    second.mkdir()
+    runs2, _bad2, _good2 = _diff_runs_fixture(second)
+    store.write_table(runs2, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_row_with_coverage(
+                            max_abs=2.5, max_rel=0.5, rmse=1.25,
+                            first_div_period=3,
+                            first_div_time=datetime(2002, 1, 1, 0, 30)))
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")  # must not raise
+
+    # Both fragments read back as one table, each keeping its own values.
+    assert ts_diff["first_div_period"].isna().any()
+    assert set(ts_diff["first_div_period"].dropna()) == {3}
+    assert ts_diff["first_div_time"].notna().any()
+    assert set(ts_diff["max_abs"].dropna()) == {1.0, 2.5}
+
+
+# ---------------------------------------------------------------------------
+# The conformed column lists cover what the producers emit
+# ---------------------------------------------------------------------------
+
+
+def test_run_columns_covers_every_key_the_run_producers_emit(
+    corpus_with_elements, tmp_path, engine_with_elements, monkeypatch,
+):
+    # `_run_frame` builds `pd.DataFrame(rows, columns=RUN_COLUMNS)`, which
+    # DROPS any key the list does not name -- silently, with no error and no
+    # column. So a field added to `_run_one` or `_reference_rows` later would
+    # simply never reach the store, and nothing would say so. Pinned here
+    # instead of noticed in an analysis six hours later.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_with_elements, out)
+
+    emitted_runs: set = set()
+    emitted_elements: set = set()
+    original = cli._flush_run_batch
+
+    def spy(out_dir, run_rows, element_rows):
+        for row in run_rows:
+            emitted_runs.update(row)
+        for row in element_rows:
+            emitted_elements.update(row)
+        return original(out_dir, run_rows, element_rows)
+
+    monkeypatch.setattr(cli, "_flush_run_batch", spy)
+    cli.stage_run(corpus_with_elements, out, engine_with_elements,
+                  timeout_s=30.0, jobs=1, limit=None)
+
+    # Executed rows, reference rows and element rows all pass through the
+    # same flush, so one sweep covers every producer the sweep uses.
+    assert emitted_runs
+    assert emitted_runs <= set(cli.RUN_COLUMNS), (
+        emitted_runs - set(cli.RUN_COLUMNS))
+    assert emitted_elements
+    assert emitted_elements <= set(cli.ELEMENT_COLUMNS), (
+        emitted_elements - set(cli.ELEMENT_COLUMNS))
+
+
+def test_run_columns_covers_the_lost_worker_row_too(corpus_root, tmp_path):
+    # `_crash_result` is reached only when the POOL loses a process, which no
+    # ordinary sweep exercises -- so its keys would drift out of RUN_COLUMNS
+    # with nothing to notice, and the row that exists precisely to keep a
+    # lost job from being retried forever would land half-empty.
+    job = {
+        "record": {"model_id": "EPA/m1", "family": "EPA",
+                   "inp_sha256": "abcd"},
+        "variant": schema.VARIANT_A, "case_id": "cafe",
+        "engine_version": "OpenSWMM 6.0", "engine_build_id": "sha256:aaa",
+        "engine_build_info": None, "corpus_commit": "git:1111",
+        "timeout_s": 30.0,
+    }
+
+    row = cli._crash_result(job, RuntimeError("pool died"))["run"]
+
+    assert set(row) <= set(cli.RUN_COLUMNS), set(row) - set(cli.RUN_COLUMNS)

@@ -67,7 +67,17 @@ ROUTING_DYNWAVE = "DYNWAVE"
 #: `runs`, `scalars`, `elements`, `ts_diff`, `deltas` and `element_deltas`,
 #: makes that impossible: the tables cannot disagree about what a case is
 #: because they never compute it themselves.
-CASE_ID_FIELDS = ("model_id", "variant", "engine_build_id", "dependency_id")
+#:
+#: `options_id` is the variant's RESOLVED option set, not its letter. The
+#: letter names a unit of work only for as long as `variants.OPTIONS[letter]`
+#: is unchanged, and this project has edited that table several times: a `B`
+#: run recorded before an edit and a `B` run after it are two materially
+#: different units of work that would otherwise share one id, so the second
+#: would read as "already done" and never run. `options_applied` was written
+#: to `runs` but never hashed, which made the drift visible after the fact
+#: and preventable never.
+CASE_ID_FIELDS = ("model_id", "variant", "engine_build_id", "dependency_id",
+                  "options_id")
 
 #: NUL joins the fields because it cannot occur in any of them. A printable
 #: separator would let two different field tuples serialise identically --
@@ -80,18 +90,25 @@ def case_id(
     variant: str,
     engine_build_id: str,
     dependency_id: str,
+    options_id: str,
 ) -> str:
     """The identity of one unit of work; see `CASE_ID_FIELDS`.
 
     `engine_build_id` is a content hash of the engine executable, not the
-    version string it prints (two builds can print the same string), and
-    `dependency_id` is the corpus git commit, not the deck hash (a deck's
-    `DataFiles/*.dat` can change while the deck does not). Both are supplied
-    by the caller; this function only fixes how they are combined, so the
-    resume key and every table's `case_id` column are the same value by
-    construction rather than by convention.
+    version string it prints (two builds can print the same string);
+    `dependency_id` is the corpus git commit rather than the deck hash (a
+    deck's `DataFiles/*.dat` can change while the deck does not), falling
+    back to the sentinel plus that deck hash when the corpus is unpinned; and
+    `options_id` is a hash of the variant's resolved option set rather than
+    its letter. All three are supplied by the caller; this function only
+    fixes how they are combined, so the resume key and every table's
+    `case_id` column are the same value by construction rather than by
+    convention.
+
+    What is deliberately NOT here: `timeout_s`. See the note in `cli` beside
+    `RESUME_KEY`.
     """
     fields = (str(model_id), str(variant), str(engine_build_id),
-              str(dependency_id))
+              str(dependency_id), str(options_id))
     payload = _CASE_ID_SEPARATOR.join(fields).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()

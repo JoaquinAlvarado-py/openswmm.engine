@@ -18,8 +18,9 @@ from . import corpus, rptparse, runner, schema, store, variants
 
 #: The resume key is the case identity and nothing else. `case_id` already
 #: folds in the model, the variant, the engine BUILD (a content hash of the
-#: executable, not the version string it prints) and the corpus commit, so
-#: listing those columns again here could only let the two definitions drift.
+#: executable, not the version string it prints), the corpus dependency
+#: identity and the variant's resolved option set, so listing those columns
+#: again here could only let the two definitions drift.
 #: The previous key -- model/variant/engine_version/inp_sha256 -- skipped work
 #: it should have re-run twice over: two executables both printing
 #: `OpenSWMM 6.0` were one key, and a deck whose `DataFiles/*.dat` changed was
@@ -27,6 +28,18 @@ from . import corpus, rptparse, runner, schema, store, variants
 #: `store.completed_keys` returns nothing and every case re-runs; that is the
 #: safe direction, since those rows' engine build cannot be established after
 #: the fact.
+#:
+#: KNOWN LIMITATION -- `timeout_s` is deliberately NOT part of `case_id`, so a
+#: case recorded as `timeout` under `--timeout 60` is never retried under
+#: `--timeout 3600`: the resume key sees one case, already done. Including the
+#: timeout was considered and rejected, because it would invalidate every
+#: SUCCESSFUL result in the store the moment the flag moved -- re-running
+#: ~8200 simulations to retry the handful that timed out, and doing it again
+#: on the next adjustment. The cure is far worse than the disease. To retry
+#: the timed-out cases, either point `--out` at a fresh store, or delete the
+#: rows whose `status` is `timeout` from `runs` (with their `scalars` and
+#: `elements` rows) and re-run; `runs` is the resume authority, so a case
+#: absent from it is simply recomputed.
 RESUME_KEY = ["case_id"]
 
 #: How many completed units of work are persisted between Parquet flushes,
@@ -314,8 +327,11 @@ REF_ENGINE_VERSION = "corpus-reference"
 #: it, so there is no executable to hash; the same sentinel stands in, and
 #: `executed_engine_versions` excludes REF rows by variant so it can never be
 #: counted as a build. A REF case therefore depends only on the model and the
-#: corpus commit -- which is right: re-inventorying at a new commit must
-#: re-read the anchors, since the corpus `.rpt` may itself have changed.
+#: corpus dependency identity -- which is right: re-inventorying at a new
+#: commit must re-read the anchors, since the corpus `.rpt` may itself have
+#: changed. (On an UNPINNED corpus that identity falls back to the deck's own
+#: hash, which does not see the anchor `.rpt` change; the deck is the only
+#: file the fallback can see at all. One more thing a git checkout buys.)
 REF_ENGINE_BUILD_ID = REF_ENGINE_VERSION
 
 
@@ -474,6 +490,34 @@ def _crash_result(job: dict, error: BaseException) -> dict:
     }
 
 
+#: What `stage_run` prints when the sweep it is about to start is not pinned
+#: to a corpus state. English-only, like every other `stage_run` message.
+#:
+#: `corpus.commit_sha` warns where it is READ, which is `inventory` -- and the
+#: documented workflow runs `inventory` and `run` as separate invocations, so
+#: the `run` process (which prefers the value already recorded on `models`)
+#: never calls it and printed nothing at all. The operator kicking off a
+#: multi-hour sweep was therefore the one person never told. Said again here,
+#: from the recorded identity rather than by re-deriving it, so what is
+#: announced is what the rows will actually carry.
+UNPINNED_SWEEP_WARNING = (
+    "WARNING: this sweep is NOT pinned to a corpus state: `models` records "
+    f"the corpus dependency identity as {corpus.UNPINNED_CORPUS!r}, so the "
+    "corpus root is not a git repository (or git was unavailable when it was "
+    "inventoried). Two consequences, both of which outlive this run:\n"
+    "  - Nothing in `runs` says which revision of the corpus produced these "
+    "numbers, so no result written here can be attributed to one or "
+    "reproduced from one.\n"
+    "  - Resume invalidation is only partial. A changed DECK still re-runs "
+    "(its `inp_sha256` is folded into `case_id` while unpinned), but a change "
+    "to a file a deck merely REFERENCES -- DataFiles/*.dat, loose .txt "
+    "series, interface files -- does not, so a resumed sweep will republish "
+    "stale numbers as current.\n"
+    "Point --corpus-root at a git checkout of the corpus and re-run "
+    "`inventory` to pin it."
+)
+
+
 def stage_run(
     corpus_root: Path,
     out_dir: Path,
@@ -511,14 +555,23 @@ def stage_run(
     # readings a `git checkout` could fall between. Falls back to reading the
     # root for a store written before the column existed.
     corpus_commit = _corpus_commit(models, corpus_root)
+    # Announced HERE, not only where the commit is read: `inventory` and `run`
+    # are separate invocations in the documented workflow, so the process
+    # about to spend several hours simulating is the one that has to say it.
+    if not corpus.is_pinned(corpus_commit):
+        print(UNPINNED_SWEEP_WARNING)
     done = store.completed_keys(out_dir, "runs", RESUME_KEY)
 
     work_dir = Path(out_dir) / "work"
     payload = []
     for record in models.to_dict("records"):
+        # Per model, because the fallback identity carries this deck's hash.
+        dependency = corpus.dependency_id(corpus_commit,
+                                          record.get("inp_sha256", ""))
         for variant in schema.VARIANTS:
             case_id = schema.case_id(record["model_id"], variant,
-                                     identity["engine_build_id"], corpus_commit)
+                                     identity["engine_build_id"], dependency,
+                                     variants.options_id(variant))
             if (case_id,) in done:
                 continue
             payload.append({
@@ -556,8 +609,11 @@ def stage_run(
             absorb(_run_one(job))
 
     for record in models.to_dict("records"):
+        dependency = corpus.dependency_id(corpus_commit,
+                                          record.get("inp_sha256", ""))
         case_id = schema.case_id(record["model_id"], schema.VARIANT_REF,
-                                 REF_ENGINE_BUILD_ID, corpus_commit)
+                                 REF_ENGINE_BUILD_ID, dependency,
+                                 variants.options_id(schema.VARIANT_REF))
         if (case_id,) in done:
             continue
         ref_row, ref_elements = _reference_rows(corpus_root, record, case_id,
@@ -626,25 +682,63 @@ TS_DIFF_COVERAGE_DTYPES = {
     "time_grid_match": "boolean",
 }
 
+#: `ts_diff`'s divergence statistics, by the dtype each is written as. Every
+#: one of them is nullable for the SAME reason, and it is not an exotic one: a
+#: comparison whose two runs agreed everywhere within tolerance has no first
+#: divergence at all, so `first_div_period` and `first_div_time` are null on
+#: every row of it. A whole flush batch can therefore be null in both --
+#: entirely ordinary on a corpus of small decks, and certain for a batch
+#: holding one model whose variants agreed.
+#:
+#: Left to inference, that batch writes Arrow `null` while a later batch
+#: holding one divergence writes `int64` and `timestamp`, and the DATASET
+#: then stops reading at all: `ArrowNotImplementedError: Unsupported cast
+#: from int64 to null`. It fails only when the null fragment is written
+#: first, so it is latent, order-dependent and data-dependent -- and because
+#: `stage_report` reads `ts_diff` unconditionally, it takes down the whole
+#: report stage rather than just its coverage section.
+#:
+#: `Int64` (not `int64`) for the same reason the coverage counts use it: it
+#: must be able to hold `<NA>` without becoming a float.
+TS_DIFF_DIVERGENCE_DTYPES = {
+    "max_abs": "float64",
+    "max_rel": "float64",
+    "rmse": "float64",
+    "first_div_period": "Int64",
+    "first_div_time": "datetime64[ns]",
+}
+
+#: Datetime columns are conformed through `pd.to_datetime` rather than
+#: `astype`, which cannot promote an all-None object column.
+_TS_DIFF_DATETIME_DTYPE = "datetime64[ns]"
+
 
 def _ts_diff_frame(rows: list[dict]) -> pd.DataFrame:
     """One batch of `ts_diff` rows, conformed to its nullable column dtypes.
 
     Conformed for the same reason `_run_frame` conforms `runs`: a batch in
     which neither side had a `case_id` (a store written before the column
-    existed), or in which every row's coverage happened to be unknown, would
-    otherwise infer Arrow's `null` type and stop matching the fragments
-    around it.
+    existed), in which every row's coverage happened to be unknown, or in
+    which every comparison agreed within tolerance, would otherwise infer
+    Arrow's `null` type and stop matching the fragments around it.
+
+    Every column the stage writes itself is conformed -- the two case ids,
+    the coverage evidence AND the divergence statistics. Conforming only some
+    of them is what made this order-dependent rather than fixed.
     """
     frame = pd.DataFrame(rows)
     for column in TS_DIFF_CASE_COLUMNS:
         if column not in frame.columns:
             frame[column] = None
         frame[column] = frame[column].astype("string")
-    for column, dtype in TS_DIFF_COVERAGE_DTYPES.items():
+    for column, dtype in {**TS_DIFF_COVERAGE_DTYPES,
+                          **TS_DIFF_DIVERGENCE_DTYPES}.items():
         if column not in frame.columns:
             frame[column] = None
-        frame[column] = frame[column].astype(dtype)
+        if dtype == _TS_DIFF_DATETIME_DTYPE:
+            frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        else:
+            frame[column] = frame[column].astype(dtype)
     return frame
 
 

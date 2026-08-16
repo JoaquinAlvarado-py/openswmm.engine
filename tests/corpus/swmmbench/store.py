@@ -1,8 +1,9 @@
 """Parquet persistence for the pipeline stages.
 
-Each stage writes one dataset; later stages read it back. Resumability keys
-include the engine version and the input hash, so a sweep can never silently
-mix results from two engine builds or two deck revisions.
+Each stage writes one dataset; later stages read it back. Resumability is
+keyed on `case_id` alone (see `cli.RESUME_KEY`), which already folds in the
+engine build and the corpus dependency identity, so a sweep can never
+silently mix results from two engine builds or two corpus states.
 """
 
 from __future__ import annotations

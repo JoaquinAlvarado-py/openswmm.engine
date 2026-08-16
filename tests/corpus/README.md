@@ -115,14 +115,15 @@ single `case_id`, carried on every row of `runs`, `scalars`, `elements`,
 
 | column | meaning |
 | --- | --- |
-| `case_id` | sha256 of `model_id` + `variant` + `engine_build_id` + `corpus_commit`. The resume key, and the join key between the tables. |
+| `case_id` | sha256 of `model_id` + `variant` + `engine_build_id` + the corpus dependency identity + the variant's resolved option set. The resume key, and the join key between the tables. |
 | `engine_build_id` | `sha256:<digest>` over the engine argv, each element replaced by its file hash. **This is the engine's identity.** |
 | `engine_version` | the first line of `--version`. A human-readable label only. |
 | `engine_build_info` | any commit / branch / build-type lines `--version` printed, when it printed them. Never depended on. |
 | `corpus_commit` | `git:<sha>` of the corpus root, read at `inventory` time. The identity of everything a deck depends on. |
-| `inp_sha256` | the deck's own hash. Retained as data; it is **not** sufficient as an identity (see below). |
+| `inp_sha256` | the deck's own hash. Retained as data; on a **pinned** corpus it is not part of the identity (the commit subsumes it), and on an unpinned one it is folded in as the fallback (see below). |
+| `options_applied` | the option set the deck was written with, as text. Its hash is part of `case_id`. |
 
-Two things that look like identities are deliberately not used as such:
+Three things that look like identities are deliberately not used as such:
 
 - **The version string is not the engine.** Two executables that both print
   `OpenSWMM 6.0` can contain completely different Anderson, continuity or
@@ -143,8 +144,30 @@ Two things that look like identities are deliberately not used as such:
   `[FILES]` interface section and more, and any section type missed makes
   the hash *lie*. The commit covers every referenced file exactly, for free.
   It over-invalidates when the corpus moves -- rare, and the safe direction.
-  A corpus that is not a git repository records `unpinned:not-a-git-repo`
-  and warns once, rather than failing the sweep or pretending it is pinned.
+- **The unpinned sentinel is not a dependency identity on its own.** A corpus
+  that is not a git repository (or a machine with no git) records
+  `unpinned:not-a-git-repo` rather than failing the sweep or pretending it is
+  pinned -- but that value is a *constant*, so used as the whole dependency
+  identity nothing about the corpus could ever invalidate a resumed sweep:
+  rewrite a deck, re-run `inventory` and `run`, and every case reads as
+  already done while `runs` keeps the stale `inp_sha256`. The deck's own hash
+  is therefore folded in behind the sentinel whenever the corpus is unpinned,
+  so **a changed deck still re-runs**. What that fallback still cannot see is
+  exactly what only a commit can: a change to a file the deck *references*
+  rather than to the deck itself, and a change to a corpus `.rpt` anchor. The
+  value keeps its `unpinned:` prefix, so a degraded identity can never compare
+  equal to a real `git:` pin. Both `inventory` and `run` say so on the
+  console -- `run` because the documented workflow makes it a separate
+  invocation, and the operator starting a multi-hour sweep is the one who
+  needs to know.
+- **The variant letter is not the option set.** `B` means whatever
+  `variants.OPTIONS["B"]` says it means *today*, and that table has been
+  edited more than once. `options_applied` records the resolved set on every
+  row, and its hash is part of `case_id`, so editing a variant's options
+  re-runs that variant -- and only that variant -- instead of colliding with
+  the pre-edit rows under one id. The hash is taken over the sorted
+  key/value pairs, so reordering the table (or moving a key into the shared
+  block) leaves every existing case valid.
 
 `REF` rows carry the `corpus-reference` sentinel as their `engine_build_id`:
 no build of ours produced them, so a second engine does not re-read the
@@ -157,6 +180,17 @@ on every re-run, so running `inventory` or `report` twice never doubles a row
 count. A store written before `case_id` existed has no such column; every
 case then re-runs, which is the safe direction, since those rows' engine
 build cannot be established after the fact.
+
+**Known limitation: `--timeout` is not part of `case_id`.** A case recorded as
+`timeout` under `--timeout 60` is therefore *not* retried by re-running with
+`--timeout 3600`; the resume key sees one case, already done. Putting the
+timeout in the identity was considered and rejected, because it would
+invalidate every **successful** result in the store the moment the flag moved
+-- re-running ~8200 simulations to retry the handful that timed out, and again
+on the next adjustment. To retry the timed-out cases, either point `--out` at
+a fresh store, or delete the `runs` rows whose `status` is `timeout` (with
+their `scalars` and `elements` rows) and re-run: `runs` is the resume
+authority, so a case absent from it is simply recomputed.
 
 `run` and `diff` write Parquet in batches of `FLUSH_BATCH_SIZE` (50)
 completed units of work -- a simulation in `run`, a model in `diff` -- rather
@@ -304,7 +338,11 @@ section:
   operator; `summary.md` is the artifact that gets kept.
 - **incomplete time-series overlap** -- how many models produced a `ts_diff`
   comparison whose two runs did not cover the same reporting grid, broken
-  down by `comparison` with the worst `coverage_fraction` beside it. See
+  down by `comparison` with the worst `coverage_fraction` beside it. The
+  headline counts **distinct models across comparisons**, not the sum of the
+  per-comparison counts: one truncated run is flagged by all five
+  comparisons, and summing them would announce a single stopped simulation
+  as five models. See
   *Time-series coverage* below. A store with no `ts_diff` coverage columns is
   reported as **not assessed**, never as complete.
 - **Anderson x Node Continuity interaction** -- `delta_interaction` per

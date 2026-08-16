@@ -1285,6 +1285,46 @@ def test_a_truncated_pairing_reaches_the_summary_in_both_languages(tmp_path):
         assert "\n".join(strings["coverage_not_assessed"]) not in section
 
 
+def test_the_coverage_headline_counts_models_not_model_comparison_pairs(tmp_path):
+    # One truncated run is flagged by every comparison it takes part in, so
+    # summing the table's per-comparison `models` column announced a single
+    # stopped simulation as "5 model(s)" -- while the table beneath it
+    # correctly said 1, five times over.
+    runs = _runs()
+    deltas = report.build_deltas(runs, METRICS)
+    ts_diff = pd.concat(
+        [_ts_diff_rows(comparison=comparison, coverage=0.5, grid_match=False)
+         for comparison in ("B_minus_A", "C_minus_A", "D_minus_A",
+                            "E_minus_A", "D_minus_C")],
+        ignore_index=True)
+
+    assert report.coverage_anomaly_models(ts_diff) == 1
+    assert (report.coverage_anomalies(ts_diff)["models"] == 1).all()
+    assert len(report.coverage_anomalies(ts_diff)) == 5
+
+    path = report.write_markdown(deltas, runs, tmp_path / "one_model.md",
+                                 lang="en", ts_diff=ts_diff)
+    strings = report.MARKDOWN_STRINGS["en"]
+    section = _markdown_section(path.read_text(encoding="utf-8"),
+                                strings["coverage_anomaly_heading"])
+
+    assert "\n".join(strings["coverage_anomaly_total"]).format(
+        n_models=1, n_comparisons=5) in section
+
+
+def test_the_coverage_headline_still_counts_every_distinct_model(tmp_path):
+    # The fix must not undercount either: two models truncated on one
+    # comparison are two models.
+    ts_diff = pd.concat([
+        _ts_diff_rows(model_id="EPA/m1", coverage=0.5, grid_match=False),
+        _ts_diff_rows(model_id="EPA/m2", coverage=0.5, grid_match=False),
+    ], ignore_index=True)
+
+    assert report.coverage_anomaly_models(ts_diff) == 2
+    assert report.coverage_anomaly_models(_ts_diff_rows()) == 0
+    assert report.coverage_anomaly_models(pd.DataFrame()) == 0
+
+
 def test_a_fully_covered_store_states_it_rather_than_omitting_the_section(tmp_path):
     runs = _runs()
     deltas = report.build_deltas(runs, METRICS)

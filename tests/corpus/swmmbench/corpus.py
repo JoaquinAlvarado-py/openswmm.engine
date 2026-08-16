@@ -97,7 +97,11 @@ def commit_sha(root: Path) -> str:
     Degrades rather than fails: a corpus that is not a git repository, or a
     machine with no git, records `UNPINNED_CORPUS` and warns once. Refusing
     to sweep would be worse than sweeping with the dependency openly marked
-    as unpinned.
+    as unpinned. `UNPINNED_CORPUS` is a CONSTANT, so it cannot carry the
+    dependency identity on its own -- see `dependency_id`, which folds the
+    deck's own hash in behind it so a changed deck still invalidates. What
+    remains lost under the fallback is exactly what only a commit can see: a
+    change to a file the deck REFERENCES rather than to the deck itself.
     """
     root = Path(root)
     try:
@@ -118,9 +122,49 @@ def commit_sha(root: Path) -> str:
         print(f"WARNING: {root} is not a git repository (or git is "
               f"unavailable); the corpus dependency identity is recorded as "
               f"{UNPINNED_CORPUS!r}. Results cannot be attributed to a "
-              f"corpus state, and a change to a deck's external data files "
-              f"will not invalidate a resumed sweep.")
+              f"corpus state, and a resumed sweep is only partially "
+              f"invalidated: a changed DECK still re-runs (its hash is "
+              f"folded into the case identity while unpinned), but a change "
+              f"to a file a deck merely REFERENCES -- DataFiles/*.dat, loose "
+              f".txt series, interface files -- does not.")
     return UNPINNED_CORPUS
+
+
+def is_pinned(corpus_commit: str) -> bool:
+    """True when `corpus_commit` is a real git pin, not the fallback."""
+    return str(corpus_commit).startswith(GIT_COMMIT_PREFIX)
+
+
+#: Separator between the unpinned sentinel and the deck hash folded in behind
+#: it. Not present in a sha256 digest or in the sentinel, so the two halves
+#: stay legible, and the whole value still carries the `unpinned:` prefix.
+_UNPINNED_DECK_JOIN = "+inp:"
+
+
+def dependency_id(corpus_commit: str, inp_sha256: str) -> str:
+    """What a case depends on besides the model, the variant and the build.
+
+    A real commit stands alone: it already covers the deck AND every external
+    file the deck references by relative path, so folding the deck hash in
+    behind it could only be redundant.
+
+    `UNPINNED_CORPUS` does NOT stand alone, and this is the whole reason this
+    function exists. It is a constant: on a corpus that is not a git
+    repository it never changes, so used as the entire dependency identity
+    nothing about the corpus could ever invalidate a resumed sweep -- an
+    operator could rewrite a deck, re-run `inventory` and `run`, and be told
+    every case was already done while `runs` still held the old
+    `inp_sha256`. The deck's own hash is therefore folded in whenever the
+    corpus is unpinned. That is strictly weaker than a commit (a changed
+    `DataFiles/*.dat` remains invisible) and strictly stronger than a
+    constant.
+
+    The result keeps the `git:` or `unpinned:` prefix it was built from, so a
+    degraded identity can never compare equal to a real pin.
+    """
+    if is_pinned(corpus_commit):
+        return str(corpus_commit)
+    return f"{corpus_commit}{_UNPINNED_DECK_JOIN}{inp_sha256}"
 
 
 def _posix(root: Path, path: Path) -> str:
