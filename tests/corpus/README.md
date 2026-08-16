@@ -84,7 +84,9 @@ python -m swmmbench check     --corpus-root /path/to/1729-SWMM5-Models --out ./r
 `--lang` (`es` or `en`, default `es`) selects the language of `summary.md`'s
 prose -- section headings, table column headers, and the Caveats bullets --
 and of the `report` stage's own console messages. Metric names, status
-values, family names and the `B - A` / `C - A` / `A - REF` axis notation are
+values, family names, variant letters, the hardness bucket labels
+(`<= 2`, `2-4`, `> 4`), the surcharge strata (`active`, `inactive`) and the
+`B - A` / `C - A` / `D - C` / `D - A` / `E - A` / `A - REF` axis notation are
 data, not prose, and are identical in both languages so the report stays
 cross-referenceable against the Parquet columns and the code regardless of
 `--lang`. The default is `es` for this harness's own operator; pass
@@ -125,14 +127,85 @@ Exit codes are meaningful and worth wiring into CI:
 import pandas as pd
 runs = pd.read_parquet("results/runs")
 
-pivot = runs.pivot_table(index="model_id", columns="variant",
-                         values="avg_iterations_per_step")
-(pivot["B"] / pivot["A"]).describe()   # Anderson's effect on iteration count
-(pivot["C"] / pivot["A"]).describe()   # Crank-Nicolson's effect on iteration count
+dynwave = runs[runs["reported_routing_model"] == "DYNWAVE"]
+pivot = dynwave.pivot_table(index="model_id", columns="variant",
+                            values="avg_iterations_per_step")
+(pivot["B"] / pivot["A"]).describe()   # Anderson under EXPLICIT/EXTRAN
+(pivot["C"] / pivot["A"]).describe()   # Crank-Nicolson's effect
+(pivot["D"] / pivot["C"]).describe()   # incremental Anderson under Crank-Nicolson
+(pivot["E"] / pivot["A"]).describe()   # Dynamic Preissmann Slot
 ```
 
+`scalars` is the long-format view of the numeric metrics only. The string
+valued keys -- `reported_version`, the dates, `iteration_metric_kind` and the
+four `reported_*` option/routing echoes -- stay one column each in `runs`;
+melting them into `scalars`'s numeric `value` column would mix types in a
+single Arrow column and the write would fail outright.
+
 `iteration_metric_kind` must be checked before comparing iteration counts:
-`fv_substeps` rows count explicit substeps, not Picard iterations.
+`fv_substeps` rows count explicit substeps, not Picard iterations. It is
+`None` -- not `picard` -- for KINWAVE and STEADY runs: the engine prints
+`Average Iterations per Step` for every routing model and relabels it only
+under FV, so the label alone does not mean the counter has any Picard
+meaning. Check `reported_routing_model` too; the pivot above pools routing
+models and only makes sense filtered to `DYNWAVE`.
+
+### `deltas` and `element_deltas`
+
+Both tables carry one value column per variant and one column per
+comparison axis:
+
+| column | meaning |
+| --- | --- |
+| `value_a` .. `value_e`, `value_ref` | the raw per-variant value |
+| `delta_b_minus_a` | Anderson under EXPLICIT/EXTRAN |
+| `delta_c_minus_a` | semi-implicit (Crank-Nicolson) node continuity |
+| `delta_d_minus_c` | **incremental Anderson under the C1-smooth operator** |
+| `delta_d_minus_a` | joint Anderson + Crank-Nicolson (two causes, not attributable) |
+| `delta_e_minus_a` | Dynamic Preissmann Slot |
+| `delta_a_minus_ref` | parity debt against EPA SWMM 5.2 |
+
+A row is always emitted, never dropped. An individual delta is null when
+either operand is missing, or when the pairing is not commensurable:
+
+- **iteration counter kind** -- FV substeps are not Picard iterations, so a
+  delta is dropped when both sides' `iteration_metric_kind` are known and
+  differ. A missing kind is *not* a mismatch: a variant that crashed must
+  not cost the model its other deltas.
+- **routing model** -- an iteration delta (`avg_iterations_per_step`,
+  `pct_steps_not_converging`) is formed only when *both* sides are known
+  `DYNWAVE`. This is checked explicitly rather than left to the kind guard,
+  because two KINWAVE runs would agree on their (meaningless) label and pass
+  straight through it.
+- **surcharge method, against the anchor only** -- `X - REF` is dropped when
+  the two sides echo different `SURCHARGE_METHOD` values. EPA SWMM 5.2 has
+  no Dynamic Preissmann Slot, so this catches E automatically, and being
+  written against the echoes it also catches a corpus reference run under a
+  surcharge method other than ours. It deliberately does not apply to
+  `E - A`: that delta moving the surcharge method is the point of variant E.
+
+`summary.md` publishes a per-metric table for each of the five feature axes,
+plus iteration-shift tables stratified two ways and a D/E surcharge-activity
+section:
+
+- **routing model** -- the iteration-shift sections show `DYNWAVE` rows only.
+- **hardness** -- split by variant A's `avg_iterations_per_step` into
+  `<= 2`, `2-4` and `> 4` (closed on the right; the three partition the
+  reals). Anderson cannot help a model that already converges in two
+  iterations, and this corpus is dominated by small decks, so a single
+  unstratified mean understates the feature exactly where it should pay off.
+- **surcharge activity** -- D and E act on the free-surface/surcharge
+  transition, so their rows are split by whether the model actually
+  surcharges. The proxy is variant A's `pct_steps_not_converging > 0`, or
+  any node with `node_total_flood_volume > 0` or `node_hours_flooded > 0`
+  in `elements`; both are read from variant A only, so the stratum does not
+  depend on the feature being measured. `node_max_hgl` is parsed but
+  deliberately unused: separating surcharge from ordinary free-surface depth
+  needs each node's crown elevation, which the harness does not parse. When
+  no model (or fewer than three) is surcharge-active, the report **says so
+  in words** rather than printing a near-zero `active` mean -- "the feature
+  was not exercised" and "the feature has no effect" are different
+  conclusions, and a markdown table cannot tell them apart on its own.
 
 `ts_diff` carries all five time-series comparisons in one table, distinguished
 by its `comparison` column (`B_minus_A`, `C_minus_A`, `D_minus_A`,

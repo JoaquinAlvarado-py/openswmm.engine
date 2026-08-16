@@ -17,13 +17,16 @@ ENGINE_V2 = "openswmm 1.1.0 (build def456)"
 
 
 def _runs(engine_version: str = ENGINE_V1) -> pd.DataFrame:
-    """Two models x {A, B, REF}, with the scalars the report pivots on."""
+    """Two models x {A, B, C, D, E, REF}, with the scalars the report pivots on."""
     rows = []
     for model_id, base in (("EPA/m1", 4.0), ("LID/m2", 6.0)):
         family = model_id.split("/")[0]
         for variant, offset, version in (
             (schema.VARIANT_A, 0.0, engine_version),
             (schema.VARIANT_B, -1.0, engine_version),
+            (schema.VARIANT_C, -0.4, engine_version),
+            (schema.VARIANT_D, -1.6, engine_version),
+            (schema.VARIANT_E, 0.5, engine_version),
             (schema.VARIANT_REF, 0.2, cli.REF_ENGINE_VERSION),
         ):
             rows.append({
@@ -37,6 +40,12 @@ def _runs(engine_version: str = ENGINE_V1) -> pd.DataFrame:
                 "avg_step": 10.0,
                 "wall_ms": 100.0,
                 "iteration_metric_kind": schema.ITER_PICARD,
+                # An iteration delta is only formed when both sides are
+                # known DYNWAVE, and an `X - REF` delta only when both echo
+                # the same surcharge method.
+                "reported_routing_model": schema.ROUTING_DYNWAVE,
+                "reported_surcharge_method":
+                    "DYNAMIC_SLOT" if variant == schema.VARIANT_E else "EXTRAN",
             })
     return pd.DataFrame(rows)
 
@@ -48,6 +57,9 @@ def _elements(engine_version: str = ENGINE_V1) -> pd.DataFrame:
         for variant, value, version in (
             (schema.VARIANT_A, 1.0, engine_version),
             (schema.VARIANT_B, 1.5, engine_version),
+            (schema.VARIANT_C, 1.2, engine_version),
+            (schema.VARIANT_D, 0.8, engine_version),
+            (schema.VARIANT_E, 1.9, engine_version),
             (schema.VARIANT_REF, 0.9, cli.REF_ENGINE_VERSION),
         ):
             rows.append({
@@ -84,6 +96,45 @@ def test_report_writes_the_derived_tables(store_dir):
     element_deltas = store.read_table(store_dir, "element_deltas")
     assert not element_deltas.empty
     assert element_deltas["delta_b_minus_a"].iloc[0] == pytest.approx(0.5)
+
+
+def test_every_value_and_delta_column_survives_the_parquet_round_trip(store_dir):
+    # The D and E columns are what the five-variant sweep is paid for; a
+    # column that build_deltas emits but the store drops (or that arrives
+    # back as all-null) would publish nothing from 40% of the compute.
+    cli.stage_report(store_dir)
+
+    for name in ("deltas", "element_deltas"):
+        table = store.read_table(store_dir, name)
+        assert set(report.VALUE_COLUMNS) <= set(table.columns), name
+        assert set(report.DELTA_COLUMNS) <= set(table.columns), name
+        for column in report.DELTA_COLUMNS:
+            assert table[column].notna().any(), f"{name}.{column}"
+
+
+def test_the_d_minus_c_axis_is_published_by_the_stage(store_dir):
+    cli.stage_report(store_dir)
+
+    deltas = store.read_table(store_dir, "deltas")
+    row = deltas[(deltas.model_id == "EPA/m1")
+                 & (deltas.metric == "avg_iterations_per_step")].iloc[0]
+
+    # A=4.0, C=3.6, D=2.4 -> D - C = -1.2 and D - A = -1.6.
+    assert row["delta_d_minus_c"] == pytest.approx(-1.2)
+    assert row["delta_d_minus_a"] == pytest.approx(-1.6)
+
+
+def test_the_e_ref_surcharge_mismatch_does_not_cost_a_minus_ref(store_dir):
+    # E echoes DYNAMIC_SLOT while REF echoes EXTRAN; the anchor guard is
+    # per-delta, so A's parity debt is unaffected.
+    cli.stage_report(store_dir)
+
+    deltas = store.read_table(store_dir, "deltas")
+    row = deltas[(deltas.model_id == "EPA/m1")
+                 & (deltas.metric == "avg_iterations_per_step")].iloc[0]
+
+    assert row["delta_a_minus_ref"] == pytest.approx(-0.2)
+    assert row["delta_e_minus_a"] == pytest.approx(0.5)
 
 
 def test_report_writes_a_summary_naming_the_estimate_caveat(store_dir):

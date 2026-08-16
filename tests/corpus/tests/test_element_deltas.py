@@ -27,6 +27,38 @@ def test_element_deltas_pair_by_element_and_metric():
     assert row["delta_a_minus_ref"] == pytest.approx(0.1)
 
 
+def test_element_deltas_carry_the_d_and_e_axes():
+    # `D - C` at the element level is the same linear subtraction as at the
+    # scalar level, and it is the axis variant D exists for -- an
+    # element-level table that stopped at A/B/C would publish nothing from D
+    # or E at all.
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "C", "value": 3.7},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "D", "value": 3.2},
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "E", "value": 4.6},
+    ])
+
+    (row,) = report.build_element_deltas(frame).to_dict("records")
+
+    assert row["value_d"] == pytest.approx(3.2)
+    assert row["value_e"] == pytest.approx(4.6)
+    assert row["delta_d_minus_c"] == pytest.approx(-0.5)
+    assert row["delta_d_minus_a"] == pytest.approx(-0.8)
+    assert row["delta_e_minus_a"] == pytest.approx(0.6)
+
+
+def test_element_deltas_expose_every_value_and_delta_column():
+    frame = _elements([
+        {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},
+    ])
+
+    columns = set(report.build_element_deltas(frame).columns)
+
+    assert set(report.VALUE_COLUMNS) <= columns
+    assert set(report.DELTA_COLUMNS) <= columns
+
+
 def test_elements_present_in_only_one_variant_yield_a_null_delta():
     frame = _elements([
         {"element_id": "J1", "metric": "node_max_depth", "variant": "A", "value": 4.0},

@@ -15,6 +15,17 @@ from . import corpus, rptparse, runner, schema, store, variants
 
 RESUME_KEY = ["model_id", "variant", "engine_version", "inp_sha256"]
 
+#: Parsed scalars that are NOT metrics and must stay out of the long-format
+#: `scalars` table. Its `value` column is numeric by construction; melting a
+#: string-valued key into it (a version banner, a timestamp, a routing-model
+#: or option echo) mixes types in one Arrow column and the write fails
+#: outright. They all remain available, one column each, in `runs`.
+NON_METRIC_SCALARS = frozenset({
+    "reported_version", "start_date", "end_date", "iteration_metric_kind",
+    "reported_routing_model", "reported_surcharge_method",
+    "reported_node_continuity", "reported_anderson_accel",
+})
+
 
 def stage_inventory(corpus_root: Path, out_dir: Path) -> pd.DataFrame:
     """Re-derive the model list from the corpus, replacing any earlier one.
@@ -220,8 +231,7 @@ def stage_run(
             # from one engine build is indistinguishable from another's.
             id_vars=["model_id", "family", "variant", "engine_version"],
             value_vars=[c for c in rptparse.SCALAR_KEYS
-                        if c not in ("reported_version", "start_date", "end_date",
-                                     "iteration_metric_kind")],
+                        if c not in NON_METRIC_SCALARS],
             var_name="metric", value_name="value",
         )
         store.write_table(scalar_frame, out_dir, "scalars", partition_by=["family"])
@@ -584,7 +594,11 @@ def stage_report(out_dir: Path, lang: str = "es") -> int:
         _replace_table(pd.DataFrame(), out_dir, "element_deltas")
         _replace_table(pd.DataFrame(), out_dir, "topology_status")
 
-    path = report.write_markdown(deltas, runs, out_dir / "summary.md", lang=lang)
+    # `elements` is passed so the summary's surcharge-activity stratum can
+    # use per-node flooding totals as well as `pct_steps_not_converging`;
+    # without it the proxy silently degrades to the scalar signal alone.
+    path = report.write_markdown(deltas, runs, out_dir / "summary.md",
+                                 lang=lang, elements=elements)
     print(f"wrote {path}")
     return 0
 

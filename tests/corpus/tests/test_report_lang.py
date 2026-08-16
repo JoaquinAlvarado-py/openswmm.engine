@@ -13,23 +13,42 @@ from swmmbench import cli, report, schema, store
 METRICS = ["avg_iterations_per_step", "continuity_error_flow"]
 
 
+_DYNWAVE_EXTRAN = {"reported_routing_model": "DYNWAVE",
+                   "reported_surcharge_method": "EXTRAN"}
+
+
 def _runs():
-    """Two families, two statuses, four variants for EPA/m1."""
+    """Two families, two statuses, six variants for EPA/m1."""
     return pd.DataFrame([
         {"model_id": "EPA/m1", "family": "EPA", "variant": "A", "status": "ok",
          "avg_iterations_per_step": 4.0, "continuity_error_flow": 0.10,
-         "iteration_metric_kind": "picard"},
+         "iteration_metric_kind": "picard", **_DYNWAVE_EXTRAN},
         {"model_id": "EPA/m1", "family": "EPA", "variant": "B", "status": "ok",
          "avg_iterations_per_step": 2.0, "continuity_error_flow": 0.12,
-         "iteration_metric_kind": "picard"},
+         "iteration_metric_kind": "picard", **_DYNWAVE_EXTRAN},
         {"model_id": "EPA/m1", "family": "EPA", "variant": "C", "status": "ok",
          "avg_iterations_per_step": 3.0, "continuity_error_flow": 0.11,
-         "iteration_metric_kind": "picard"},
+         "iteration_metric_kind": "picard", **_DYNWAVE_EXTRAN},
+        {"model_id": "EPA/m1", "family": "EPA", "variant": "D", "status": "ok",
+         "avg_iterations_per_step": 1.5, "continuity_error_flow": 0.13,
+         "iteration_metric_kind": "picard", **_DYNWAVE_EXTRAN},
+        {"model_id": "EPA/m1", "family": "EPA", "variant": "E", "status": "ok",
+         "avg_iterations_per_step": 5.0, "continuity_error_flow": 0.14,
+         "iteration_metric_kind": "picard",
+         "reported_routing_model": "DYNWAVE",
+         "reported_surcharge_method": "DYNAMIC_SLOT"},
         {"model_id": "EPA/m1", "family": "EPA", "variant": "REF", "status": "ok",
          "avg_iterations_per_step": 3.8, "continuity_error_flow": 0.09,
-         "iteration_metric_kind": "picard"},
+         "iteration_metric_kind": "picard", **_DYNWAVE_EXTRAN},
         {"model_id": "LID/m2", "family": "LID", "variant": "A", "status": "engine_error"},
     ])
+
+
+#: Every `## ` heading `write_markdown` emits, derived from the key names so
+#: a new section cannot be added without these tests seeing it.
+HEADING_KEYS = tuple(sorted(
+    key for key in report.MARKDOWN_STRINGS["en"] if key.endswith("_heading")
+))
 
 
 def _write(tmp_path, lang):
@@ -49,8 +68,7 @@ def test_write_markdown_lang_es_produces_spanish_headings(tmp_path):
     es = report.MARKDOWN_STRINGS["es"]
 
     assert text.startswith(es["title"])
-    for key in ("coverage_heading", "b_minus_a_heading", "c_minus_a_heading",
-                "iter_shift_b_heading", "iter_shift_c_heading", "caveats_heading"):
+    for key in HEADING_KEYS:
         assert es[key] in text
 
     en = report.MARKDOWN_STRINGS["en"]
@@ -63,8 +81,7 @@ def test_write_markdown_lang_en_produces_english_headings(tmp_path):
     en = report.MARKDOWN_STRINGS["en"]
 
     assert text.startswith(en["title"])
-    for key in ("coverage_heading", "b_minus_a_heading", "c_minus_a_heading",
-                "iter_shift_b_heading", "iter_shift_c_heading", "caveats_heading"):
+    for key in HEADING_KEYS:
         assert en[key] in text
 
     es = report.MARKDOWN_STRINGS["es"]
@@ -92,13 +109,15 @@ def _heading_lines(text: str) -> list[str]:
 def _all_known_header_and_sep_lines() -> set[str]:
     """Every table header/separator line either language can produce.
 
-    Used to strip prose lines from a document, leaving only data rows --
-    without hardcoding a second copy of the header text.
+    Derived from the key names rather than an enumerated list, so a section
+    added to `MARKDOWN_STRINGS` is covered without editing this helper --
+    which would otherwise silently start counting its header line as a data
+    row and make the cross-language comparison fail for the wrong reason.
     """
-    keys = ("coverage_header", "coverage_sep", "metric_header", "metric_sep",
-            "family_header", "family_sep")
-    return {report.MARKDOWN_STRINGS[lang][key]
-            for lang in report.MARKDOWN_STRINGS for key in keys}
+    return {value
+            for strings in report.MARKDOWN_STRINGS.values()
+            for key, value in strings.items()
+            if key.endswith("_header") or key.endswith("_sep")}
 
 
 def _data_rows(text: str) -> list[str]:
@@ -112,7 +131,8 @@ def test_both_languages_produce_the_same_section_count(tmp_path):
     en_text = _write(tmp_path, "en")
     es_text = _write(tmp_path, "es")
 
-    assert len(_heading_lines(en_text)) == len(_heading_lines(es_text)) == 6
+    assert (len(_heading_lines(en_text)) == len(_heading_lines(es_text))
+            == len(HEADING_KEYS))
 
 
 def test_both_languages_produce_identical_data_rows_and_numeric_values(tmp_path):
@@ -168,6 +188,42 @@ def test_estimate_caveat_present_and_names_total_iterations_est_in_both_language
         text = _write(tmp_path, lang)
         assert "total_iterations_est" in text
         assert "\n".join(report.MARKDOWN_STRINGS[lang]["caveat_estimate"]) in text
+
+
+def test_hardness_bucket_labels_are_untranslated_in_both_languages(tmp_path):
+    # `<= 2` / `2-4` / `> 4` are numeric notation, not prose -- a reader
+    # reproduces them from `value_a` in the Parquet store regardless of
+    # --lang, exactly like the `B - A` axis notation.
+    for lang in ("en", "es"):
+        text = _write(tmp_path, lang)
+        assert "| 2-4 | " in text
+    assert set(report.HARDNESS_LABELS) == {"<= 2", "2-4", "> 4"}
+
+
+def test_surcharge_strata_and_axis_labels_are_untranslated_in_both_languages(
+    tmp_path,
+):
+    for lang in ("en", "es"):
+        text = _write(tmp_path, lang)
+        assert f"| D - C | {report.SURCHARGE_INACTIVE} |" in text
+        assert f"| E - A | {report.SURCHARGE_INACTIVE} |" in text
+
+
+def test_every_d_and_e_section_exists_in_both_languages(tmp_path):
+    for lang in ("en", "es"):
+        text = _write(tmp_path, lang)
+        strings = report.MARKDOWN_STRINGS[lang]
+        for key in ("d_minus_c_heading", "d_minus_a_heading",
+                    "e_minus_a_heading", "iter_shift_d_heading",
+                    "iter_shift_e_heading", "surcharge_heading"):
+            assert strings[key] in text
+
+
+def test_every_string_key_exists_in_both_languages():
+    # A heading added to one language and forgotten in the other would
+    # KeyError only for the operator who happened to pass that --lang.
+    assert (set(report.MARKDOWN_STRINGS["en"])
+            == set(report.MARKDOWN_STRINGS["es"]))
 
 
 def test_fv_scheme_identifier_is_not_translated_to_vf_in_spanish():
