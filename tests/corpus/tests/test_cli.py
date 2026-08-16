@@ -184,7 +184,8 @@ def test_main_requires_an_engine_for_the_run_stage(corpus_root, tmp_path, capsys
 
 def _diff_runs_fixture(tmp_path):
     """A `runs` table with two OK models, each with real (fake) .out files
-    for all five variants (A-E), so all four DIFF_COMPARISONS are exercised."""
+    for all five variants (A-E), so every DIFF_COMPARISONS entry is
+    exercised."""
     bad = tuple(tmp_path / f"bad_{v}.out" for v in schema.VARIANTS)
     good = tuple(tmp_path / f"good_{v}.out" for v in schema.VARIANTS)
     for path in bad + good:
@@ -258,7 +259,7 @@ def test_diff_stage_deletes_out_files_and_writes_rows_for_a_succeeding_model(
     assert set(ts_diff["model_id"]) == {"F/good"}
 
 
-def test_diff_stage_emits_all_four_comparisons_distinguishable_by_column(
+def test_diff_stage_emits_all_five_comparisons_distinguishable_by_column(
     tmp_path, monkeypatch,
 ):
     out = tmp_path / "out"
@@ -273,10 +274,13 @@ def test_diff_stage_emits_all_four_comparisons_distinguishable_by_column(
     good = ts_diff[ts_diff["model_id"] == "F/good"]
 
     assert "comparison" in good.columns
+    # `D_minus_C` is not derivable downstream from `D_minus_A` and
+    # `C_minus_A` -- these are non-linear reductions of a pointwise
+    # difference -- so it must be produced here as its own comparison.
     assert set(good["comparison"]) == {
-        "B_minus_A", "C_minus_A", "D_minus_A", "E_minus_A",
+        "B_minus_A", "C_minus_A", "D_minus_A", "E_minus_A", "D_minus_C",
     }
-    assert len(good) == 4  # one diff row per comparison from the fake
+    assert len(good) == 5  # one diff row per comparison from the fake
 
 
 def _fake_diff_out_files_raising_when(fail_needle):
@@ -296,15 +300,15 @@ def _fake_diff_out_files_always_raising(a_out, other_out, abs_tol):
     raise RuntimeError("truncated .out file")
 
 
-def test_a_failing_b_minus_a_does_not_cost_the_other_three_comparisons(
+def test_a_failing_b_minus_a_does_not_cost_the_other_comparisons(
     tmp_path, monkeypatch,
 ):
     # b_out is the only bad input; a_out, c_out, d_out and e_out are
-    # perfectly readable, so C - A, D - A and E - A must still be computed
-    # and persisted. Only b_out -- the input the failed comparison actually
-    # read -- may be deleted... and since it failed, it must NOT be: it
-    # stays for a future retry of B - A. a_out is read by EVERY comparison,
-    # so with B - A still outstanding it must survive too.
+    # perfectly readable, so C - A, D - A, E - A and D - C must still be
+    # computed and persisted. Only b_out -- the input the failed comparison
+    # actually read -- may be deleted... and since it failed, it must NOT
+    # be: it stays for a future retry of B - A. a_out is read by four
+    # comparisons, so with B - A still outstanding it must survive too.
     out = tmp_path / "out"
     runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
     store.write_table(runs, out, "runs", partition_by=["family"])
@@ -315,19 +319,25 @@ def test_a_failing_b_minus_a_does_not_cost_the_other_three_comparisons(
 
     ts_diff = store.read_table(out, "ts_diff")
     good = ts_diff[ts_diff["model_id"] == "F/good"]
-    assert set(good["comparison"]) == {"C_minus_A", "D_minus_A", "E_minus_A"}
+    assert set(good["comparison"]) == {
+        "C_minus_A", "D_minus_A", "E_minus_A", "D_minus_C",
+    }
 
     assert good_a.exists()
     assert good_b.exists()
+    # c_out and d_out are each read by two comparisons; both of each pair
+    # succeeded here, so both files are releasable.
     assert not good_c.exists()
     assert not good_d.exists()
     assert not good_e.exists()
 
 
-def test_a_failing_c_minus_a_does_not_cost_the_other_three_comparisons(
+def test_a_failing_c_minus_a_does_not_cost_the_other_comparisons(
     tmp_path, monkeypatch,
 ):
-    # Mirror of the above: c_out is the only bad input.
+    # Mirror of the above: the C - A comparison is the only failing one
+    # (the fake keys off the non-baseline argument, so D - C, which also
+    # reads c_out, still succeeds).
     out = tmp_path / "out"
     runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
     store.write_table(runs, out, "runs", partition_by=["family"])
@@ -338,16 +348,20 @@ def test_a_failing_c_minus_a_does_not_cost_the_other_three_comparisons(
 
     ts_diff = store.read_table(out, "ts_diff")
     good = ts_diff[ts_diff["model_id"] == "F/good"]
-    assert set(good["comparison"]) == {"B_minus_A", "D_minus_A", "E_minus_A"}
+    assert set(good["comparison"]) == {
+        "B_minus_A", "D_minus_A", "E_minus_A", "D_minus_C",
+    }
 
     assert good_a.exists()
     assert not good_b.exists()
+    # C - A still needs a retry, so c_out stays even though its other
+    # reader (D - C) is done with it.
     assert good_c.exists()
     assert not good_d.exists()
     assert not good_e.exists()
 
 
-def test_all_four_comparisons_failing_writes_nothing_and_keeps_all_five_files(
+def test_all_comparisons_failing_writes_nothing_and_keeps_all_five_files(
     tmp_path, monkeypatch,
 ):
     out = tmp_path / "out"
@@ -367,10 +381,10 @@ def test_all_four_comparisons_failing_writes_nothing_and_keeps_all_five_files(
     assert good_e.exists()
 
 
-def test_a_out_is_deleted_only_once_all_four_comparisons_have_flushed(
+def test_a_out_is_deleted_only_once_every_comparison_reading_it_has_flushed(
     tmp_path, monkeypatch,
 ):
-    # Every comparison but E succeeds. Three out of four A-anchored
+    # Every comparison but E - A succeeds. Three out of four A-anchored
     # comparisons flushing is not enough: a_out is read by all four, so it
     # must survive until E - A (or a retry of it) also flushes.
     out = tmp_path / "out"
@@ -383,13 +397,247 @@ def test_a_out_is_deleted_only_once_all_four_comparisons_have_flushed(
 
     ts_diff = store.read_table(out, "ts_diff")
     good = ts_diff[ts_diff["model_id"] == "F/good"]
-    assert set(good["comparison"]) == {"B_minus_A", "C_minus_A", "D_minus_A"}
+    assert set(good["comparison"]) == {
+        "B_minus_A", "C_minus_A", "D_minus_A", "D_minus_C",
+    }
 
     assert good_a.exists()
     assert good_e.exists()
     assert not good_b.exists()
     assert not good_c.exists()
     assert not good_d.exists()
+
+
+def _fake_diff_out_files_raising_only_for_d_minus_c(base_out, other_out, abs_tol):
+    """Fails exactly the D - C comparison: it is the only one whose baseline
+    (first) argument is the C `.out`."""
+    if "_C" in str(base_out) and "_D" in str(other_out):
+        raise RuntimeError("truncated .out file")
+    return [{"element_type": "NODE", "element_id": "n1",
+             "attribute": "INVERT_DEPTH", "max_abs": 1.0, "max_rel": 1.0,
+             "rmse": 1.0, "first_div_period": None, "first_div_time": None,
+             "n_periods": 1}]
+
+
+def test_c_out_survives_c_minus_a_when_d_minus_c_has_not_flushed(
+    tmp_path, monkeypatch,
+):
+    # c_out is read by TWO comparisons now. Deleting it the moment C - A
+    # flushes would strand D - C -- the only honest measurement of Anderson
+    # under Crank-Nicolson, and the sole reason variant D exists.
+    out = tmp_path / "out"
+    runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_only_for_d_minus_c)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    good = ts_diff[ts_diff["model_id"] == "F/good"]
+    assert set(good["comparison"]) == {
+        "B_minus_A", "C_minus_A", "D_minus_A", "E_minus_A",
+    }
+
+    # Both of D - C's inputs stay for its retry, even though each has
+    # already served its A-anchored comparison.
+    assert good_c.exists()
+    assert good_d.exists()
+    # a_out is read by the four A-anchored comparisons only; all four
+    # flushed, so it goes.
+    assert not good_a.exists()
+    assert not good_b.exists()
+    assert not good_e.exists()
+
+
+def test_c_out_is_deleted_once_both_c_minus_a_and_d_minus_c_have_flushed(
+    tmp_path, monkeypatch,
+):
+    # The other half of the rule above: once every comparison that reads
+    # c_out has succeeded and flushed, retaining it is pure waste.
+    out = tmp_path / "out"
+    runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    good = ts_diff[ts_diff["model_id"] == "F/good"]
+    assert "C_minus_A" in set(good["comparison"])
+    assert "D_minus_C" in set(good["comparison"])
+
+    assert not good_c.exists()
+    assert not good_d.exists()
+
+
+def _custom_diff_runs_fixture(tmp_path, spec):
+    """One model whose per-variant `runs` rows are given as
+    {variant: status} or {variant: (status, has_out_file)}."""
+    paths = {}
+    rows = []
+    for variant, value in spec.items():
+        status, has_out = value if isinstance(value, tuple) else (value, True)
+        out_path = None
+        if has_out:
+            path = tmp_path / f"custom_{variant}.out"
+            path.write_bytes(b"not really a binary .out file")
+            paths[variant] = path
+            out_path = str(path)
+        rows.append({"model_id": "F/custom", "family": "F", "variant": variant,
+                     "status": status, "out_path": out_path})
+    return pd.DataFrame(rows), paths
+
+
+def test_out_files_are_deleted_when_their_remaining_comparisons_are_terminal(
+    tmp_path, monkeypatch,
+):
+    # C - A succeeds. Every other comparison reading a_out or c_out is
+    # terminally unavailable: B and D crashed, E ran `ok` but produced no
+    # `.out`. The resume key means `stage_run` will never retry those runs
+    # for this build, so no future `diff` can ever produce B - A, D - A,
+    # E - A or D - C here -- retaining their inputs would be waste with no
+    # recovery path.
+    out = tmp_path / "out"
+    runs, paths = _custom_diff_runs_fixture(tmp_path, {
+        schema.VARIANT_A: schema.Status.OK,
+        schema.VARIANT_B: (schema.Status.CRASH, False),
+        schema.VARIANT_C: schema.Status.OK,
+        schema.VARIANT_D: (schema.Status.TIMEOUT, False),
+        schema.VARIANT_E: (schema.Status.OK, False),  # ok, but null out_path
+    })
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    rows = ts_diff[ts_diff["model_id"] == "F/custom"]
+    assert set(rows["comparison"]) == {"C_minus_A"}
+
+    assert not paths[schema.VARIANT_A].exists()
+    assert not paths[schema.VARIANT_C].exists()
+
+
+def test_c_out_is_retained_when_d_has_no_run_row_at_all(tmp_path, monkeypatch):
+    # The resume case, and the reason "not succeeded" cannot simply mean
+    # "delete": someone may run A/B/C, diff, then add D/E and diff again.
+    # D has no row here, so D - C is merely pending -- deleting c_out would
+    # destroy a computable comparison rather than a dead one.
+    out = tmp_path / "out"
+    runs, paths = _custom_diff_runs_fixture(tmp_path, {
+        schema.VARIANT_A: schema.Status.OK,
+        schema.VARIANT_C: schema.Status.OK,
+    })
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    rows = ts_diff[ts_diff["model_id"] == "F/custom"]
+    assert set(rows["comparison"]) == {"C_minus_A"}
+
+    assert paths[schema.VARIANT_C].exists()
+    assert paths[schema.VARIANT_A].exists()
+
+
+def test_d_minus_c_is_produced_even_when_the_a_run_is_unavailable(
+    tmp_path, monkeypatch,
+):
+    # No comparison depends on another's inputs: D - C reads C and D only,
+    # so a crashed A run costs the A-anchored comparisons and nothing else.
+    out = tmp_path / "out"
+    runs, paths = _custom_diff_runs_fixture(tmp_path, {
+        schema.VARIANT_A: (schema.Status.CRASH, False),
+        schema.VARIANT_C: schema.Status.OK,
+        schema.VARIANT_D: schema.Status.OK,
+    })
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    rows = ts_diff[ts_diff["model_id"] == "F/custom"]
+    assert set(rows["comparison"]) == {"D_minus_C"}
+
+
+def _mixed_engine_diff_runs(tmp_path):
+    """One model whose A ran under build 1 and whose C ran under build 2,
+    plus a REF row carrying the fixed `corpus-reference` sentinel."""
+    rows = []
+    paths = {}
+    for variant, version in ((schema.VARIANT_A, "openswmm 1.0"),
+                             (schema.VARIANT_C, "openswmm 2.0")):
+        path = tmp_path / f"mixed_{variant}.out"
+        path.write_bytes(b"not really a binary .out file")
+        paths[variant] = path
+        rows.append({"model_id": "F/mixed", "family": "F", "variant": variant,
+                     "engine_version": version, "status": schema.Status.OK,
+                     "out_path": str(path)})
+    rows.append({"model_id": "F/mixed", "family": "F",
+                 "variant": schema.VARIANT_REF,
+                 "engine_version": cli.REF_ENGINE_VERSION,
+                 "status": schema.Status.OK, "out_path": None})
+    return pd.DataFrame(rows), paths
+
+
+def test_diff_refuses_a_store_holding_two_engine_builds(
+    tmp_path, monkeypatch, capsys,
+):
+    # `runs` is keyed on engine_version, so two builds legitimately coexist.
+    # Taking the last out_path per variant would diff build 1's A against
+    # build 2's C under a single label -- a number attributable to neither.
+    out = tmp_path / "out"
+    runs, paths = _mixed_engine_diff_runs(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    code = cli.stage_diff(out, abs_tol=1e-9)
+
+    assert code != 0
+    ts_diff = store.read_table(out, "ts_diff")
+    assert ts_diff.empty
+    # Nothing written means nothing deleted either.
+    assert paths[schema.VARIANT_A].exists()
+    assert paths[schema.VARIANT_C].exists()
+
+    captured = capsys.readouterr()
+    assert "openswmm 1.0" in captured.out
+    assert "openswmm 2.0" in captured.out
+
+
+def test_diff_does_not_count_the_reference_sentinel_as_an_engine_build(
+    tmp_path, monkeypatch,
+):
+    # REF rows always carry `corpus-reference`; counting it would make every
+    # single-build store look mixed and refuse every sweep.
+    out = tmp_path / "out"
+    runs, paths = _custom_diff_runs_fixture(tmp_path, {
+        schema.VARIANT_A: schema.Status.OK,
+        schema.VARIANT_C: schema.Status.OK,
+    })
+    runs["engine_version"] = "openswmm 1.0"
+    runs = pd.concat([runs, pd.DataFrame([{
+        "model_id": "F/custom", "family": "F", "variant": schema.VARIANT_REF,
+        "engine_version": cli.REF_ENGINE_VERSION,
+        "status": schema.Status.OK, "out_path": None,
+    }])], ignore_index=True)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    code = cli.stage_diff(out, abs_tol=1e-9)
+
+    assert code == 0
+    ts_diff = store.read_table(out, "ts_diff")
+    assert set(ts_diff["comparison"]) == {"C_minus_A"}
 
 
 def _partial_diff_runs_fixture(tmp_path, present_variants):
@@ -465,10 +713,9 @@ def test_a_missing_d_run_still_yields_the_other_three_comparisons(tmp_path, monk
     rows = ts_diff[ts_diff["model_id"] == "F/partial"]
     assert set(rows["comparison"]) == {"B_minus_A", "C_minus_A", "E_minus_A"}
 
-    # a_out is read by every attempted comparison; D was never attempted
-    # (its .out is entirely absent, not merely failed), so the three
-    # attempted comparisons succeeding is not "all of DIFF_COMPARISONS" --
-    # a_out must survive for a future D - A once D actually runs.
+    # D - A is one of a_out's four readers and it was never attempted: D has
+    # no run row at all, so it is pending rather than terminally
+    # unavailable. a_out must survive for that future D - A.
     assert paths[schema.VARIANT_A].exists()
 
 
@@ -502,14 +749,15 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
     captured = capsys.readouterr()
     assert "F/bad" in captured.out
     # `_fake_diff_out_files_raising_for_bad` fails for every comparison of
-    # this model (it keys off `a_out`, which all four read), so all four
-    # labels must be identifiable in the warning output -- naming the model
-    # alone would also be satisfied by a message that dropped which
-    # comparison failed.
+    # this model (it keys off the baseline argument, and every baseline of
+    # this model is a "bad_*" path), so all five labels must be identifiable
+    # in the warning output -- naming the model alone would also be
+    # satisfied by a message that dropped which comparison failed.
     assert "B_minus_A" in captured.out
     assert "C_minus_A" in captured.out
     assert "D_minus_A" in captured.out
     assert "E_minus_A" in captured.out
+    assert "D_minus_C" in captured.out
 
 
 def test_multi_worker_runs_produce_the_same_results_as_a_single_worker(

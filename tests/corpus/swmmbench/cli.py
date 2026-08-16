@@ -267,55 +267,109 @@ def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> N
         path.unlink(missing_ok=True)
 
 
-#: Which variant's `.out` is compared against A, and the label stamped on
-#: the rows that comparison produces. Every comparison here is anchored on
-#: A (it is the shared baseline `.out` every one of them reads), which keeps
-#: the A `.out` retention rule below uniform across all of them -- it does
-#: NOT mean every comparison's *interpretation* is A - X alone: D - A is a
-#: joint effect (Anderson + Crank-Nicolson together) and its attributable
-#: reading is D - C, formed downstream from D_minus_A and C_minus_A. B
-#: isolates Anderson acceleration (EXPLICIT/EXTRAN); C isolates
-#: semi-implicit (Crank-Nicolson) node continuity; D is the joint Anderson +
-#: Crank-Nicolson regime Anderson was designed for; E isolates the Dynamic
-#: Preissmann Slot surcharge method.
+#: Time-series comparisons, as `(left, right, label)`: each produces rows
+#: labelled `label` holding the divergence of `left`'s `.out` from `right`'s.
+#:
+#: `D_minus_C` is a FIRST-CLASS comparison here, not something a reader can
+#: reconstruct downstream. A `ts_diff` row holds `max_abs`, `max_rel`, `rmse`
+#: and `first_div_period` -- non-linear reductions over the pointwise
+#: difference of two series -- and `max_abs(D, C)` is NOT
+#: `max_abs(D, A) - max_abs(C, A)`; the triangle inequality gives a bound,
+#: never a value. So pairing `D_minus_A` with `C_minus_A` cannot yield
+#: D - C at the time-series level, and without this entry the only reason
+#: variant D exists would be unmeasurable from anything the harness writes.
+#: (At the *scalar* level `D - C` IS derivable, because `value_d - value_c`
+#: is linear; that is `report.build_deltas`'s business, not this stage's.)
+#:
+#: B isolates Anderson acceleration (EXPLICIT/EXTRAN); C isolates
+#: semi-implicit (Crank-Nicolson) node continuity; D - A is the joint
+#: Anderson + Crank-Nicolson effect and D - C the attributable incremental
+#: Anderson one; E isolates the Dynamic Preissmann Slot surcharge method.
 DIFF_COMPARISONS = (
-    (schema.VARIANT_B, "B_minus_A"),
-    (schema.VARIANT_C, "C_minus_A"),
-    (schema.VARIANT_D, "D_minus_A"),
-    (schema.VARIANT_E, "E_minus_A"),
+    (schema.VARIANT_B, schema.VARIANT_A, "B_minus_A"),
+    (schema.VARIANT_C, schema.VARIANT_A, "C_minus_A"),
+    (schema.VARIANT_D, schema.VARIANT_A, "D_minus_A"),
+    (schema.VARIANT_E, schema.VARIANT_A, "E_minus_A"),
+    (schema.VARIANT_D, schema.VARIANT_C, "D_minus_C"),
 )
 
 
-def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
-    """Diff the retained A-anchored `.out` pairs, then discard the binaries.
+def _comparison_is_resolved(
+    comparison: tuple[str, str, str],
+    variant: str,
+    succeeded: set[str],
+    usable: dict[str, str],
+    recorded: set[str],
+) -> bool:
+    """True when `comparison` can no longer need `variant`'s `.out` on disk.
+
+    Resolved means either it succeeded on this pass (its rows are queued for
+    the flush that precedes any deletion), or it is *terminally unavailable*:
+    the other side is recorded in `runs` for this build with a status that is
+    not `ok`, or `ok` with no `out_path`. The resume key guarantees
+    `stage_run` will not retry such a run, so no future `diff` can ever
+    produce this comparison for this model under this build -- retaining a
+    file for it would be waste with no recovery path.
+
+    Deliberately NOT resolved: the other side has no run row at all (merely
+    pending -- someone may run A/B/C, diff, then add D/E and diff again), or
+    it ran `ok` but its diff raised on this pass (retryable).
+    """
+    left, right, label = comparison
+    if label in succeeded:
+        return True
+    other = right if variant == left else left
+    return other not in usable and other in recorded
+
+
+#: Console messages `stage_diff` prints when it refuses a mixed-build store.
+#: English-only, like every other `stage_run`/`stage_diff` message; only
+#: `stage_report`'s output is translated (see `STAGE_REPORT_STRINGS`).
+DIFF_MIXED_ENGINE_ERROR = (
+    "ERROR: `runs` mixes results from more than one engine build; diff "
+    "refuses to compare `.out` files it cannot attribute to one build."
+)
+DIFF_MIXED_ENGINE_HINT = (
+    "Re-run `diff` against a store holding a single engine build."
+)
+
+
+def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> int:
+    """Diff the retained `.out` pairs, then discard the binaries safely.
+
+    Returns a process exit code; non-zero means nothing was written.
 
     `abs_tol` is an absolute tolerance on the value difference, not a relative
     one: it is the threshold `outdiff.diff_series` compares `|b - a|` against.
 
-    Only variant A is required per model: it is the shared baseline every
-    comparison in `DIFF_COMPARISONS` reads. Each comparison runs whenever its
-    OWN variant's `.out` is present, independently of whether any other
-    variant ran at all -- a model whose C run crashed still yields its
-    B - A, D - A and E - A.
+    Each comparison in `DIFF_COMPARISONS` runs whenever BOTH of its own
+    variants' `.out` files are present, independently of every other
+    comparison. A truncated (or missing) `.out` for one variant must not cost
+    an otherwise-computable comparison for another -- the same "a
+    missing/bad thing must not cost an unrelated computable result"
+    principle already applied to the iteration-kind guard in
+    `report.build_deltas` and, one level up, to per-model isolation in this
+    very stage. So a model whose C run crashed still yields B - A, D - A and
+    E - A, and a model whose A run crashed still yields D - C.
 
-    Each comparison is isolated, not each model: B - A reads `a_out` and
-    `b_out`; C - A reads `a_out` and `c_out`; likewise for D - A and E - A.
-    A truncated (or missing) `.out` for one variant must not cost an
-    otherwise-computable comparison for another -- the same "a missing/bad
-    thing must not cost an unrelated computable result" principle already
-    applied to the iteration-kind guard in `report.build_deltas` and, one
-    level up, to per-model isolation in this very stage.
+    Deletion follows one general rule, not a per-variant special case: for
+    each `.out` file, the set of comparisons that READ it is computed from
+    `DIFF_COMPARISONS`, and the file is deleted only once every comparison
+    in that set is resolved -- succeeded on this pass, or terminally
+    unavailable (see `_comparison_is_resolved`). It is retained while any
+    reader is merely pending (the other variant has not run yet) or
+    retryable (it ran `ok` but its diff raised this pass). `a_out` is read by
+    four comparisons and `c_out`/`d_out` by two each, so neither `c_out` nor
+    `d_out` may be dropped when only `C - A` / `D - A` has flushed --
+    `D - C` still needs them.
 
-    Deletion follows the comparisons that actually ran and succeeded for
-    each file: `b_out` is deletable once B - A has flushed, `c_out` once
-    C - A has flushed, `d_out`/`e_out` likewise for D - A/E - A, and
-    `a_out` -- read by every comparison in `DIFF_COMPARISONS` -- only once
-    ALL of them have flushed. A comparison that raises, OR was never
-    attempted because its variant's `.out` is missing, leaves every `.out`
-    file IT would have read in place for a future re-run; it never touches
-    another comparison's outcome. Rows are flushed to disk in batches of
-    `FLUSH_BATCH_SIZE` models, and only the `.out` files behind an
-    already-flushed batch are deleted.
+    The trade is deliberately asymmetric: `.out` files are regenerable by
+    re-running the model, whereas the diff rows derived from them are not.
+    Over-retention costs disk; over-deletion costs a re-run. Which is why
+    rows are always flushed to disk BEFORE any file behind them is unlinked,
+    in every path -- batch boundaries and the final remainder alike. Rows
+    are flushed in batches of `FLUSH_BATCH_SIZE` models, and only the `.out`
+    files behind an already-flushed batch are deleted.
     """
     from . import outdiff
 
@@ -323,58 +377,68 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
 
     runs = store.read_table(out_dir, "runs")
     if runs.empty or "out_path" not in runs.columns:
-        return
+        return 0
 
-    ok = runs[(runs["status"] == schema.Status.OK)
-              & (runs["variant"].isin(schema.VARIANTS))
-              & runs["out_path"].notna()]
+    # `runs` is keyed on (model_id, variant, engine_version, inp_sha256), so
+    # two engine builds legitimately coexist in one store. Taking the last
+    # `out_path` per variant would then silently diff build 1's A against
+    # build 2's E -- a comparison of two different engines wearing one
+    # label. `stage_report` already refuses on this; so does this stage.
+    versions = executed_engine_versions(runs)
+    if len(versions) > 1:
+        print(DIFF_MIXED_ENGINE_ERROR)
+        for version in versions:
+            print(f"  {version}")
+        print(DIFF_MIXED_ENGINE_HINT)
+        return 1
+
+    executed = runs[runs["variant"].isin(schema.VARIANTS)]
 
     rows: list[dict] = []
     pending: list[Path] = []
     batch_count = 0
 
-    for model_id, group in ok.groupby("model_id"):
-        paths = dict(zip(group["variant"], group["out_path"]))
-        # Only A is required here: it is the shared baseline both
-        # comparisons read, so without it neither is possible. Requiring B
-        # AND C used to mean a model whose brand-new C run crashed (the
-        # variant most likely to fail, across a 1646-model third-party
-        # corpus) lost its otherwise-perfectly-computable B - A too. Each
-        # comparison below is then run only if ITS OTHER variant is present.
-        if schema.VARIANT_A not in paths:
-            continue
-        a_out = Path(paths[schema.VARIANT_A])
+    for model_id, group in executed.groupby("model_id"):
+        # Every variant with a run row at all, versus those whose row is
+        # usable as a diff input. The difference is exactly what separates a
+        # merely-pending comparison (retain its inputs) from a terminally
+        # unavailable one (release them).
+        recorded = set(group["variant"])
+        ok = group[(group["status"] == schema.Status.OK)
+                   & group["out_path"].notna()]
+        usable = dict(zip(ok["variant"], ok["out_path"]))
         family = group["family"].iloc[0]
 
         succeeded: set[str] = set()
-        for variant, comparison in DIFF_COMPARISONS:
-            if variant not in paths:
-                continue  # that variant's run is missing; not attempted
-            other_out = Path(paths[variant])
+        for comparison in DIFF_COMPARISONS:
+            left, right, label = comparison
+            if left not in usable or right not in usable:
+                continue  # an input is missing; not attempted
+            # `outdiff.diff_out_files` reduces `second - first`, so the
+            # RIGHT side of the label is the first argument: D_minus_C
+            # passes (c_out, d_out) and reports D's divergence from C.
+            base_out, other_out = Path(usable[right]), Path(usable[left])
             try:
-                diff_rows = outdiff.diff_out_files(a_out, other_out, abs_tol)
+                diff_rows = outdiff.diff_out_files(base_out, other_out, abs_tol)
             except Exception as error:  # noqa: BLE001  isolate one bad comparison
                 print(f"WARNING: diff failed for model {model_id!r} "
-                      f"({comparison}): {error}")
+                      f"({label}): {error}")
                 continue
 
             for row in diff_rows:
                 rows.append({
                     "model_id": model_id, "family": family,
-                    "comparison": comparison, **row,
+                    "comparison": label, **row,
                 })
-            # `other_out` (b_out or c_out) is read only by this comparison,
-            # so it may be scheduled for deletion as soon as this
-            # comparison's own rows are queued -- the batch flush below
-            # still writes them before anything in `pending` is unlinked.
-            pending.append(other_out)
-            succeeded.add(variant)
+            succeeded.add(label)
 
-        # `a_out` is read by BOTH comparisons. It may only be scheduled for
-        # deletion once both have succeeded: if either failed, that
-        # comparison's future retry still needs `a_out` on disk.
-        if len(succeeded) == len(DIFF_COMPARISONS):
-            pending.append(a_out)
+        for variant, out_path in usable.items():
+            readers = [c for c in DIFF_COMPARISONS if variant in (c[0], c[1])]
+            if not readers:
+                continue  # read by nothing; keep it rather than guess why
+            if all(_comparison_is_resolved(c, variant, succeeded, usable, recorded)
+                   for c in readers):
+                pending.append(Path(out_path))
 
         batch_count += 1
         if batch_count >= FLUSH_BATCH_SIZE:
@@ -382,6 +446,7 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
             rows, pending, batch_count = [], [], 0
 
     _flush_diff_batch(out_dir, rows, pending)
+    return 0
 
 
 def _replace_table(frame: pd.DataFrame, out_dir: Path, name: str,
@@ -568,8 +633,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if clean else 1
 
     if args.stage == "diff":
-        stage_diff(args.out, args.abs_tol)
-        return 0
+        return stage_diff(args.out, args.abs_tol)
 
     if args.stage == "report":
         return stage_report(args.out, args.lang)

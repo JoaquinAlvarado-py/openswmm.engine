@@ -1,8 +1,13 @@
-"""B - A time-series comparison.
+"""Pairwise time-series comparison of two `.out` files.
 
-Diffs are aggregated per element and attribute. Retaining raw series for 878
-models across two configurations would run to billions of rows, so each pair
-of `.out` files is read, reduced, and discarded.
+The pairs are whatever `cli.DIFF_COMPARISONS` names -- four A-anchored
+comparisons plus D - C, over the five executed variants. Nothing here is
+anchored on A: `diff_out_files(first, second)` reduces `second - first` for
+any two files.
+
+Diffs are aggregated per element and attribute. Retaining raw series for a
+~1700-model corpus across five configurations would run to billions of rows,
+so each pair of `.out` files is read, reduced, and discarded.
 
 The `openswmm` binding is imported lazily: it requires a built engine, and
 every other stage of the harness must remain usable without one.

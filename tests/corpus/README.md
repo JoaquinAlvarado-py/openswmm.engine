@@ -13,7 +13,8 @@ EPA SWMM 5.2 reports.
 | E | `NO` | `EXPLICIT` | `DYNAMIC_SLOT` | the Dynamic Preissmann Slot (`E - A`) |
 | REF | (not run) | (not run) | (not run) | the corpus's own EPA SWMM 5.2 report; parity debt (`A - REF`) |
 
-A is the shared baseline every comparison reads, and every option under
+A is the baseline four of the five comparisons read (`D - C` is the
+exception; it reads C and D only), and every option under
 study is stated explicitly in all five decks (never left to an engine
 default) so a future default change cannot silently redefine it. B, C and E
 each move exactly one option relative to A, so `B - A`, `C - A` and `E - A`
@@ -108,10 +109,13 @@ Exit codes are meaningful and worth wiring into CI:
 - `run` and `check` return non-zero if any harness temporary deck survives in
   the corpus. The corpus is read-only by contract; a leftover deck would be
   inventoried as a model by the next sweep.
-- `report` returns non-zero, and writes nothing, if `runs` holds results from
-  more than one engine build. Two builds legitimately coexist in one store
-  (they are part of the resume key), but the report will not guess which to
-  publish. Point `--out` at a store holding a single build.
+- `diff` and `report` return non-zero, and write nothing, if `runs` holds
+  results from more than one engine build. Two builds legitimately coexist in
+  one store (they are part of the resume key), but the report will not guess
+  which to publish, and `diff` will not compare one build's `.out` against
+  another's under a single label. Point `--out` at a store holding a single
+  build. The `REF` rows' `corpus-reference` sentinel is not a build and never
+  triggers either refusal.
 - `run` returns non-zero if `--engine` is missing; every stage returns non-zero
   if a flag it requires is absent.
 
@@ -130,15 +134,26 @@ pivot = runs.pivot_table(index="model_id", columns="variant",
 `iteration_metric_kind` must be checked before comparing iteration counts:
 `fv_substeps` rows count explicit substeps, not Picard iterations.
 
-`ts_diff` carries all four time-series comparisons in one table, distinguished
-by its `comparison` column (`B_minus_A`, `C_minus_A`, `D_minus_A` or
-`E_minus_A`). Every comparison is anchored on A -- it is the shared baseline
-`.out` each one reads -- but that does not mean `D - A` is a one-cause
-delta: it is a joint Anderson + Crank-Nicolson effect, and `D_minus_A` /
-`C_minus_A` together are what let you form the attributable `D - C` pairing
-yourself from this table:
+`ts_diff` carries all five time-series comparisons in one table, distinguished
+by its `comparison` column (`B_minus_A`, `C_minus_A`, `D_minus_A`,
+`E_minus_A` and `D_minus_C`):
 
 ```python
 ts_diff = pd.read_parquet("results/ts_diff")
 ts_diff[ts_diff["comparison"] == "C_minus_A"]   # Crank-Nicolson's effect on state
+ts_diff[ts_diff["comparison"] == "D_minus_C"]   # incremental Anderson under Crank-Nicolson
 ```
+
+`D_minus_C` is stored directly, and it has to be: **do not try to form it by
+subtracting `C_minus_A` from `D_minus_A`.** A `ts_diff` row holds `max_abs`,
+`max_rel`, `rmse` and `first_div_period` -- non-linear reductions over the
+pointwise difference of two whole series. `max_abs(D, C)` is not
+`max_abs(D, A) - max_abs(C, A)`; the triangle inequality bounds it, it does
+not give its value. `D_minus_A` remains a joint Anderson + Crank-Nicolson
+effect and is not attributable to one cause; `D_minus_C` is the attributable
+measurement, and only the row labelled `D_minus_C` carries it.
+
+The scalar tables behave differently, and the contrast is worth keeping
+straight: a scalar metric is a single number per (model, variant), so at that
+level `D - C` is a plain linear subtraction, `value_d - value_c`. That
+linearity is exactly what fails for the time-series reductions above.
