@@ -7,6 +7,7 @@ redefine the baseline and invalidate comparisons against earlier sweeps.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from contextlib import contextmanager
 from pathlib import Path
@@ -97,6 +98,37 @@ OPTIONS: dict[str, dict[str, str]] = {
         "SURCHARGE_METHOD": "DYNAMIC_SLOT",
     },
 }
+
+#: Prefix on an option-set fingerprint, so a `case_id` field can never be
+#: mistaken for one of the other prefixed identities (`sha256:`, `argv:`,
+#: `git:`, `unpinned:`, `corpus-reference`).
+OPTIONS_ID_PREFIX = "options:"
+
+
+def options_id(variant: str) -> str:
+    """A hash of the RESOLVED option set `variant`'s deck is written with.
+
+    The variant letter alone does not identify a unit of work: `B` means
+    whatever `OPTIONS[B]` says today, and that table has been edited several
+    times. Without this in the `case_id`, a `B` run recorded before an edit
+    and a `B` run after it are one case, so the second is skipped as "already
+    done" and the store quietly holds two different configurations under one
+    id. `options_applied` is written to `runs`, but a column nobody joins on
+    documents the drift rather than preventing it.
+
+    Hashed over the SORTED key/value pairs, so it identifies the option set
+    itself: reordering the dict literal (or moving a key into `_COMMON`)
+    leaves every existing case valid, while changing any key or value
+    invalidates exactly the variants that changed.
+
+    `REF` -- and any other variant with no entry -- hashes the empty set. A
+    reference row is parsed, never run with options, so nothing about
+    `OPTIONS` should ever re-read the anchors.
+    """
+    options = OPTIONS.get(variant, {})
+    payload = "\n".join(f"{key}={value}" for key, value in sorted(options.items()))
+    return OPTIONS_ID_PREFIX + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 TEMP_PREFIX = ".swmmbench_"
 

@@ -11,6 +11,11 @@ them side by side rather than collapsed is the reason the A/B/C/D/E matrix
 exists: folding two feature changes into one variant would make an observed
 shift unattributable between their two causes.
 
+A/B/C/D is additionally a full 2x2 factorial over ANDERSON_ACCEL and
+NODE_CONTINUITY, so it supports one measurement none of the simple effects
+above can give: the INTERACTION, `(D - C) - (B - A)`. See
+`INTERACTION_SPEC`.
+
 Unlike the time-series stage (`cli.stage_diff`), `D - C` here is a plain
 linear subtraction of two scalars, so it is formed from the same pivot as
 every other axis rather than needing its own comparison pass.
@@ -71,8 +76,57 @@ DELTA_SPECS = (
     ("delta_a_minus_ref", schema.VARIANT_A, schema.VARIANT_REF),
 )
 
-DELTA_COLUMNS = [column for column, _, _ in DELTA_SPECS]
+#: The 2x2 factorial interaction between the two factors A/B/C/D crosses --
+#: Anderson acceleration and node continuity -- and the two simple effects it
+#: is formed from, as `(column, anderson_under_semi_implicit,
+#: anderson_under_explicit)`:
+#:
+#:     delta_interaction = (D - C) - (B - A)  ==  D - C - B + A
+#:
+#: A/B/C/D is a full 2x2 design (ANDERSON_ACCEL x NODE_CONTINUITY), and the
+#: five simple effects above are all it publishes. None of them answers the
+#: question the design exists to ask: *does switching to semi-implicit
+#: continuity change how effective Anderson acceleration is?* `B - A` measures
+#: Anderson under EXPLICIT, `D - C` measures it under SEMI_IMPLICIT, and only
+#: their difference measures whether the operator changed the answer.
+#:
+#: It is expected to be non-zero, which is exactly why it must be quantified
+#: rather than assumed: `DWSolver::computeAASkipFlags` disables Anderson at
+#: every surcharged node under EXPLICIT/EXTRAN and not under SEMI_IMPLICIT, so
+#: the two simple effects are measurements of two different regimes. A
+#: near-zero interaction would be evidence that the skip flags do not matter
+#: on this corpus -- a finding in its own right, and one no single axis can
+#: report.
+#:
+#: Derived from the two DELTA_SPECS columns rather than from the four raw
+#: values, deliberately: each of those columns is already null when its own
+#: operand is missing or when `_commensurable` rejects its pairing, so the
+#: interaction inherits both rules by construction. A fifth screen written
+#: here could drift from the four it is supposed to agree with; a case the
+#: screens reject cannot slip in through the interaction because the
+#: interaction never sees the raw values at all.
+INTERACTION_COLUMN = "delta_interaction"
+INTERACTION_SPEC = (INTERACTION_COLUMN, "delta_d_minus_c", "delta_b_minus_a")
+
+#: Axis notation for the interaction, in the same register as `B - A` and
+#: `D - C`: data, not prose, and verbatim in both languages.
+INTERACTION_AXIS = "(D - C) - (B - A)"
+
+DELTA_COLUMNS = [column for column, _, _ in DELTA_SPECS] + [INTERACTION_COLUMN]
 VALUE_COLUMNS = [f"value_{variant.lower()}" for variant in DELTA_VARIANTS]
+
+#: The `case_id` of each variant's source run, carried through to `deltas`
+#: and `element_deltas` -- one column per variant, exactly parallel to
+#: `VALUE_COLUMNS`.
+#:
+#: These tables are recomputed and replaced on every `report`, so without the
+#: provenance a published number is traceable only as far as "some row of
+#: `runs`". With it, every `value_e` and every `delta_e_minus_a` names the
+#: exact executable and the exact corpus state that produced it. One column
+#: per variant rather than one per row because a delta row is a JOIN across
+#: six runs: a single `case_id` would have to pick a side, and the side it
+#: picked would be the one nobody was asking about.
+CASE_ID_COLUMNS = [f"case_id_{variant.lower()}" for variant in DELTA_VARIANTS]
 
 
 def _pivot(runs: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -237,11 +291,29 @@ def _commensurable(
     return True
 
 
+def _interaction(row: dict) -> object:
+    """`(D - C) - (B - A)` for one delta row, or `pd.NA`.
+
+    Reads the two already-computed simple effects rather than the four raw
+    values, so it is null exactly when either constituent pairing is -- an
+    operand missing, or the pairing rejected by a commensurability screen --
+    with no screen of its own to drift out of step with them. See
+    `INTERACTION_SPEC`.
+    """
+    _column, minuend, subtrahend = INTERACTION_SPEC
+    left, right = row.get(minuend), row.get(subtrahend)
+    if left is None or right is None or pd.isna(left) or pd.isna(right):
+        return pd.NA
+    return left - right
+
+
 def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
     """One row per (model, metric) with A..E and REF values and all deltas.
 
     A row is always emitted, never dropped; an individual delta is null when
     either operand is missing or when `_commensurable` rejects the pairing.
+    `delta_interaction` follows the same two rules over all four of its
+    operands, by being derived from the two deltas that already enforce them.
     """
     if runs.empty:
         return pd.DataFrame()
@@ -253,6 +325,10 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
     kinds = _pivot(runs, "iteration_metric_kind")
     routing = _pivot(runs, "reported_routing_model")
     echoes = echo_pivots(runs)
+    # Empty for a store written before `case_id` existed; `_lookup` then
+    # yields NA and the columns are still emitted, so the schema does not
+    # depend on the age of the store.
+    cases = _pivot(runs, "case_id")
 
     families = runs.groupby("model_id")["family"].first()
     rows: list[dict] = []
@@ -270,6 +346,9 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
             }
             row.update({f"value_{variant.lower()}": values[variant]
                         for variant in DELTA_VARIANTS})
+            row.update({f"case_id_{variant.lower()}":
+                        _lookup(cases, model_id, variant)
+                        for variant in DELTA_VARIANTS})
 
             for column, left, right in DELTA_SPECS:
                 value_left, value_right = values[left], values[right]
@@ -278,6 +357,7 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
                                              kinds, routing, echoes))
                 row[column] = (value_left - value_right) if usable else pd.NA
 
+            row[INTERACTION_COLUMN] = _interaction(row)
             rows.append(row)
 
     return pd.DataFrame(rows)
@@ -365,6 +445,127 @@ def anomaly_summary(anomalies: pd.DataFrame) -> pd.DataFrame:
     frame = grouped.agg(runs=("model_id", "size"),
                         models=("model_id", "nunique")).reset_index()
     return frame.sort_values(["variant", "option"], ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Time-series comparisons computed over an incomplete overlap
+# ---------------------------------------------------------------------------
+#
+# `outdiff.diff_series` compares only the timestamps two runs SHARE. If one
+# run stopped at hour 12 of a 24-hour simulation and the two agreed over the
+# first 12, its row reports `max_abs ~ 0` -- an excellent result, computed
+# over half a run that silently failed. The numbers are still published (the
+# agreement over the compared span is a real finding, and it is the evidence
+# that identifies the truncation as the whole story), but a published number
+# that cannot be read as a full comparison must be COUNTED and ATTRIBUTED,
+# not merely accompanied by a column somebody might notice -- the same
+# standard the option-echo anomalies and the withheld-iteration ledger meet.
+
+#: `ts_diff` columns this section reads. A store whose `ts_diff` predates them
+#: has no coverage evidence at all, which is reported as *not assessed* rather
+#: than as *complete*: absence of evidence is not evidence of completeness.
+COVERAGE_FRACTION_COLUMN = "coverage_fraction"
+TIME_GRID_MATCH_COLUMN = "time_grid_match"
+
+COVERAGE_ANOMALY_COLUMNS = ["comparison", "models", "series", "min_coverage"]
+
+
+def _incomplete_coverage(ts_diff: pd.DataFrame) -> pd.Series:
+    """Per-row mask of comparisons that did NOT cover both grids in full.
+
+    A row counts as incomplete when its `time_grid_match` is known False, or
+    when its `coverage_fraction` is known and below 1.0. Either alone would
+    miss a store carrying only the other column; neither treats a MISSING
+    value as incomplete, for the same reason a missing option echo is not a
+    contradiction -- absence is no evidence, and a store written before these
+    columns existed must not be reported as a corpus-wide anomaly.
+    """
+    incomplete = pd.Series(False, index=ts_diff.index)
+    if TIME_GRID_MATCH_COLUMN in ts_diff.columns:
+        matched = ts_diff[TIME_GRID_MATCH_COLUMN]
+        incomplete |= matched.notna() & ~matched.fillna(False).astype(bool)
+    if COVERAGE_FRACTION_COLUMN in ts_diff.columns:
+        fraction = pd.to_numeric(ts_diff[COVERAGE_FRACTION_COLUMN],
+                                 errors="coerce")
+        incomplete |= fraction.notna() & (fraction < 1.0)
+    return incomplete
+
+
+def coverage_anomalies(ts_diff: pd.DataFrame) -> pd.DataFrame:
+    """Time-series comparisons whose two runs did not cover the same grid.
+
+    One row per `comparison`, because that is what an operator acts on:
+    `D_minus_C` alone points at the C or D run, every comparison at once
+    points at A.
+
+    `models` is the count of distinct models affected -- equivalently, of
+    affected (model, comparison) pairings, since a comparison contributes one
+    pairing per model. `series` is the number of `ts_diff` rows behind them,
+    i.e. per-element per-attribute series. Both are given for the reason the
+    exclusion ledger separates pairings from models: a truncated run
+    truncates every element and attribute it wrote, so `series` alone would
+    report one stopped simulation as thousands of failures, while `models`
+    alone would hide how much of the comparison is affected.
+
+    `min_coverage` is the worst `coverage_fraction` in the group, so a reader
+    can tell a comparison that missed one reporting period from one that
+    missed half the simulation without opening the Parquet store.
+    """
+    if ts_diff.empty or not {"comparison", "model_id"} <= set(ts_diff.columns):
+        return pd.DataFrame(columns=COVERAGE_ANOMALY_COLUMNS)
+
+    flagged = ts_diff[_incomplete_coverage(ts_diff)]
+    if flagged.empty:
+        return pd.DataFrame(columns=COVERAGE_ANOMALY_COLUMNS)
+
+    fraction = (pd.to_numeric(flagged[COVERAGE_FRACTION_COLUMN],
+                              errors="coerce")
+                if COVERAGE_FRACTION_COLUMN in flagged.columns
+                else pd.Series(float("nan"), index=flagged.index,
+                               dtype="float64"))
+    frame = flagged.assign(_coverage=fraction)
+
+    grouped = frame.groupby("comparison", observed=True)
+    rows = [{"comparison": comparison,
+             "models": group["model_id"].nunique(),
+             "series": len(group),
+             "min_coverage": group["_coverage"].min()}
+            for comparison, group in grouped]
+    return (pd.DataFrame(rows, columns=COVERAGE_ANOMALY_COLUMNS)
+            .sort_values("comparison", ignore_index=True))
+
+
+def coverage_anomaly_models(ts_diff: pd.DataFrame) -> int:
+    """Distinct models with at least one incomplete-overlap comparison.
+
+    NOT the sum of `coverage_anomalies`'s `models` column. That column is a
+    per-comparison count, and one truncated run truncates every comparison it
+    takes part in, so summing it reports a single stopped simulation as
+    "5 model(s)" -- inflating the headline by up to the number of comparisons
+    while the table beneath it says 1 five times over. Counted across
+    comparisons here, from the same mask the table is built from, so the
+    headline and the table are two views of one set rather than two
+    computations that can disagree.
+    """
+    if ts_diff is None or ts_diff.empty:
+        return 0
+    if not {"comparison", "model_id"} <= set(ts_diff.columns):
+        return 0
+    return int(ts_diff[_incomplete_coverage(ts_diff)]["model_id"].nunique())
+
+
+def coverage_was_assessed(ts_diff: pd.DataFrame) -> bool:
+    """True when `ts_diff` carries coverage evidence at all.
+
+    False for an absent `ts_diff` and for one written before the coverage
+    columns existed. The summary states that case as *not assessed*: an
+    unqualified "every comparison covered the full run" would be a claim the
+    store cannot support.
+    """
+    if ts_diff is None or ts_diff.empty:
+        return False
+    return bool({COVERAGE_FRACTION_COLUMN, TIME_GRID_MATCH_COLUMN}
+                & set(ts_diff.columns))
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +870,77 @@ MARKDOWN_STRINGS = {
         "anomaly_none": [
             "No run echoed an option value contradicting its variant's intent.",
         ],
+        "coverage_anomaly_heading": "## Time-series comparisons over an incomplete overlap",
+        "coverage_anomaly_header": "| comparison | models | series | min coverage |",
+        "coverage_anomaly_sep": "| --- | --- | --- | --- |",
+        "coverage_anomaly_intro": [
+            "A time-series comparison reduces only the timestamps the two runs",
+            "SHARE. If one run stopped at hour 12 of a 24-hour simulation and",
+            "the two agreed over those 12, its row reports a near-zero",
+            "`max_abs` -- an excellent-looking result computed over half a run",
+            "that failed. `coverage_fraction` is `n_common` divided by the",
+            "number of distinct timestamps appearing in EITHER series, so it",
+            "is 1.0 exactly when the two reporting grids are identical.",
+            "`start_time_match`, `end_time_match` and `time_grid_match`",
+            "separate a truncated run (start matches, end does not) from the",
+            "same span sampled differently (both ends match, the grid does",
+            "not).",
+        ],
+        "coverage_anomaly_total": [
+            "**{n_models} model(s) across {n_comparisons} comparison(s)",
+            "produced a time-series comparison over an incomplete overlap.**",
+            "Their `max_abs`, `max_rel` and `rmse` ARE still written to",
+            "`ts_diff` -- an exact agreement up to the point one run stopped",
+            "is a real finding, and deleting it would destroy the evidence",
+            "that identifies the truncation -- but they are statistics about a",
+            "sub-span, and must never be read as a full comparison. Check",
+            "`coverage_fraction` on any row before quoting its numbers.",
+        ],
+        "coverage_anomaly_none": [
+            "Every time-series comparison in this store covered both runs'",
+            "reporting grids in full.",
+        ],
+        "coverage_not_assessed": [
+            "**Coverage was not assessed.** This store has no `ts_diff` rows",
+            "carrying `coverage_fraction` or `time_grid_match` -- either the",
+            "`diff` stage has not been run, or it was run before those columns",
+            "existed. Read that as *not checked*, never as *complete*: a run",
+            "that stopped halfway would be invisible here.",
+        ],
+        "interaction_heading": "## Anderson × Node Continuity interaction ((D - C) - (B - A))",
+        "interaction_intro": [
+            "A/B/C/D is a 2x2 factorial over `ANDERSON_ACCEL` and",
+            "`NODE_CONTINUITY`. `B - A` measures Anderson under `EXPLICIT`;",
+            "`D - C` measures it under `SEMI_IMPLICIT`; the interaction is the",
+            "difference between those two simple effects,",
+            "`(D - C) - (B - A)`, equivalently `D - C - B + A`. It answers the",
+            "question no individual axis answers: **does switching to",
+            "semi-implicit (Crank-Nicolson) node continuity change how",
+            "effective Anderson acceleration is?**",
+        ],
+        "interaction_sign": [
+            "**Sign convention.** The interaction is a signed change in the",
+            "metric itself, in that metric's own units -- it is not a score.",
+            "It is NEGATIVE when Anderson moves the metric further DOWN under",
+            "`SEMI_IMPLICIT` than it does under `EXPLICIT`. So for",
+            "`avg_iterations_per_step`, `pct_steps_not_converging` and",
+            "`wall_ms`, where lower is better, **a negative interaction means",
+            "Anderson helps MORE under Crank-Nicolson**, and a positive one",
+            "means it helps less. Negative is the expected direction:",
+            "`DWSolver::computeAASkipFlags` disables Anderson at every",
+            "surcharged node under `EXPLICIT`/`EXTRAN` and not under",
+            "`SEMI_IMPLICIT`, so `B - A` measures Anderson with its most",
+            "valuable case switched off. For the `continuity_error_*` metrics",
+            "the sign is directional in the error, not in its magnitude, so",
+            "read those rows with `min` and `max` beside the mean.",
+        ],
+        "interaction_empty": [
+            "No model produced both a `B - A` and a `D - C` delta for any",
+            "metric, so the interaction could not be formed. It is null",
+            "whenever either simple effect is -- an operand missing, or the",
+            "pairing rejected by a commensurability screen -- so read this as",
+            "*not measured*, never as *no interaction*.",
+        ],
         "b_minus_a_heading": "## B - A by metric (Anderson acceleration effect)",
         "c_minus_a_heading": "## C - A by metric (Crank-Nicolson continuity effect)",
         "d_minus_c_heading": "## D - C by metric (incremental Anderson under Crank-Nicolson)",
@@ -797,6 +1069,15 @@ MARKDOWN_STRINGS = {
             "- Time series are compared only between our own runs. The external",
             "  anchor is summary-level.",
         ],
+        "caveat_coverage": [
+            "- A `ts_diff` row is reduced over the timestamps its two runs",
+            "  share, so it carries `n_periods_left`, `n_periods_right`,",
+            "  `n_common`, `coverage_fraction`, `start_time_match`,",
+            "  `end_time_match` and `time_grid_match`. Anything below full",
+            "  coverage is counted as an anomaly above; the row's `max_abs`,",
+            "  `max_rel` and `rmse` are still written, but they describe the",
+            "  shared sub-span only.",
+        ],
     },
     "es": {
         "title": "# Resumen del Benchmark del Corpus",
@@ -823,6 +1104,80 @@ MARKDOWN_STRINGS = {
         "anomaly_none": [
             "Ninguna corrida reportó un valor de opción que contradiga la "
             "intención de su variante.",
+        ],
+        "coverage_anomaly_heading": "## Comparaciones de series temporales sobre un solape incompleto",
+        "coverage_anomaly_header": "| comparación | modelos | series | cobertura mínima |",
+        "coverage_anomaly_sep": "| --- | --- | --- | --- |",
+        "coverage_anomaly_intro": [
+            "Una comparación de series temporales reduce solo las marcas de",
+            "tiempo que ambas corridas COMPARTEN. Si una corrida se detuvo en",
+            "la hora 12 de una simulación de 24 horas y ambas coincidieron en",
+            "esas 12, su fila reporta un `max_abs` casi cero: un resultado de",
+            "apariencia excelente calculado sobre media corrida que falló.",
+            "`coverage_fraction` es `n_common` dividido por la cantidad de",
+            "marcas de tiempo distintas que aparecen en CUALQUIERA de las dos",
+            "series, así que vale 1.0 exactamente cuando las dos grillas de",
+            "reporte son idénticas. `start_time_match`, `end_time_match` y",
+            "`time_grid_match` distinguen una corrida truncada (coincide el",
+            "inicio, no el final) de el mismo lapso muestreado distinto",
+            "(coinciden ambos extremos, no la grilla).",
+        ],
+        "coverage_anomaly_total": [
+            "**{n_models} modelo(s) en {n_comparisons} comparación(es)",
+            "produjeron una comparación de series temporales sobre un solape",
+            "incompleto.** Sus `max_abs`, `max_rel` y `rmse` SÍ se escriben en",
+            "`ts_diff` -- una coincidencia exacta hasta el punto en que una",
+            "corrida se detuvo es un hallazgo real, y borrarla destruiría la",
+            "evidencia que identifica el truncamiento -- pero son estadísticos",
+            "sobre un sublapso, y nunca deben leerse como una comparación",
+            "completa. Revise `coverage_fraction` en cualquier fila antes de",
+            "citar sus números.",
+        ],
+        "coverage_anomaly_none": [
+            "Toda comparación de series temporales de este almacén cubrió por",
+            "completo las grillas de reporte de ambas corridas.",
+        ],
+        "coverage_not_assessed": [
+            "**No se evaluó la cobertura.** Este almacén no tiene filas de",
+            "`ts_diff` con `coverage_fraction` ni `time_grid_match`: o no se",
+            "ejecutó la etapa `diff`, o se ejecutó antes de que existieran esas",
+            "columnas. Léalo como *no verificado*, nunca como *completo*: una",
+            "corrida que se detuvo a mitad de camino sería invisible aquí.",
+        ],
+        "interaction_heading": "## Interacción Anderson × continuidad de nodos ((D - C) - (B - A))",
+        "interaction_intro": [
+            "A/B/C/D es un factorial 2x2 sobre `ANDERSON_ACCEL` y",
+            "`NODE_CONTINUITY`. `B - A` mide Anderson bajo `EXPLICIT`;",
+            "`D - C` lo mide bajo `SEMI_IMPLICIT`; la interacción es la",
+            "diferencia entre esos dos efectos simples,",
+            "`(D - C) - (B - A)`, equivalentemente `D - C - B + A`. Responde la",
+            "pregunta que ningún eje individual responde: **¿cambia el pasar a",
+            "continuidad de nodos semi-implícita (Crank-Nicolson) qué tan",
+            "efectiva es la aceleración de Anderson?**",
+        ],
+        "interaction_sign": [
+            "**Convención de signo.** La interacción es un cambio con signo en",
+            "la métrica misma, en las unidades de esa métrica: no es un",
+            "puntaje. Es NEGATIVA cuando Anderson mueve la métrica más hacia",
+            "ABAJO bajo `SEMI_IMPLICIT` que bajo `EXPLICIT`. Así que para",
+            "`avg_iterations_per_step`, `pct_steps_not_converging` y",
+            "`wall_ms`, donde menos es mejor, **una interacción negativa",
+            "significa que Anderson ayuda MÁS bajo Crank-Nicolson**, y una",
+            "positiva significa que ayuda menos. Negativa es la dirección",
+            "esperada: `DWSolver::computeAASkipFlags` desactiva Anderson en",
+            "todo nodo sobrecargado bajo `EXPLICIT`/`EXTRAN` y no bajo",
+            "`SEMI_IMPLICIT`, así que `B - A` mide Anderson con su caso más",
+            "valioso apagado. Para las métricas `continuity_error_*` el signo",
+            "es direccional en el error, no en su magnitud, así que lea esas",
+            "filas con `min` y `max` junto a la media.",
+        ],
+        "interaction_empty": [
+            "Ningún modelo produjo a la vez un delta `B - A` y uno `D - C` para",
+            "métrica alguna, así que la interacción no pudo formarse. Es nula",
+            "siempre que lo sea cualquiera de los dos efectos simples -- un",
+            "operando ausente, o el par rechazado por un filtro de",
+            "conmensurabilidad -- así que léalo como *no medido*, nunca como",
+            "*sin interacción*.",
         ],
         "b_minus_a_heading": "## B - A por métrica (efecto de la aceleración de Anderson)",
         "c_minus_a_heading": "## C - A por métrica (efecto de continuidad de Crank-Nicolson)",
@@ -958,6 +1313,15 @@ MARKDOWN_STRINGS = {
             "- Las series temporales se comparan solo entre nuestras propias",
             "  corridas. El ancla externa es a nivel de resumen.",
         ],
+        "caveat_coverage": [
+            "- Una fila de `ts_diff` se reduce sobre las marcas de tiempo que",
+            "  comparten sus dos corridas, así que lleva `n_periods_left`,",
+            "  `n_periods_right`, `n_common`, `coverage_fraction`,",
+            "  `start_time_match`, `end_time_match` y `time_grid_match`. Toda",
+            "  cobertura menor que la completa se cuenta como anomalía arriba;",
+            "  el `max_abs`, `max_rel` y `rmse` de la fila sí se escriben, pero",
+            "  describen únicamente el sublapso compartido.",
+        ],
     },
 }
 
@@ -1001,18 +1365,25 @@ def write_markdown(
     path: Path,
     lang: str = DEFAULT_LANG,
     elements: pd.DataFrame | None = None,
+    ts_diff: pd.DataFrame | None = None,
 ) -> Path:
     """Write a summary readable without opening a notebook.
 
     `lang` selects the language of the generated prose only (headings, table
     column headers, the Caveats bullets). Metric names, status values, family
     names, hardness buckets, surcharge strata and the `B - A` / `C - A` /
-    `D - C` / `D - A` / `E - A` / `A - REF` notation are data, not prose, and
-    are identical in both languages.
+    `D - C` / `D - A` / `E - A` / `A - REF` / `(D - C) - (B - A)` notation are
+    data, not prose, and are identical in both languages.
 
     `elements` is optional and used only to strengthen the surcharge-activity
     proxy with per-node flooding totals; without it the proxy falls back to
     `pct_steps_not_converging` alone.
+
+    `ts_diff` is optional and used only for the incomplete-overlap anomaly
+    section. Passing nothing is reported as *coverage not assessed* rather
+    than as *coverage complete*: the section exists to stop a comparison over
+    half a run being read as a full one, and it could not do that if a
+    missing table read as a clean bill of health.
     """
     path = Path(path)
     strings = MARKDOWN_STRINGS[lang]
@@ -1031,6 +1402,12 @@ def write_markdown(
     # says so outright -- an absent section would be indistinguishable from
     # a harness that never looked.
     lines += _anomaly_section(runs, strings)
+
+    # Unconditional for the same reason, and beside it: an incomplete overlap
+    # is the second way a number in this store can be true and still
+    # misleading. An absent section would be indistinguishable from a harness
+    # that never looked.
+    lines += _coverage_section(ts_diff, strings)
 
     if not deltas.empty:
         # One section per axis rather than columns of one table, so no axis
@@ -1053,6 +1430,10 @@ def write_markdown(
                         f"{column.max():.4f} |"
                     )
             lines.append("")
+
+        # After the five simple effects, because it is formed from two of
+        # them and reads as nonsense before they have been seen.
+        lines += _interaction_section(deltas, strings)
 
         # Only DYNWAVE baselines are STRATIFIED: a KINWAVE or STEADY run
         # still prints an iteration count, and bucketing on it would sort a
@@ -1110,6 +1491,7 @@ def write_markdown(
     lines += strings["caveat_surcharge_ref"]
     lines += strings["caveat_option_echo"]
     lines += strings["caveat_time_series"]
+    lines += strings["caveat_coverage"]
     lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1147,6 +1529,87 @@ def _anomaly_section(runs: pd.DataFrame, strings: dict) -> list[str]:
         lines.append(f"| {row['variant']} | {row['option']} | "
                      f"{row['runs']} | {row['models']} |")
     lines.append("")
+    return lines
+
+
+def _coverage_section(ts_diff: pd.DataFrame | None, strings: dict) -> list[str]:
+    """Time-series comparisons computed over an incomplete overlap.
+
+    Three outcomes, all stated rather than inferred from a missing table:
+    coverage was never assessed (no `ts_diff`, or one predating the coverage
+    columns), every comparison covered both grids in full, or some did not --
+    in which case they are counted per comparison and attributed by model.
+    """
+    lines = [strings["coverage_anomaly_heading"], ""]
+    lines += strings["coverage_anomaly_intro"]
+    lines.append("")
+
+    if not coverage_was_assessed(ts_diff):
+        lines += strings["coverage_not_assessed"]
+        lines.append("")
+        return lines
+
+    anomalies = coverage_anomalies(ts_diff)
+    if anomalies.empty:
+        lines += strings["coverage_anomaly_none"]
+        lines.append("")
+        return lines
+
+    # Distinct models ACROSS the comparisons, not the sum of the table's
+    # per-comparison counts: a single truncated run is flagged by every
+    # comparison it takes part in, and summing them would announce one
+    # stopped simulation as five models.
+    lines += [line.format(n_models=coverage_anomaly_models(ts_diff),
+                          n_comparisons=len(anomalies))
+              for line in strings["coverage_anomaly_total"]]
+    lines.append("")
+    lines += [strings["coverage_anomaly_header"], strings["coverage_anomaly_sep"]]
+    for _, row in anomalies.iterrows():
+        coverage = row["min_coverage"]
+        rendered = "n/a" if pd.isna(coverage) else f"{float(coverage):.4f}"
+        lines.append(f"| {row['comparison']} | {row['models']} | "
+                     f"{row['series']} | {rendered} |")
+    lines.append("")
+    return lines
+
+
+def _interaction_section(deltas: pd.DataFrame, strings: dict) -> list[str]:
+    """The 2x2 factorial interaction, with its sign convention spelled out.
+
+    The sign is stated in words because a bare number cannot carry it: a
+    reader looking at `-0.4` has no way to tell whether it means *Anderson
+    helps more under Crank-Nicolson* or the reverse. It is the same table
+    shape as the five simple-effect sections, so the numbers stay directly
+    comparable against them.
+    """
+    lines = [strings["interaction_heading"], ""]
+    lines += strings["interaction_intro"]
+    lines.append("")
+    lines += strings["interaction_sign"]
+    lines.append("")
+    lines += [strings["metric_header"], strings["metric_sep"]]
+
+    emitted = 0
+    if INTERACTION_COLUMN in deltas.columns:
+        grouped = deltas.dropna(subset=[INTERACTION_COLUMN]).groupby("metric")
+        for metric, group in grouped:
+            column = group[INTERACTION_COLUMN].astype(float)
+            lines.append(
+                f"| {metric} | {len(column)} | {column.mean():.4f} | "
+                f"{column.median():.4f} | {column.min():.4f} | "
+                f"{column.max():.4f} |"
+            )
+            emitted += 1
+    lines.append("")
+
+    # An empty table here means neither simple effect survived for any
+    # metric, which is *not measured* -- not *the two factors do not
+    # interact*. Said outright, for the same reason the iteration sections
+    # announce their own emptiness.
+    if not emitted:
+        lines += strings["interaction_empty"]
+        lines.append("")
+
     return lines
 
 
@@ -1264,11 +1727,13 @@ ELEMENT_KEY = ["model_id", "family", "element_type", "element_id", "metric"]
 
 
 def build_element_deltas(elements: pd.DataFrame) -> pd.DataFrame:
-    """Per-element A/B/C/D/E/REF values and all deltas.
+    """Per-element A/B/C/D/E/REF values, all deltas and the interaction.
 
     No commensurability guard applies here: element metrics are depths,
     flows and volumes in fixed units, not iteration counters, so none of the
-    three confounds `build_deltas` screens for can arise.
+    three confounds `build_deltas` screens for can arise. `delta_interaction`
+    is still formed the same way -- from `delta_d_minus_c` and
+    `delta_b_minus_a` -- so it nulls whenever any of its four operands does.
     """
     if elements.empty:
         return pd.DataFrame()
@@ -1301,7 +1766,40 @@ def build_element_deltas(elements: pd.DataFrame) -> pd.DataFrame:
         wide[column] = (wide[f"value_{left.lower()}"]
                         - wide[f"value_{right.lower()}"])
 
-    return wide[ELEMENT_KEY + VALUE_COLUMNS + DELTA_COLUMNS]
+    # Formed from the two simple-effect columns, exactly as in `build_deltas`,
+    # so the element table's interaction is null under the same conditions as
+    # the scalar one -- here that reduces to "any of the four operands is
+    # missing", since no commensurability guard applies at element level.
+    _column, minuend, subtrahend = INTERACTION_SPEC
+    wide[INTERACTION_COLUMN] = wide[minuend] - wide[subtrahend]
+
+    wide = _attach_element_case_ids(wide, elements)
+    return wide[ELEMENT_KEY + VALUE_COLUMNS + DELTA_COLUMNS + CASE_ID_COLUMNS]
+
+
+def _attach_element_case_ids(
+    wide: pd.DataFrame, elements: pd.DataFrame,
+) -> pd.DataFrame:
+    """Join each variant's source `case_id` onto the pivoted element rows.
+
+    Pivoted the same way and on the same key as the values themselves, so a
+    row's `case_id_c` is by construction the case its `value_c` came from --
+    not a lookup that could pick a different run of the same model.
+    """
+    if "case_id" not in elements.columns:
+        for column in CASE_ID_COLUMNS:
+            wide[column] = pd.NA
+        return wide
+
+    cases = elements.pivot_table(
+        index=ELEMENT_KEY, columns="variant", values="case_id", aggfunc="first"
+    ).rename(columns={variant: f"case_id_{variant.lower()}"
+                      for variant in DELTA_VARIANTS})
+    for column in CASE_ID_COLUMNS:
+        if column not in cases.columns:
+            cases[column] = pd.NA
+    return wide.merge(cases[CASE_ID_COLUMNS].reset_index(),
+                      on=ELEMENT_KEY, how="left")
 
 
 def topology_status(elements: pd.DataFrame) -> pd.DataFrame:

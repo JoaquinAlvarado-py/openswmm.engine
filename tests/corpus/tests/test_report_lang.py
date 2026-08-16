@@ -51,10 +51,24 @@ HEADING_KEYS = tuple(sorted(
 ))
 
 
-def _write(tmp_path, lang):
+def _ts_diff():
+    """One incompletely-covered pairing and one fully-covered one."""
+    return pd.DataFrame([
+        {"model_id": "EPA/m1", "family": "EPA", "comparison": comparison,
+         "element_type": "NODE", "element_id": "n1",
+         "attribute": "INVERT_DEPTH", "max_abs": 0.0, "max_rel": 0.0,
+         "rmse": 0.0, "n_periods_left": 24, "n_periods_right": n_right,
+         "n_common": n_right, "coverage_fraction": n_right / 24.0,
+         "start_time_match": True, "end_time_match": n_right == 24,
+         "time_grid_match": n_right == 24}
+        for comparison, n_right in (("B_minus_A", 12), ("C_minus_A", 24))
+    ])
+
+
+def _write(tmp_path, lang, ts_diff=None):
     deltas = report.build_deltas(_runs(), METRICS)
     path = report.write_markdown(deltas, _runs(), tmp_path / f"summary_{lang}.md",
-                                 lang=lang)
+                                 lang=lang, ts_diff=ts_diff)
     return path.read_text(encoding="utf-8")
 
 
@@ -217,6 +231,41 @@ def test_every_d_and_e_section_exists_in_both_languages(tmp_path):
                     "e_minus_a_heading", "iter_shift_d_heading",
                     "iter_shift_e_heading", "surcharge_heading"):
             assert strings[key] in text
+
+
+def test_the_interaction_and_coverage_sections_exist_in_both_languages(tmp_path):
+    for lang in ("en", "es"):
+        text = _write(tmp_path, lang, ts_diff=_ts_diff())
+        strings = report.MARKDOWN_STRINGS[lang]
+        for key in ("interaction_heading", "coverage_anomaly_heading"):
+            assert strings[key] in text
+
+
+def test_the_new_sections_produce_identical_rows_and_numbers_in_both_languages(
+    tmp_path,
+):
+    # Same sections, same numbers, only the prose differs -- asserted with a
+    # store that actually populates the interaction table and the
+    # coverage-anomaly table, which the bare `_write` fixture does not.
+    en_text = _write(tmp_path, "en", ts_diff=_ts_diff())
+    es_text = _write(tmp_path, "es", ts_diff=_ts_diff())
+
+    assert _heading_lines(en_text) != _heading_lines(es_text)  # prose differs
+    assert len(_heading_lines(en_text)) == len(_heading_lines(es_text))
+    assert _data_rows(en_text) == _data_rows(es_text)
+    # `_runs()`: A=4.0, B=2.0, C=3.0, D=1.5 -> (D - C) - (B - A) = +0.5.
+    assert any("| avg_iterations_per_step | 1 | 0.5000 |" in row
+               for row in _data_rows(en_text))
+    assert any("| B_minus_A | 1 | 1 | 0.5000 |" in row
+               for row in _data_rows(en_text))
+
+
+def test_the_interaction_axis_notation_is_untranslated_in_both_languages():
+    # `(D - C) - (B - A)` is notation a reader reproduces from the Parquet
+    # columns, exactly like `B - A` and the hardness buckets.
+    for lang in ("en", "es"):
+        assert (report.INTERACTION_AXIS
+                in report.MARKDOWN_STRINGS[lang]["interaction_heading"])
 
 
 def test_every_string_key_exists_in_both_languages():
