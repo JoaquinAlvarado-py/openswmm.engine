@@ -100,11 +100,66 @@ python -m swmmbench report --out ./results --lang en
 (`|b - a|`), not a relative one. The reported `max_rel` is scaled by the
 baseline but is never thresholded.
 
-Sweeps are resumable: re-running `run` skips any (model, variant) already
-recorded for the same engine version and input hash. `runs`, `scalars`,
-`elements` and `ts_diff` therefore accumulate. `models` and the `report`
-outputs are pure derived data and are **replaced** on every re-run, so running
-`inventory` or `report` twice never doubles a row count.
+## Case identity, and what makes a sweep resume
+
+A **case** is one unit of work: this model, under this variant, executed by
+*this engine build*, against *this state of the corpus*. It is hashed into a
+single `case_id`, carried on every row of `runs`, `scalars`, `elements`,
+`ts_diff`, `deltas` and `element_deltas`, and it is the whole resume key.
+
+| column | meaning |
+| --- | --- |
+| `case_id` | sha256 of `model_id` + `variant` + `engine_build_id` + `corpus_commit`. The resume key, and the join key between the tables. |
+| `engine_build_id` | `sha256:<digest>` over the engine argv, each element replaced by its file hash. **This is the engine's identity.** |
+| `engine_version` | the first line of `--version`. A human-readable label only. |
+| `engine_build_info` | any commit / branch / build-type lines `--version` printed, when it printed them. Never depended on. |
+| `corpus_commit` | `git:<sha>` of the corpus root, read at `inventory` time. The identity of everything a deck depends on. |
+| `inp_sha256` | the deck's own hash. Retained as data; it is **not** sufficient as an identity (see below). |
+
+Two things that look like identities are deliberately not used as such:
+
+- **The version string is not the engine.** Two executables that both print
+  `OpenSWMM 6.0` can contain completely different Anderson, continuity or
+  slot implementations. `engine_build_id` hashes the file. It hashes the
+  whole argv (each element that names a readable file by content) so that a
+  launcher invocation -- `[python, engine.py]`, `[wine, openswmm.exe]` --
+  identifies the real program and not just the launcher. If argv's first
+  element is not a readable file at all, the id is still deterministic but
+  is prefixed `argv:` instead of `sha256:`, marking it as **not** a
+  cryptographic build pin. A sweep degrades; it never crashes on this.
+- **The deck is not the input.** Corpus decks reference external data by
+  relative path -- `DataFiles/*.dat`, loose `.txt` series, interface files.
+  If `Example.inp` is untouched but `DataFiles/rainfall.dat` changes, a
+  deck-only hash says "already done" and the sweep republishes stale numbers.
+  The dependency identity is therefore the corpus's **git commit**, not a
+  parse of the deck's file references: enumerating those means covering
+  `[RAINGAGES] FILE`, `[TIMESERIES] FILE`, `[TEMPERATURE] FILE`, the
+  `[FILES]` interface section and more, and any section type missed makes
+  the hash *lie*. The commit covers every referenced file exactly, for free.
+  It over-invalidates when the corpus moves -- rare, and the safe direction.
+  A corpus that is not a git repository records `unpinned:not-a-git-repo`
+  and warns once, rather than failing the sweep or pretending it is pinned.
+
+`REF` rows carry the `corpus-reference` sentinel as their `engine_build_id`:
+no build of ours produced them, so a second engine does not re-read the
+anchors, but a new corpus commit does.
+
+Sweeps are resumable: re-running `run` skips any case already recorded in
+`runs`. `runs`, `scalars`, `elements` and `ts_diff` therefore accumulate.
+`models` and the `report` outputs are pure derived data and are **replaced**
+on every re-run, so running `inventory` or `report` twice never doubles a row
+count. A store written before `case_id` existed has no such column; every
+case then re-runs, which is the safe direction, since those rows' engine
+build cannot be established after the fact.
+
+`run` and `diff` write Parquet in batches of `FLUSH_BATCH_SIZE` (50)
+completed units of work -- a simulation in `run`, a model in `diff` -- rather
+than once at the end. A full sweep is ~8200 simulations over several hours;
+a machine failure now costs at most one unflushed batch instead of
+everything. Each stage writes derived rows before the thing they are derived
+from is destroyed or claimed: `diff` flushes `ts_diff` before unlinking any
+`.out`, and `run` writes `elements` and `scalars` before the `runs` rows that
+would let a resume skip them.
 
 Exit codes are meaningful and worth wiring into CI:
 
@@ -113,11 +168,14 @@ Exit codes are meaningful and worth wiring into CI:
   inventoried as a model by the next sweep.
 - `diff` and `report` return non-zero, and write nothing, if `runs` holds
   results from more than one engine build. Two builds legitimately coexist in
-  one store (they are part of the resume key), but the report will not guess
-  which to publish, and `diff` will not compare one build's `.out` against
-  another's under a single label. Point `--out` at a store holding a single
-  build. The `REF` rows' `corpus-reference` sentinel is not a build and never
-  triggers either refusal.
+  one store (the build is part of every `case_id`), but the report will not
+  guess which to publish, and `diff` will not compare one build's `.out`
+  against another's under a single label. Point `--out` at a store holding a
+  single build. The check reads `engine_build_id`, falling back per row to
+  `engine_version` only for rows written before the hash existed -- a guard
+  reading the printed string alone would wave through exactly the mix it
+  exists to catch. The `REF` rows' `corpus-reference` sentinel is not a build
+  and never triggers either refusal.
 - `run` returns non-zero if `--engine` is missing; every stage returns non-zero
   if a flag it requires is absent.
 
@@ -158,12 +216,19 @@ comparison axis:
 | column | meaning |
 | --- | --- |
 | `value_a` .. `value_e`, `value_ref` | the raw per-variant value |
+| `case_id_a` .. `case_id_e`, `case_id_ref` | the `case_id` of the run each value came from |
 | `delta_b_minus_a` | Anderson under EXPLICIT/EXTRAN |
 | `delta_c_minus_a` | semi-implicit (Crank-Nicolson) node continuity |
 | `delta_d_minus_c` | **incremental Anderson under the C1-smooth operator** |
 | `delta_d_minus_a` | joint Anderson + Crank-Nicolson (two causes, not attributable) |
 | `delta_e_minus_a` | Dynamic Preissmann Slot |
 | `delta_a_minus_ref` | parity debt against EPA SWMM 5.2 |
+
+Both tables are recomputed and **replaced** on every `report`, so the
+`case_id_*` columns are how a published number stays traceable: each one
+names the exact executable and corpus state behind the value beside it. One
+per variant rather than one per row, because a delta row is a join across six
+runs and a single id would have to pick a side.
 
 A row is always emitted, never dropped. An individual delta is null when
 either operand is missing, or when the pairing is not commensurable:
@@ -250,6 +315,10 @@ ts_diff = pd.read_parquet("results/ts_diff")
 ts_diff[ts_diff["comparison"] == "C_minus_A"]   # Crank-Nicolson's effect on state
 ts_diff[ts_diff["comparison"] == "D_minus_C"]   # incremental Anderson under Crank-Nicolson
 ```
+
+A comparison has two sources, so a `ts_diff` row carries `case_id_left` and
+`case_id_right` -- in the label's own `X_minus_Y` order -- rather than one
+`case_id` that would have to pick a side.
 
 `D_minus_C` is stored directly, and it has to be: **do not try to form it by
 subtracting `C_minus_A` from `D_minus_A`.** A `ts_diff` row holds `max_abs`,

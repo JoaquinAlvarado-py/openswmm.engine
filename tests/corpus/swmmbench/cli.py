@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import platform
-from concurrent.futures import ProcessPoolExecutor
+import re
+import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,7 +16,33 @@ import pandas as pd
 
 from . import corpus, rptparse, runner, schema, store, variants
 
-RESUME_KEY = ["model_id", "variant", "engine_version", "inp_sha256"]
+#: The resume key is the case identity and nothing else. `case_id` already
+#: folds in the model, the variant, the engine BUILD (a content hash of the
+#: executable, not the version string it prints) and the corpus commit, so
+#: listing those columns again here could only let the two definitions drift.
+#: The previous key -- model/variant/engine_version/inp_sha256 -- skipped work
+#: it should have re-run twice over: two executables both printing
+#: `OpenSWMM 6.0` were one key, and a deck whose `DataFiles/*.dat` changed was
+#: unchanged. A store written before `case_id` existed has no such column, so
+#: `store.completed_keys` returns nothing and every case re-runs; that is the
+#: safe direction, since those rows' engine build cannot be established after
+#: the fact.
+RESUME_KEY = ["case_id"]
+
+#: How many completed units of work are persisted between Parquet flushes,
+#: in BOTH long stages: one unit is a simulation in `run`, a model in `diff`.
+#:
+#: A full sweep is ~8200 simulations over several hours, and every run row
+#: plus its (potentially hundreds of) element rows would otherwise be held in
+#: memory until the last one finished -- so a machine failure near the end
+#: lost the whole sweep, not its tail. 50 is chosen from the 25-100 band: low
+#: enough that a crash costs at most a minute or two of re-running, high
+#: enough that the per-write overhead (a Parquet file per family per flush,
+#: each with its own footer and dictionary pages) stays a rounding error
+#: against the simulations themselves. Below ~25 the store fragments into
+#: thousands of tiny files and the read side pays for it; above ~100 the
+#: memory and the loss window grow with no compensating gain.
+FLUSH_BATCH_SIZE = 50
 
 #: Parsed scalars that are NOT metrics and must stay out of the long-format
 #: `scalars` table. Its `value` column is numeric by construction; melting a
@@ -25,6 +54,45 @@ NON_METRIC_SCALARS = frozenset({
     "reported_routing_model", "reported_surcharge_method",
     "reported_node_continuity", "reported_anderson_accel",
 })
+
+#: The metric columns `scalars` is melted from -- every parsed scalar that is
+#: not in the denylist above.
+METRIC_SCALARS = tuple(key for key in rptparse.SCALAR_KEYS
+                       if key not in NON_METRIC_SCALARS)
+
+#: Every column a `runs` row can carry, in write order.
+#:
+#: Load-bearing now that `run` writes in batches rather than once: a plain
+#: `pd.DataFrame(rows)` takes the union of the keys the rows in THAT batch
+#: happen to have, and the batches are not alike -- a crash row has no
+#: `out_path`, a reference row has no `wall_ms`, `exit_code` or `host`. Two
+#: fragments with different columns no longer read back as one dataset, so
+#: the column set is stated once and every batch is conformed to it.
+RUN_COLUMNS = (
+    "case_id", "model_id", "family", "variant",
+    "engine_version", "engine_build_id", "engine_build_info", "corpus_commit",
+    "inp_sha256", "options_applied", "host", "run_started_at", "timeout_s",
+    "status", "exit_code", "signal", "wall_ms", "peak_rss_mb",
+    "stderr_tail", "out_path",
+    *rptparse.SCALAR_KEYS,
+)
+
+#: `runs` columns written as float64, and as datetimes, respectively.
+#: Everything else is written as a nullable string. Stated rather than left
+#: to inference for the same reason as `RUN_COLUMNS`: a batch in which a
+#: column happens to be entirely null infers Arrow's `null` type and no
+#: longer matches its neighbours.
+RUN_NUMERIC_COLUMNS = frozenset({
+    "timeout_s", "exit_code", "signal", "wall_ms", "peak_rss_mb",
+    *METRIC_SCALARS,
+})
+RUN_DATETIME_COLUMNS = frozenset({"start_date", "end_date"})
+
+#: Every column an `elements` row carries, for the same reason.
+ELEMENT_COLUMNS = (
+    "case_id", "model_id", "family", "variant", "engine_version",
+    "element_type", "element_id", "metric", "value",
+)
 
 
 def stage_inventory(corpus_root: Path, out_dir: Path) -> pd.DataFrame:
@@ -45,20 +113,123 @@ def stage_inventory(corpus_root: Path, out_dir: Path) -> pd.DataFrame:
     return frame
 
 
-def _engine_version(engine: list[str]) -> str:
-    """Best-effort engine identity; falls back to the argv itself."""
+#: Prefix on an `engine_build_id` derived from the CONTENT of the executable.
+#: The load-bearing case: two builds differ here iff their bytes differ.
+ENGINE_BUILD_HASHED_PREFIX = "sha256:"
+
+#: Prefix on an `engine_build_id` that could NOT be derived from file
+#: content, because the argv's first element does not name a readable file --
+#: a command the OS resolves some other way, or a stand-in. Clearly marked
+#: because it is NOT a cryptographic build identity: two different engines
+#: reachable under one name collide under it. Marked rather than fatal: a
+#: sweep must not crash because `--version` was pointed at something odd.
+ENGINE_BUILD_UNHASHED_PREFIX = "argv:"
+
+VERSION_TIMEOUT_S = 30
+
+#: Lines of `--version` output worth keeping beyond the bare banner: a git
+#: commit, a branch, a build type. Purely a human-readable extra -- captured
+#: when the engine happens to print it, never depended on. `engine_build_id`
+#: must not depend on the engine printing ANYTHING.
+_BUILD_INFO_LINE = re.compile(r"\b(commit|revision|branch|build|hash)\b",
+                              re.IGNORECASE)
+
+
+def _version_output(engine: list[str]) -> str:
+    """Raw `--version` output, or empty when the engine cannot be asked."""
     import subprocess
     try:
         proc = subprocess.run(
             list(engine) + ["--version"],
-            capture_output=True, text=True, timeout=30, errors="replace",
+            capture_output=True, text=True, timeout=VERSION_TIMEOUT_S,
+            errors="replace",
         )
-        line = (proc.stdout or proc.stderr).strip().splitlines()
-        if line:
-            return line[0][:200]
+        return (proc.stdout or proc.stderr) or ""
     except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _engine_version(engine: list[str]) -> str:
+    """The engine's human-readable LABEL. Not an identity.
+
+    Kept because an operator reading `runs` needs something legible, but it
+    is exactly what must not be trusted as identity: two executables with
+    completely different Anderson, continuity or slot implementations can
+    both print `OpenSWMM 6.0`. `engine_build_id` is the identity.
+    """
+    lines = _version_output(engine).strip().splitlines()
+    return lines[0][:200] if lines else " ".join(engine)[:200]
+
+
+def _build_info(output: str) -> str | None:
+    """Any git commit / branch / build-type lines the version output carried."""
+    hits = [line.strip() for line in output.splitlines()
+            if line.strip() and _BUILD_INFO_LINE.search(line)]
+    return "; ".join(hits)[:200] or None
+
+
+def _argv_fingerprint(token: str) -> str:
+    """The content hash of the file `token` names, or the token itself.
+
+    Resolution follows the OS's own order -- an explicit path first, then
+    PATH -- so a bare `openswmm` fingerprints identically to the absolute
+    path of the same file.
+    """
+    path = Path(token)
+    try:
+        if not path.is_file():
+            resolved = shutil.which(token)
+            if resolved:
+                path = Path(resolved)
+        if path.is_file():
+            return ENGINE_BUILD_HASHED_PREFIX + corpus.sha256_of(path)
+    except OSError:
         pass
-    return " ".join(engine)[:200]
+    return ENGINE_BUILD_UNHASHED_PREFIX + token
+
+
+def _engine_build_id(engine: list[str]) -> str:
+    """A cryptographic identity for the engine actually being invoked.
+
+    The load-bearing part is the sha256 of the EXECUTABLE FILE -- argv's
+    first element -- and it never depends on the engine printing anything.
+    The digest is taken over the whole argv, each element replaced by its
+    file hash where it names a readable file and left literal where it does
+    not, because the executable alone is not the whole engine whenever the
+    real program is an argument to a launcher: `[python, engine.py]`,
+    `[wine, openswmm.exe]`, `[mpirun, -n, 4, openswmm]`. For the ordinary
+    `[/path/to/openswmm]` argv this reduces to exactly the hash of that one
+    file, wrapped once more.
+
+    When the first element is NOT a readable file -- a shell builtin, a
+    command resolved by something other than PATH, a deleted binary -- the
+    result is still deterministic but is prefixed `argv:` instead of
+    `sha256:`, so a reader can never mistake it for a real build pin. It
+    degrades; it does not raise. A sweep of 8200 simulations must not die
+    because the identity could not be computed.
+    """
+    argv = list(engine) or [""]
+    fingerprints = [_argv_fingerprint(token) for token in argv]
+    digest = hashlib.sha256("\n".join(fingerprints).encode("utf-8")).hexdigest()
+    prefix = (ENGINE_BUILD_HASHED_PREFIX
+              if fingerprints[0].startswith(ENGINE_BUILD_HASHED_PREFIX)
+              else ENGINE_BUILD_UNHASHED_PREFIX)
+    return prefix + digest
+
+
+def _engine_identity(engine: list[str]) -> dict:
+    """`engine_build_id` (identity), `engine_version` and `engine_build_info`.
+
+    One `--version` invocation serves both derived labels. Never raises.
+    """
+    output = _version_output(engine)
+    lines = output.strip().splitlines()
+    return {
+        "engine_build_id": _engine_build_id(engine),
+        "engine_version": (lines[0][:200] if lines
+                           else " ".join(engine)[:200]),
+        "engine_build_info": _build_info(output),
+    }
 
 
 def _run_one(job: dict) -> dict:
@@ -67,10 +238,18 @@ def _run_one(job: dict) -> dict:
     variant = job["variant"]
     work = Path(job["work_dir"]) / record["model_id"].replace("/", "__") / variant
     row = {
+        # The case identity is derived once, in `stage_run`, and travels in
+        # the job: the resume key that decided to dispatch this job and the
+        # `case_id` written on its rows are then the same value, not two
+        # computations that could disagree.
+        "case_id": job["case_id"],
         "model_id": record["model_id"],
         "family": record["family"],
         "variant": variant,
         "engine_version": job["engine_version"],
+        "engine_build_id": job["engine_build_id"],
+        "engine_build_info": job["engine_build_info"],
+        "corpus_commit": job["corpus_commit"],
         "inp_sha256": record["inp_sha256"],
         "options_applied": "; ".join(
             f"{k}={v}" for k, v in variants.OPTIONS[variant].items()
@@ -111,13 +290,16 @@ def _run_one(job: dict) -> dict:
         except (OSError, ValueError):
             row["status"] = schema.Status.PARSE_ERROR
 
-    # `engine_version` travels with every element row for the same reason it
-    # is part of the `runs` resume key: two engine builds legitimately coexist
-    # in one store, and without the column their rows cannot be told apart --
-    # not even in principle -- so any pivot over them would silently mix builds.
+    # `case_id` travels with every element row for the same reason it is the
+    # `runs` resume key: two engine builds -- or two corpus commits --
+    # legitimately coexist in one store, and without the column their rows
+    # cannot be told apart even in principle, so `build_element_deltas`'s
+    # `pivot_table(..., aggfunc="first")` would silently pick one of them.
+    # `engine_version` stays alongside it as the legible label.
     for element in elements:
-        element.update(model_id=record["model_id"], family=record["family"],
-                       variant=variant, engine_version=job["engine_version"])
+        element.update(case_id=job["case_id"], model_id=record["model_id"],
+                       family=record["family"], variant=variant,
+                       engine_version=job["engine_version"])
 
     return {"run": {**row, **scalars}, "elements": elements}
 
@@ -128,18 +310,35 @@ def _run_one(job: dict) -> dict:
 #: resumed sweep would duplicate its reference rows.
 REF_ENGINE_VERSION = "corpus-reference"
 
+#: The `engine_build_id` a reference row carries. No build of ours produced
+#: it, so there is no executable to hash; the same sentinel stands in, and
+#: `executed_engine_versions` excludes REF rows by variant so it can never be
+#: counted as a build. A REF case therefore depends only on the model and the
+#: corpus commit -- which is right: re-inventorying at a new commit must
+#: re-read the anchors, since the corpus `.rpt` may itself have changed.
+REF_ENGINE_BUILD_ID = REF_ENGINE_VERSION
 
-def _reference_rows(corpus_root: Path, record: dict) -> tuple[dict, list[dict]]:
+
+def _reference_rows(
+    corpus_root: Path,
+    record: dict,
+    case_id: str,
+    corpus_commit: str,
+) -> tuple[dict, list[dict]]:
     """Parse the anchor report. It is never re-run, only read.
 
     A model with no anchor still gets a row, carrying status `no_ref`. An
     absent row would be indistinguishable from a model the sweep skipped.
     """
     base = {
+        "case_id": case_id,
         "model_id": record["model_id"],
         "family": record["family"],
         "variant": schema.VARIANT_REF,
         "engine_version": REF_ENGINE_VERSION,
+        "engine_build_id": REF_ENGINE_BUILD_ID,
+        "engine_build_info": None,
+        "corpus_commit": corpus_commit,
         "inp_sha256": record["inp_sha256"],
     }
     empty = {key: None for key in rptparse.SCALAR_KEYS}
@@ -160,10 +359,119 @@ def _reference_rows(corpus_root: Path, record: dict) -> tuple[dict, list[dict]]:
         return {**base, "status": schema.Status.PARSE_ERROR, **empty}, []
 
     for element in elements:
-        element.update(model_id=record["model_id"], family=record["family"],
-                       variant=schema.VARIANT_REF,
+        element.update(case_id=case_id, model_id=record["model_id"],
+                       family=record["family"], variant=schema.VARIANT_REF,
                        engine_version=REF_ENGINE_VERSION)
     return {**base, "status": schema.Status.OK, **scalars}, elements
+
+
+def _run_frame(rows: list[dict]) -> pd.DataFrame:
+    """One batch of `runs` rows, conformed to `RUN_COLUMNS` and its dtypes.
+
+    Every batch is written with the same columns and the same Arrow types, so
+    the fragments a batched sweep leaves behind still read back as one
+    dataset. Without this a batch of only reference rows (no `wall_ms`) or
+    only crash rows (no `out_path`), or one in which some scalar happened to
+    be null throughout, would write an incompatible fragment.
+    """
+    frame = pd.DataFrame(rows, columns=list(RUN_COLUMNS))
+    for column in frame.columns:
+        if column in RUN_NUMERIC_COLUMNS:
+            frame[column] = pd.to_numeric(
+                frame[column], errors="coerce").astype("float64")
+        elif column in RUN_DATETIME_COLUMNS:
+            frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        else:
+            frame[column] = frame[column].astype("string")
+    return frame
+
+
+def _scalar_frame(runs: pd.DataFrame) -> pd.DataFrame:
+    """The long-format `scalars` view of one already-conformed `runs` batch."""
+    frame = runs.melt(
+        # `case_id` is THE id: `engine_version` alone could not tell one
+        # build's scalar row from another's, and nothing at all could tell a
+        # pre-change model's row from its post-change replacement.
+        # `engine_version` stays as the legible label beside it.
+        id_vars=["case_id", "model_id", "family", "variant", "engine_version"],
+        value_vars=list(METRIC_SCALARS),
+        var_name="metric", value_name="value",
+    )
+    frame["metric"] = frame["metric"].astype("string")
+    frame["value"] = pd.to_numeric(frame["value"], errors="coerce").astype("float64")
+    return frame
+
+
+def _element_frame(rows: list[dict]) -> pd.DataFrame:
+    """One batch of `elements` rows, conformed to `ELEMENT_COLUMNS`."""
+    frame = pd.DataFrame(rows, columns=list(ELEMENT_COLUMNS))
+    for column in frame.columns:
+        if column == "value":
+            frame[column] = pd.to_numeric(
+                frame[column], errors="coerce").astype("float64")
+        else:
+            frame[column] = frame[column].astype("string")
+    return frame
+
+
+def _flush_run_batch(
+    out_dir: Path,
+    run_rows: list[dict],
+    element_rows: list[dict],
+) -> None:
+    """Persist one batch of completed simulations.
+
+    `scalars` is derived from the very frame written to `runs`, not from the
+    raw rows, so the two can never disagree about a value or an id.
+
+    `runs` is written LAST, for the same asymmetry `_flush_diff_batch`
+    observes: `runs` is the resume authority, so a crash between the writes
+    must not leave a case recorded as done whose `scalars` and `elements`
+    never landed -- irrecoverable without deleting run rows by hand. Written
+    in this order the crash instead leaves derived rows for a case `runs`
+    does not claim, which the resumed sweep simply recomputes; a case is
+    deterministic in its id, so the re-appended rows are duplicates of equal
+    values rather than a contradiction.
+    """
+    if element_rows:
+        store.write_table(_element_frame(element_rows), out_dir, "elements",
+                          partition_by=["family"])
+    if run_rows:
+        frame = _run_frame(run_rows)
+        store.write_table(_scalar_frame(frame), out_dir, "scalars",
+                          partition_by=["family"])
+        store.write_table(frame, out_dir, "runs", partition_by=["family"])
+
+
+def _crash_result(job: dict, error: BaseException) -> dict:
+    """A `runs` row for a job whose WORKER died, not whose model failed.
+
+    `_run_one` never raises, so this is reached only when the pool itself
+    loses the process (`BrokenProcessPool`, an OOM kill). The taxonomy still
+    has to cover it: an absent row would be indistinguishable from work the
+    resume key skipped, and would be silently retried forever.
+    """
+    record = job["record"]
+    return {
+        "run": {
+            "case_id": job["case_id"],
+            "model_id": record["model_id"],
+            "family": record["family"],
+            "variant": job["variant"],
+            "engine_version": job["engine_version"],
+            "engine_build_id": job["engine_build_id"],
+            "engine_build_info": job["engine_build_info"],
+            "corpus_commit": job["corpus_commit"],
+            "inp_sha256": record["inp_sha256"],
+            "host": platform.node(),
+            "timeout_s": job["timeout_s"],
+            "status": schema.Status.CRASH,
+            "wall_ms": 0.0,
+            "stderr_tail": f"worker process lost: {error}",
+            **{key: None for key in rptparse.SCALAR_KEYS},
+        },
+        "elements": [],
+    }
 
 
 def stage_run(
@@ -175,6 +483,15 @@ def stage_run(
     limit: int | None,
 ) -> int:
     """Run every outstanding (model, variant) pair. Returns a process exit code.
+
+    Rows are flushed to Parquet every `FLUSH_BATCH_SIZE` completed
+    simulations rather than once at the end. A full sweep is ~8200
+    simulations over several hours; accumulating every run row and every
+    element row until the last one finished meant a machine failure near the
+    end lost the whole sweep instead of its tail, and held the entire result
+    set in memory to boot. Completions are consumed as they arrive
+    (`as_completed`), so a slow model delays only its own batch. This mirrors
+    `stage_diff`, which already batches by model against the same constant.
 
     Non-zero means the corpus was left dirty. That is a hard failure, not a
     warning: the harness's input is read-only by contract, and a surviving
@@ -188,56 +505,66 @@ def stage_run(
     if limit:
         models = models.head(limit)
 
-    engine_version = _engine_version(engine)
+    identity = _engine_identity(engine)
+    # Read at inventory time and carried on `models`, so the model list and
+    # the dependency identity describe one corpus state rather than two
+    # readings a `git checkout` could fall between. Falls back to reading the
+    # root for a store written before the column existed.
+    corpus_commit = _corpus_commit(models, corpus_root)
     done = store.completed_keys(out_dir, "runs", RESUME_KEY)
 
     work_dir = Path(out_dir) / "work"
     payload = []
     for record in models.to_dict("records"):
         for variant in schema.VARIANTS:
-            key = (record["model_id"], variant, engine_version,
-                   str(record["inp_sha256"]))
-            if key in done:
+            case_id = schema.case_id(record["model_id"], variant,
+                                     identity["engine_build_id"], corpus_commit)
+            if (case_id,) in done:
                 continue
             payload.append({
                 "record": record, "variant": variant, "engine": engine,
-                "engine_version": engine_version, "timeout_s": timeout_s,
+                "case_id": case_id, "corpus_commit": corpus_commit,
+                "timeout_s": timeout_s, **identity,
                 "corpus_root": str(corpus_root), "work_dir": str(work_dir),
             })
 
+    run_rows: list[dict] = []
+    element_rows: list[dict] = []
+    batch_count = 0
+
+    def absorb(result: dict) -> None:
+        """Queue one completed unit of work, flushing at a batch boundary."""
+        nonlocal run_rows, element_rows, batch_count
+        run_rows.append(result["run"])
+        element_rows.extend(result["elements"])
+        batch_count += 1
+        if batch_count >= FLUSH_BATCH_SIZE:
+            _flush_run_batch(out_dir, run_rows, element_rows)
+            run_rows, element_rows, batch_count = [], [], 0
+
     if jobs > 1 and payload:
         with ProcessPoolExecutor(max_workers=jobs) as pool:
-            results = list(pool.map(_run_one, payload))
+            futures = {pool.submit(_run_one, job): job for job in payload}
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                except Exception as error:  # noqa: BLE001  isolate one model
+                    result = _crash_result(futures[future], error)
+                absorb(result)
     else:
-        results = [_run_one(job) for job in payload]
-
-    run_rows = [r["run"] for r in results]
-    element_rows = [e for r in results for e in r["elements"]]
+        for job in payload:
+            absorb(_run_one(job))
 
     for record in models.to_dict("records"):
-        key = (record["model_id"], schema.VARIANT_REF, REF_ENGINE_VERSION,
-               str(record["inp_sha256"]))
-        if key in done:
+        case_id = schema.case_id(record["model_id"], schema.VARIANT_REF,
+                                 REF_ENGINE_BUILD_ID, corpus_commit)
+        if (case_id,) in done:
             continue
-        ref_row, ref_elements = _reference_rows(corpus_root, record)
-        run_rows.append(ref_row)
-        element_rows.extend(ref_elements)
+        ref_row, ref_elements = _reference_rows(corpus_root, record, case_id,
+                                                corpus_commit)
+        absorb({"run": ref_row, "elements": ref_elements})
 
-    if run_rows:
-        store.write_table(pd.DataFrame(run_rows), out_dir, "runs",
-                          partition_by=["family"])
-        scalar_frame = pd.DataFrame(run_rows).melt(
-            # `engine_version` is an id, not a metric: without it a scalar row
-            # from one engine build is indistinguishable from another's.
-            id_vars=["model_id", "family", "variant", "engine_version"],
-            value_vars=[c for c in rptparse.SCALAR_KEYS
-                        if c not in NON_METRIC_SCALARS],
-            var_name="metric", value_name="value",
-        )
-        store.write_table(scalar_frame, out_dir, "scalars", partition_by=["family"])
-    if element_rows:
-        store.write_table(pd.DataFrame(element_rows), out_dir, "elements",
-                          partition_by=["family"])
+    _flush_run_batch(out_dir, run_rows, element_rows)
 
     clean, leftovers = corpus_is_clean(corpus_root)
     if not clean:
@@ -246,6 +573,22 @@ def stage_run(
             print(f"  {item}")
         return 1
     return 0
+
+
+def _corpus_commit(models: pd.DataFrame, corpus_root: Path) -> str:
+    """The corpus commit `models` was inventoried at, or a fresh reading.
+
+    Preferring the recorded value keeps `models` and `runs` describing the
+    same corpus state -- the README makes `inventory` step 1 of every sweep,
+    so it is also the current one. The fallback covers a store written before
+    the column existed, where re-reading the root is strictly better than
+    pretending the dependency was never pinned.
+    """
+    if "corpus_commit" in models.columns:
+        values = models["corpus_commit"].dropna().astype(str).unique()
+        if len(values) == 1:
+            return str(values[0])
+    return corpus.commit_sha(corpus_root)
 
 
 def corpus_is_clean(corpus_root: Path) -> tuple[bool, list[str]]:
@@ -257,10 +600,10 @@ def corpus_is_clean(corpus_root: Path) -> tuple[bool, list[str]]:
     return not leftovers, leftovers
 
 
-#: How many models' rows are persisted between flushes. Bounds the cost of a
-#: crash (or an unhandled exception) mid-sweep to at most one unflushed
-#: batch, rather than every model diffed since the stage started.
-FLUSH_BATCH_SIZE = 50
+#: `ts_diff` columns naming the two cases a comparison row was computed from.
+#: A comparison has two sources, not one, so a single `case_id` would have to
+#: pick a side; both are carried, matching the label's own `X_minus_Y` order.
+TS_DIFF_CASE_COLUMNS = ("case_id_left", "case_id_right")
 
 
 def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> None:
@@ -271,8 +614,16 @@ def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> N
     deleting source data whose derived rows were never written (irrecoverable).
     """
     if rows:
-        store.write_table(pd.DataFrame(rows), out_dir, "ts_diff",
-                          partition_by=["family"])
+        frame = pd.DataFrame(rows)
+        # Conformed for the same reason `_run_frame` conforms `runs`: a batch
+        # in which neither side had a `case_id` (a store written before the
+        # column existed) would otherwise infer Arrow's `null` type and stop
+        # matching the fragments around it.
+        for column in TS_DIFF_CASE_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = None
+            frame[column] = frame[column].astype("string")
+        store.write_table(frame, out_dir, "ts_diff", partition_by=["family"])
     for path in pending:
         path.unlink(missing_ok=True)
 
@@ -417,6 +768,10 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> int:
         ok = group[(group["status"] == schema.Status.OK)
                    & group["out_path"].notna()]
         usable = dict(zip(ok["variant"], ok["out_path"]))
+        # Empty for a store written before `case_id` existed; the rows then
+        # carry nulls rather than the stage refusing to diff at all.
+        cases = (dict(zip(ok["variant"], ok["case_id"]))
+                 if "case_id" in ok.columns else {})
         family = group["family"].iloc[0]
 
         succeeded: set[str] = set()
@@ -438,7 +793,10 @@ def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> int:
             for row in diff_rows:
                 rows.append({
                     "model_id": model_id, "family": family,
-                    "comparison": label, **row,
+                    "comparison": label,
+                    "case_id_left": cases.get(left),
+                    "case_id_right": cases.get(right),
+                    **row,
                 })
             succeeded.add(label)
 
@@ -477,8 +835,6 @@ def _replace_table(frame: pd.DataFrame, out_dir: Path, name: str,
     clears the stale dataset from a previous run, instead of leaving it
     behind to be read as still current.
     """
-    import shutil
-
     shutil.rmtree(Path(out_dir) / name, ignore_errors=True)
     if not frame.empty:
         store.write_table(frame, out_dir, name, partition_by=partition_by)
@@ -487,13 +843,31 @@ def _replace_table(frame: pd.DataFrame, out_dir: Path, name: str,
 def executed_engine_versions(runs: pd.DataFrame) -> list[str]:
     """Distinct engine builds among the executed (non-reference) rows.
 
+    `engine_build_id` is the authority and `engine_version` only the
+    fallback: the version string is what the engine PRINTED, and two builds
+    with entirely different Anderson, continuity or slot implementations can
+    both print `OpenSWMM 6.0`. A guard reading the string alone would wave
+    exactly the mix it exists to catch straight through. The fallback exists
+    for rows written before the hash did, and is applied per row so a store
+    holding both kinds is still screened rather than half-ignored.
+
     Reference rows are excluded: they always carry the `corpus-reference`
     sentinel, which identifies the corpus anchor rather than any build of ours.
     """
-    if runs.empty or "engine_version" not in runs.columns:
+    if runs.empty:
         return []
     executed = runs[runs["variant"].isin(schema.VARIANTS)]
-    return sorted(executed["engine_version"].dropna().astype(str).unique())
+    build = executed.get("engine_build_id")
+    version = executed.get("engine_version")
+    if build is None and version is None:
+        return []
+    if build is None:
+        identity = version
+    elif version is None:
+        identity = build
+    else:
+        identity = build.astype(object).where(build.notna(), version)
+    return sorted(identity.dropna().astype(str).unique())
 
 
 #: Operator-facing console messages `stage_report` prints, keyed by language

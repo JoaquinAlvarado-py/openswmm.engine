@@ -74,6 +74,19 @@ DELTA_SPECS = (
 DELTA_COLUMNS = [column for column, _, _ in DELTA_SPECS]
 VALUE_COLUMNS = [f"value_{variant.lower()}" for variant in DELTA_VARIANTS]
 
+#: The `case_id` of each variant's source run, carried through to `deltas`
+#: and `element_deltas` -- one column per variant, exactly parallel to
+#: `VALUE_COLUMNS`.
+#:
+#: These tables are recomputed and replaced on every `report`, so without the
+#: provenance a published number is traceable only as far as "some row of
+#: `runs`". With it, every `value_e` and every `delta_e_minus_a` names the
+#: exact executable and the exact corpus state that produced it. One column
+#: per variant rather than one per row because a delta row is a JOIN across
+#: six runs: a single `case_id` would have to pick a side, and the side it
+#: picked would be the one nobody was asking about.
+CASE_ID_COLUMNS = [f"case_id_{variant.lower()}" for variant in DELTA_VARIANTS]
+
 
 def _pivot(runs: pd.DataFrame, column: str) -> pd.DataFrame:
     """model_id x variant table of `column`, or an empty frame if absent."""
@@ -253,6 +266,10 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
     kinds = _pivot(runs, "iteration_metric_kind")
     routing = _pivot(runs, "reported_routing_model")
     echoes = echo_pivots(runs)
+    # Empty for a store written before `case_id` existed; `_lookup` then
+    # yields NA and the columns are still emitted, so the schema does not
+    # depend on the age of the store.
+    cases = _pivot(runs, "case_id")
 
     families = runs.groupby("model_id")["family"].first()
     rows: list[dict] = []
@@ -269,6 +286,9 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
                 "metric": metric,
             }
             row.update({f"value_{variant.lower()}": values[variant]
+                        for variant in DELTA_VARIANTS})
+            row.update({f"case_id_{variant.lower()}":
+                        _lookup(cases, model_id, variant)
                         for variant in DELTA_VARIANTS})
 
             for column, left, right in DELTA_SPECS:
@@ -1301,7 +1321,33 @@ def build_element_deltas(elements: pd.DataFrame) -> pd.DataFrame:
         wide[column] = (wide[f"value_{left.lower()}"]
                         - wide[f"value_{right.lower()}"])
 
-    return wide[ELEMENT_KEY + VALUE_COLUMNS + DELTA_COLUMNS]
+    wide = _attach_element_case_ids(wide, elements)
+    return wide[ELEMENT_KEY + VALUE_COLUMNS + DELTA_COLUMNS + CASE_ID_COLUMNS]
+
+
+def _attach_element_case_ids(
+    wide: pd.DataFrame, elements: pd.DataFrame,
+) -> pd.DataFrame:
+    """Join each variant's source `case_id` onto the pivoted element rows.
+
+    Pivoted the same way and on the same key as the values themselves, so a
+    row's `case_id_c` is by construction the case its `value_c` came from --
+    not a lookup that could pick a different run of the same model.
+    """
+    if "case_id" not in elements.columns:
+        for column in CASE_ID_COLUMNS:
+            wide[column] = pd.NA
+        return wide
+
+    cases = elements.pivot_table(
+        index=ELEMENT_KEY, columns="variant", values="case_id", aggfunc="first"
+    ).rename(columns={variant: f"case_id_{variant.lower()}"
+                      for variant in DELTA_VARIANTS})
+    for column in CASE_ID_COLUMNS:
+        if column not in cases.columns:
+            cases[column] = pd.NA
+    return wide.merge(cases[CASE_ID_COLUMNS].reset_index(),
+                      on=ELEMENT_KEY, how="left")
 
 
 def topology_status(elements: pd.DataFrame) -> pd.DataFrame:

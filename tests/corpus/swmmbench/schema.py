@@ -5,6 +5,8 @@ way across the pipeline; a typo in a stage that writes Parquet is otherwise
 invisible until the analysis stage silently drops rows.
 """
 
+import hashlib
+
 
 class Status:
     """Outcome of a single (model, variant) run. Every run gets exactly one."""
@@ -46,3 +48,50 @@ ITER_FV = "fv_substeps"
 #: The value `Flow Routing Method` echoes for the dynamic wave solver -- the
 #: only routing model under which a Picard iteration count means anything.
 ROUTING_DYNWAVE = "DYNWAVE"
+
+
+# ---------------------------------------------------------------------------
+# Case identity
+# ---------------------------------------------------------------------------
+
+#: The fields a `case_id` is derived from, in order. A *case* is one unit of
+#: work: this model, under this variant, executed by THIS engine build,
+#: against THIS state of the corpus.
+#:
+#: `runs` used to be the only table carrying any of this (`engine_version` +
+#: `inp_sha256`), while `scalars` and `elements` were identified by
+#: model/family/variant/engine_version alone. So a model whose inputs changed
+#: left old and new records coexisting in those tables with nothing to tell
+#: them apart, and `pivot_table(..., aggfunc="first")` could silently pick
+#: the stale one. One id, derived here and only here, carried on every row of
+#: `runs`, `scalars`, `elements`, `ts_diff`, `deltas` and `element_deltas`,
+#: makes that impossible: the tables cannot disagree about what a case is
+#: because they never compute it themselves.
+CASE_ID_FIELDS = ("model_id", "variant", "engine_build_id", "dependency_id")
+
+#: NUL joins the fields because it cannot occur in any of them. A printable
+#: separator would let two different field tuples serialise identically --
+#: ("a|b", "c") and ("a", "b|c") -- and hash to the same case.
+_CASE_ID_SEPARATOR = "\x00"
+
+
+def case_id(
+    model_id: str,
+    variant: str,
+    engine_build_id: str,
+    dependency_id: str,
+) -> str:
+    """The identity of one unit of work; see `CASE_ID_FIELDS`.
+
+    `engine_build_id` is a content hash of the engine executable, not the
+    version string it prints (two builds can print the same string), and
+    `dependency_id` is the corpus git commit, not the deck hash (a deck's
+    `DataFiles/*.dat` can change while the deck does not). Both are supplied
+    by the caller; this function only fixes how they are combined, so the
+    resume key and every table's `case_id` column are the same value by
+    construction rather than by convention.
+    """
+    fields = (str(model_id), str(variant), str(engine_build_id),
+              str(dependency_id))
+    payload = _CASE_ID_SEPARATOR.join(fields).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()

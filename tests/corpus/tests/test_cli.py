@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -5,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from swmmbench import cli, outdiff, rptparse, schema, store
+from swmmbench import cli, corpus, outdiff, report, rptparse, schema, store
 
 DECK = "[TITLE]\nt\n\n[OPTIONS]\nFLOW_UNITS CFS\n"
 
@@ -1053,3 +1055,342 @@ def test_run_without_a_corpus_root_fails_cleanly(tmp_path, capsys):
 
     assert code != 0
     assert "--corpus-root" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Engine build identity
+# ---------------------------------------------------------------------------
+
+#: An engine stand-in that answers `--version` with a FIXED banner regardless
+#: of its own contents, so two of them are indistinguishable by version
+#: string and distinguishable only by their bytes -- exactly the situation
+#: `engine_version` cannot tell apart and `engine_build_id` must.
+_ENGINE_TEMPLATE = """
+    import sys, pathlib
+    BUILD_MARKER = {marker!r}
+    if "--version" in sys.argv:
+        print("OpenSWMM 6.0")
+        raise SystemExit(0)
+    pathlib.Path(sys.argv[2]).write_text({report!r}, encoding="latin-1")
+    pathlib.Path(sys.argv[3]).write_bytes(b"out")
+"""
+
+MISSING_ENGINE = "swmmbench-no-such-executable"
+
+
+def _marked_engine(tmp_path, name, marker, report=FAKE_REPORT):
+    script = tmp_path / name
+    script.write_text(
+        textwrap.dedent(_ENGINE_TEMPLATE).format(marker=marker, report=report),
+        encoding="utf-8",
+    )
+    return [sys.executable, str(script)]
+
+
+def test_two_engines_with_one_version_banner_have_different_build_ids(tmp_path):
+    # The defect: `--version` was the engine's identity in the resume key, so
+    # two executables containing completely different Anderson, continuity or
+    # slot implementations were one key as long as they printed one string.
+    build_a = _marked_engine(tmp_path, "engine_a.py", "build-a")
+    build_b = _marked_engine(tmp_path, "engine_b.py", "build-b")
+
+    assert cli._engine_version(build_a) == cli._engine_version(build_b)
+
+    id_a = cli._engine_identity(build_a)["engine_build_id"]
+    id_b = cli._engine_identity(build_b)["engine_build_id"]
+
+    assert id_a != id_b
+    # ... and it is a content hash, not a restatement of the argv.
+    assert id_a.startswith(cli.ENGINE_BUILD_HASHED_PREFIX)
+    assert id_b.startswith(cli.ENGINE_BUILD_HASHED_PREFIX)
+
+
+def test_a_run_under_one_build_is_not_completed_under_another(corpus_root, tmp_path):
+    out = tmp_path / "out"
+    build_a = _marked_engine(tmp_path, "engine_a.py", "build-a")
+    build_b = _marked_engine(tmp_path, "engine_b.py", "build-b")
+    cli.stage_inventory(corpus_root, out)
+
+    cli.stage_run(corpus_root, out, build_a, timeout_s=30.0, jobs=1, limit=None)
+    cli.stage_run(corpus_root, out, build_b, timeout_s=30.0, jobs=1, limit=None)
+
+    runs = store.read_table(out, "runs")
+    executed = runs[runs["variant"].isin(schema.VARIANTS)]
+
+    # Both builds ran everything: neither was skipped as "already done".
+    assert len(executed) == 20
+    assert executed["engine_build_id"].nunique() == 2
+    assert executed["engine_version"].nunique() == 1  # the string agrees...
+    # ... and the anchors are NOT re-read: a REF case depends on the corpus,
+    # not on any build of ours, so a second engine must not duplicate them.
+    assert len(runs[runs["variant"] == schema.VARIANT_REF]) == 2
+
+
+def test_an_engine_that_is_not_a_readable_file_degrades_without_raising(tmp_path):
+    identity = cli._engine_identity([MISSING_ENGINE])
+
+    # Clearly marked as non-cryptographic rather than dressed up as a hash:
+    # anything reachable under this name would collide with anything else.
+    assert identity["engine_build_id"].startswith(cli.ENGINE_BUILD_UNHASHED_PREFIX)
+    assert not identity["engine_build_id"].startswith(cli.ENGINE_BUILD_HASHED_PREFIX)
+    assert identity["engine_version"]
+
+
+def test_a_sweep_with_an_unrunnable_engine_records_crashes_rather_than_raising(
+    corpus_root, tmp_path,
+):
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+
+    code = cli.stage_run(corpus_root, out, [MISSING_ENGINE],
+                         timeout_s=30.0, jobs=1, limit=None)
+
+    assert code == 0  # the corpus is still clean; the engine is the problem
+    runs = store.read_table(out, "runs")
+    executed = runs[runs["variant"].isin(schema.VARIANTS)]
+    assert set(executed["status"]) == {schema.Status.CRASH}
+    assert executed["case_id"].notna().all()
+
+
+def test_the_mixed_build_guard_reads_the_build_hash_not_the_version_string(
+    tmp_path,
+):
+    # The guard exists to catch exactly the mix a version string cannot see.
+    runs = pd.DataFrame([
+        {"model_id": "F/m", "family": "F", "variant": variant,
+         "engine_version": "OpenSWMM 6.0", "engine_build_id": build}
+        for variant, build in ((schema.VARIANT_A, "sha256:aaa"),
+                               (schema.VARIANT_C, "sha256:bbb"))
+    ])
+
+    assert cli.executed_engine_versions(runs) == ["sha256:aaa", "sha256:bbb"]
+
+
+# ---------------------------------------------------------------------------
+# The corpus dependency identity
+# ---------------------------------------------------------------------------
+
+requires_git = pytest.mark.skipif(shutil.which("git") is None,
+                                  reason="git is not installed")
+
+
+def _git(root, *args):
+    subprocess.run(["git", "-C", str(root), *args],
+                   check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def git_corpus(corpus_root):
+    """`corpus_root` as a git repository, with an external data file.
+
+    The data file is the point: it is what a deck references by relative
+    path and what a deck-only hash cannot see change.
+    """
+    _git(corpus_root, "init", "-q")
+    _git(corpus_root, "config", "user.email", "swmmbench@example.invalid")
+    _git(corpus_root, "config", "user.name", "swmmbench")
+    _git(corpus_root, "config", "commit.gpgsign", "false")
+    (corpus_root / "EPA" / "DataFiles").mkdir()
+    (corpus_root / "EPA" / "DataFiles" / "rainfall.dat").write_text(
+        "1\n", encoding="latin-1")
+    _git(corpus_root, "add", "-A")
+    _git(corpus_root, "commit", "-qm", "one")
+    return corpus_root
+
+
+@requires_git
+def test_a_new_corpus_commit_invalidates_the_resume_key(
+    git_corpus, tmp_path, fake_engine,
+):
+    # The decks are byte-identical before and after; only an external data
+    # file changed. Under the old deck-only key every case read as "already
+    # done" and the sweep republished stale numbers as current.
+    out = tmp_path / "out"
+    cli.stage_inventory(git_corpus, out)
+    cli.stage_run(git_corpus, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+    before = len(store.read_table(out, "runs"))
+
+    (git_corpus / "EPA" / "DataFiles" / "rainfall.dat").write_text(
+        "2\n", encoding="latin-1")
+    _git(git_corpus, "commit", "-qam", "two")
+    cli.stage_inventory(git_corpus, out)
+    cli.stage_run(git_corpus, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+
+    runs = store.read_table(out, "runs")
+
+    assert len(runs) == 2 * before
+    assert runs["corpus_commit"].nunique() == 2
+    assert runs["inp_sha256"].nunique() == 1  # the decks never moved
+    assert runs["case_id"].nunique() == len(runs)
+
+
+@requires_git
+def test_an_unchanged_git_corpus_still_resumes(git_corpus, tmp_path, fake_engine):
+    # The other half: over-invalidation is the safe direction, but it must
+    # not fire on a corpus that did not move.
+    out = tmp_path / "out"
+    cli.stage_inventory(git_corpus, out)
+    cli.stage_run(git_corpus, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+    before = len(store.read_table(out, "runs"))
+
+    cli.stage_run(git_corpus, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+
+    assert len(store.read_table(out, "runs")) == before
+
+
+def test_a_non_git_corpus_sweeps_with_the_dependency_marked_unpinned(
+    corpus_root, tmp_path, fake_engine,
+):
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+
+    assert cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0,
+                         jobs=1, limit=None) == 0
+
+    runs = store.read_table(out, "runs")
+    assert set(runs["corpus_commit"]) == {corpus.UNPINNED_CORPUS}
+
+
+# ---------------------------------------------------------------------------
+# `case_id` travels to every derived table
+# ---------------------------------------------------------------------------
+
+
+def _case_keys(table):
+    return set(zip(table["model_id"], table["variant"], table["case_id"]))
+
+
+def test_case_id_is_identical_across_runs_scalars_and_elements(
+    corpus_with_elements, tmp_path, engine_with_elements,
+):
+    # `scalars` and `elements` used to be identified by model/family/variant/
+    # engine_version alone, so a changed model left old and new records
+    # coexisting with nothing to tell them apart and `aggfunc="first"` free
+    # to pick the stale one.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_with_elements, out)
+    cli.stage_run(corpus_with_elements, out, engine_with_elements,
+                  timeout_s=30.0, jobs=1, limit=None)
+
+    runs = store.read_table(out, "runs")
+    scalars = store.read_table(out, "scalars")
+    elements = store.read_table(out, "elements")
+
+    for table in (runs, scalars, elements):
+        assert "case_id" in table.columns
+        assert table["case_id"].notna().all()
+
+    assert _case_keys(scalars) == _case_keys(runs)
+    assert _case_keys(elements) == _case_keys(runs)
+
+
+def test_case_id_differs_when_the_engine_build_differs(corpus_root, tmp_path):
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    cli.stage_run(corpus_root, out, _marked_engine(tmp_path, "engine_a.py", "a"),
+                  timeout_s=30.0, jobs=1, limit=None)
+    cli.stage_run(corpus_root, out, _marked_engine(tmp_path, "engine_b.py", "b"),
+                  timeout_s=30.0, jobs=1, limit=None)
+
+    runs = store.read_table(out, "runs")
+    executed = runs[runs["variant"].isin(schema.VARIANTS)]
+    per_case = executed.groupby(["model_id", "variant"])["case_id"].nunique()
+
+    assert set(per_case) == {2}
+
+
+def test_delta_rows_carry_the_case_id_of_every_source_run(
+    corpus_with_elements, tmp_path, engine_with_elements,
+):
+    # A published number has to be traceable to the exact executable and
+    # corpus state behind it; `deltas` and `element_deltas` are recomputed
+    # and replaced every report, so they cannot rely on `runs` staying put.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_with_elements, out)
+    cli.stage_run(corpus_with_elements, out, engine_with_elements,
+                  timeout_s=30.0, jobs=1, limit=None)
+    cli.stage_report(out, lang="en")
+
+    runs = store.read_table(out, "runs")
+    known = set(runs["case_id"])
+
+    for name in ("deltas", "element_deltas"):
+        table = store.read_table(out, name)
+        assert not table.empty, name
+        for column in report.CASE_ID_COLUMNS:
+            assert column in table.columns, (name, column)
+            assert set(table[column].dropna()) <= known, (name, column)
+        # Each column names its OWN variant's run, not just some run.
+        for variant in ("a", "e", "ref"):
+            expected = set(runs.loc[runs["variant"] == variant.upper(), "case_id"])
+            assert set(table[f"case_id_{variant}"].dropna()) == expected, name
+
+
+# ---------------------------------------------------------------------------
+# Batched writes during `run`
+# ---------------------------------------------------------------------------
+
+
+class _SimulatedMachineFailure(Exception):
+    """Something `_run_one` cannot itself raise: a lost machine mid-sweep."""
+
+
+def test_rows_reach_disk_before_the_sweep_finishes(
+    corpus_root, tmp_path, fake_engine, monkeypatch,
+):
+    # The whole sweep used to be held in memory and written once, so a
+    # machine failure near the end of ~8200 simulations lost everything
+    # rather than the tail. Two models x five variants against a batch of
+    # two crosses four real boundaries.
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    monkeypatch.setattr(cli, "FLUSH_BATCH_SIZE", 2)
+
+    original = cli._run_one
+    durable = []
+
+    def spy(job):
+        durable.append(len(store.read_table(out, "runs")))
+        return original(job)
+
+    monkeypatch.setattr(cli, "_run_one", spy)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+
+    # By the last of the ten simulations, the first eight are already durable.
+    assert durable[0] == 0
+    assert durable[-1] == 8
+    assert len(store.read_table(out, "runs")) == 12  # 10 + two REF rows
+
+
+def test_an_interruption_after_a_flush_leaves_the_flushed_rows_resumable(
+    corpus_root, tmp_path, fake_engine, monkeypatch,
+):
+    out = tmp_path / "out"
+    cli.stage_inventory(corpus_root, out)
+    monkeypatch.setattr(cli, "FLUSH_BATCH_SIZE", 2)
+
+    original = cli._run_one
+    calls = {"n": 0}
+
+    def failing(job):
+        calls["n"] += 1
+        if calls["n"] == 5:
+            raise _SimulatedMachineFailure("power cut")
+        return original(job)
+
+    monkeypatch.setattr(cli, "_run_one", failing)
+    with pytest.raises(_SimulatedMachineFailure):
+        cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0,
+                      jobs=1, limit=None)
+
+    # Two batches had flushed; only the unflushed fifth simulation is lost.
+    assert len(store.read_table(out, "runs")) == 4
+
+    monkeypatch.setattr(cli, "_run_one", original)
+    cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
+
+    runs = store.read_table(out, "runs")
+    assert len(runs) == 12
+    # Resumed, not redone: the survivors were recognised by their case_id.
+    assert runs["case_id"].nunique() == 12
+    assert set(store.read_table(out, "scalars")["case_id"]) == set(runs["case_id"])
