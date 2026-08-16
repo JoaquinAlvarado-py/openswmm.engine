@@ -217,6 +217,97 @@ def _option_runs(**overrides):
     ])
 
 
+def _option_runs_with_surcharge(**overrides):
+    """One executed run per variant (A, B, C, D, E), each echoing what its
+    variant intends -- including `reported_surcharge_method` -- unless
+    overridden by `overrides[variant] = {"reported_surcharge_method": ...}`."""
+    base = {
+        schema.VARIANT_A: {"reported_node_continuity": "EXPLICIT",
+                           "reported_anderson_accel": "NO",
+                           "reported_surcharge_method": "EXTRAN"},
+        schema.VARIANT_B: {"reported_node_continuity": "EXPLICIT",
+                           "reported_anderson_accel": "YES",
+                           "reported_surcharge_method": "EXTRAN"},
+        schema.VARIANT_C: {"reported_node_continuity": "SEMI_IMPLICIT",
+                           "reported_anderson_accel": "NO",
+                           "reported_surcharge_method": "EXTRAN"},
+        schema.VARIANT_D: {"reported_node_continuity": "SEMI_IMPLICIT",
+                           "reported_anderson_accel": "YES",
+                           "reported_surcharge_method": "EXTRAN"},
+        schema.VARIANT_E: {"reported_node_continuity": "EXPLICIT",
+                           "reported_anderson_accel": "NO",
+                           "reported_surcharge_method": "DYNAMIC_SLOT"},
+    }
+    for variant, patch in overrides.items():
+        base[variant].update(patch)
+    return pd.DataFrame([
+        {"model_id": "EPA/m1", "family": "EPA", "variant": variant, **echoes}
+        for variant, echoes in base.items()
+    ])
+
+
+def test_option_anomalies_is_empty_across_all_five_variants_when_every_run_echoes_intent():
+    anomalies = report.option_anomalies(_option_runs_with_surcharge())
+
+    assert anomalies.empty
+
+
+def test_option_anomalies_flags_a_d_run_that_echoes_anderson_off():
+    # D's value comes from D - C, so its ANDERSON_ACCEL echo matters just
+    # as much as B's.
+    runs = _option_runs_with_surcharge(D={"reported_anderson_accel": "NO"})
+
+    anomalies = report.option_anomalies(runs)
+
+    assert len(anomalies) == 1
+    row = anomalies.iloc[0]
+    assert row["variant"] == schema.VARIANT_D
+    assert row["option"] == "ANDERSON_ACCEL"
+    assert row["expected"] == "YES"
+    assert row["reported"] == "NO"
+
+
+def test_option_anomalies_flags_a_d_run_that_echoes_explicit_node_continuity():
+    runs = _option_runs_with_surcharge(D={"reported_node_continuity": "EXPLICIT"})
+
+    anomalies = report.option_anomalies(runs)
+
+    assert len(anomalies) == 1
+    row = anomalies.iloc[0]
+    assert row["variant"] == schema.VARIANT_D
+    assert row["option"] == "NODE_CONTINUITY"
+    assert row["expected"] == "SEMI_IMPLICIT"
+    assert row["reported"] == "EXPLICIT"
+
+
+def test_option_anomalies_flags_an_e_run_that_echoes_extran_surcharge_method():
+    # E's whole point is the Dynamic Preissmann Slot -- an engine that
+    # silently fell back to EXTRAN for E must be caught here.
+    runs = _option_runs_with_surcharge(E={"reported_surcharge_method": "EXTRAN"})
+
+    anomalies = report.option_anomalies(runs)
+
+    assert len(anomalies) == 1
+    row = anomalies.iloc[0]
+    assert row["variant"] == schema.VARIANT_E
+    assert row["option"] == "SURCHARGE_METHOD"
+    assert row["expected"] == "DYNAMIC_SLOT"
+    assert row["reported"] == "EXTRAN"
+
+
+def test_option_anomalies_ignores_a_non_dynwave_run_missing_all_three_echoes():
+    # A KINWAVE (or STEADY/FV) run never prints the DYNWAVE-only block at
+    # all: no NODE_CONTINUITY, ANDERSON_ACCEL or SURCHARGE_METHOD echo.
+    # Absence must be skipped, not flagged as a contradiction.
+    runs = _option_runs_with_surcharge(E={"reported_node_continuity": None,
+                                          "reported_anderson_accel": None,
+                                          "reported_surcharge_method": None})
+
+    anomalies = report.option_anomalies(runs)
+
+    assert anomalies.empty
+
+
 def test_option_anomalies_is_empty_when_every_run_echoes_its_intent():
     anomalies = report.option_anomalies(_option_runs())
 

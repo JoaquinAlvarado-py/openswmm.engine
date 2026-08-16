@@ -268,44 +268,54 @@ def _flush_diff_batch(out_dir: Path, rows: list[dict], pending: list[Path]) -> N
 
 
 #: Which variant's `.out` is compared against A, and the label stamped on
-#: the rows that comparison produces. B isolates Anderson acceleration; C
-#: isolates semi-implicit (Crank-Nicolson) node continuity -- kept as two
-#: distinct comparisons, both anchored on A, for the same attribution reason
-#: the A/B/C matrix itself exists.
+#: the rows that comparison produces. Every comparison here is anchored on
+#: A (it is the shared baseline `.out` every one of them reads), which keeps
+#: the A `.out` retention rule below uniform across all of them -- it does
+#: NOT mean every comparison's *interpretation* is A - X alone: D - A is a
+#: joint effect (Anderson + Crank-Nicolson together) and its attributable
+#: reading is D - C, formed downstream from D_minus_A and C_minus_A. B
+#: isolates Anderson acceleration (EXPLICIT/EXTRAN); C isolates
+#: semi-implicit (Crank-Nicolson) node continuity; D is the joint Anderson +
+#: Crank-Nicolson regime Anderson was designed for; E isolates the Dynamic
+#: Preissmann Slot surcharge method.
 DIFF_COMPARISONS = (
     (schema.VARIANT_B, "B_minus_A"),
     (schema.VARIANT_C, "C_minus_A"),
+    (schema.VARIANT_D, "D_minus_A"),
+    (schema.VARIANT_E, "E_minus_A"),
 )
 
 
 def stage_diff(out_dir: Path, abs_tol: float = 1e-9) -> None:
-    """Diff the retained A/B and A/C `.out` pairs, then discard the binaries.
+    """Diff the retained A-anchored `.out` pairs, then discard the binaries.
 
     `abs_tol` is an absolute tolerance on the value difference, not a relative
     one: it is the threshold `outdiff.diff_series` compares `|b - a|` against.
 
-    Only variant A is required per model: it is the shared baseline both
-    comparisons read. B - A runs whenever B's `.out` is present, C - A
-    whenever C's is, independently of whether the other variant ran at all
-    -- a model whose C run crashed still yields its B - A.
+    Only variant A is required per model: it is the shared baseline every
+    comparison in `DIFF_COMPARISONS` reads. Each comparison runs whenever its
+    OWN variant's `.out` is present, independently of whether any other
+    variant ran at all -- a model whose C run crashed still yields its
+    B - A, D - A and E - A.
 
     Each comparison is isolated, not each model: B - A reads `a_out` and
-    `b_out`; C - A reads `a_out` and `c_out`. A truncated `b_out` (or a
-    missing one) must not cost an otherwise-computable C - A result (or vice
-    versa) -- the same "a missing/bad thing must not cost an unrelated
-    computable result" principle already applied to the iteration-kind guard
-    in `report.build_deltas` and, one level up, to per-model isolation in
-    this very stage.
+    `b_out`; C - A reads `a_out` and `c_out`; likewise for D - A and E - A.
+    A truncated (or missing) `.out` for one variant must not cost an
+    otherwise-computable comparison for another -- the same "a missing/bad
+    thing must not cost an unrelated computable result" principle already
+    applied to the iteration-kind guard in `report.build_deltas` and, one
+    level up, to per-model isolation in this very stage.
 
     Deletion follows the comparisons that actually ran and succeeded for
     each file: `b_out` is deletable once B - A has flushed, `c_out` once
-    C - A has flushed, and `a_out` -- read by both -- only once BOTH have
-    flushed. A comparison that raises, OR was never attempted because its
-    variant's `.out` is missing, leaves every `.out` file IT would have read
-    in place for a future re-run; it never touches the other comparison's
-    outcome. Rows are flushed to disk in batches of `FLUSH_BATCH_SIZE`
-    models, and only the `.out` files behind an already-flushed batch are
-    deleted.
+    C - A has flushed, `d_out`/`e_out` likewise for D - A/E - A, and
+    `a_out` -- read by every comparison in `DIFF_COMPARISONS` -- only once
+    ALL of them have flushed. A comparison that raises, OR was never
+    attempted because its variant's `.out` is missing, leaves every `.out`
+    file IT would have read in place for a future re-run; it never touches
+    another comparison's outcome. Rows are flushed to disk in batches of
+    `FLUSH_BATCH_SIZE` models, and only the `.out` files behind an
+    already-flushed batch are deleted.
     """
     from . import outdiff
 

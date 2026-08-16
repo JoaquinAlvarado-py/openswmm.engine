@@ -89,7 +89,7 @@ def test_inventory_drops_a_model_that_left_the_corpus(corpus_root, tmp_path):
     assert sorted(store.read_table(out, "models")["model_id"]) == ["EPA/m1"]
 
 
-def test_run_produces_three_variants_per_model(corpus_root, tmp_path, fake_engine):
+def test_run_produces_five_variants_per_model(corpus_root, tmp_path, fake_engine):
     out = tmp_path / "out"
     cli.stage_inventory(corpus_root, out)
     cli.stage_run(corpus_root, out, fake_engine, timeout_s=30.0, jobs=1, limit=None)
@@ -97,8 +97,8 @@ def test_run_produces_three_variants_per_model(corpus_root, tmp_path, fake_engin
     runs = store.read_table(out, "runs")
     executed = runs[runs["variant"].isin(schema.VARIANTS)]
 
-    assert len(executed) == 6  # 2 models x variants A, B and C
-    assert set(executed["variant"]) == {"A", "B", "C"}
+    assert len(executed) == 10  # 2 models x variants A, B, C, D and E
+    assert set(executed["variant"]) == {"A", "B", "C", "D", "E"}
     assert set(executed["status"]) == {schema.Status.OK}
 
 
@@ -183,27 +183,19 @@ def test_main_requires_an_engine_for_the_run_stage(corpus_root, tmp_path, capsys
 
 
 def _diff_runs_fixture(tmp_path):
-    """A `runs` table with two OK models, each with real (fake) A/B/C .out files."""
-    a1, b1, c1 = (tmp_path / f"bad_{v}.out" for v in "ABC")
-    a2, b2, c2 = (tmp_path / f"good_{v}.out" for v in "ABC")
-    for path in (a1, b1, c1, a2, b2, c2):
+    """A `runs` table with two OK models, each with real (fake) .out files
+    for all five variants (A-E), so all four DIFF_COMPARISONS are exercised."""
+    bad = tuple(tmp_path / f"bad_{v}.out" for v in schema.VARIANTS)
+    good = tuple(tmp_path / f"good_{v}.out" for v in schema.VARIANTS)
+    for path in bad + good:
         path.write_bytes(b"not really a binary .out file")
 
-    runs = pd.DataFrame([
-        {"model_id": "F/bad", "family": "F", "variant": schema.VARIANT_A,
-         "status": schema.Status.OK, "out_path": str(a1)},
-        {"model_id": "F/bad", "family": "F", "variant": schema.VARIANT_B,
-         "status": schema.Status.OK, "out_path": str(b1)},
-        {"model_id": "F/bad", "family": "F", "variant": schema.VARIANT_C,
-         "status": schema.Status.OK, "out_path": str(c1)},
-        {"model_id": "F/good", "family": "F", "variant": schema.VARIANT_A,
-         "status": schema.Status.OK, "out_path": str(a2)},
-        {"model_id": "F/good", "family": "F", "variant": schema.VARIANT_B,
-         "status": schema.Status.OK, "out_path": str(b2)},
-        {"model_id": "F/good", "family": "F", "variant": schema.VARIANT_C,
-         "status": schema.Status.OK, "out_path": str(c2)},
-    ])
-    return runs, (a1, b1, c1), (a2, b2, c2)
+    rows = []
+    for model_id, paths in (("F/bad", bad), ("F/good", good)):
+        for variant, path in zip(schema.VARIANTS, paths):
+            rows.append({"model_id": model_id, "family": "F", "variant": variant,
+                        "status": schema.Status.OK, "out_path": str(path)})
+    return pd.DataFrame(rows), bad, good
 
 
 def _fake_diff_out_files_raising_for_bad(a_out, b_out, abs_tol):
@@ -231,7 +223,7 @@ def test_diff_stage_keeps_out_files_for_a_model_whose_diff_raised(
     tmp_path, monkeypatch,
 ):
     out = tmp_path / "out"
-    runs, (bad_a, bad_b, bad_c), _good_paths = _diff_runs_fixture(tmp_path)
+    runs, (bad_a, bad_b, bad_c, bad_d, bad_e), _good_paths = _diff_runs_fixture(tmp_path)
     store.write_table(runs, out, "runs", partition_by=["family"])
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_for_bad)
@@ -241,13 +233,15 @@ def test_diff_stage_keeps_out_files_for_a_model_whose_diff_raised(
     assert bad_a.exists()
     assert bad_b.exists()
     assert bad_c.exists()
+    assert bad_d.exists()
+    assert bad_e.exists()
 
 
 def test_diff_stage_deletes_out_files_and_writes_rows_for_a_succeeding_model(
     tmp_path, monkeypatch,
 ):
     out = tmp_path / "out"
-    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
+    runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
     store.write_table(runs, out, "runs", partition_by=["family"])
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_for_bad)
@@ -257,12 +251,14 @@ def test_diff_stage_deletes_out_files_and_writes_rows_for_a_succeeding_model(
     assert not good_a.exists()
     assert not good_b.exists()
     assert not good_c.exists()
+    assert not good_d.exists()
+    assert not good_e.exists()
 
     ts_diff = store.read_table(out, "ts_diff")
     assert set(ts_diff["model_id"]) == {"F/good"}
 
 
-def test_diff_stage_emits_both_comparisons_distinguishable_by_column(
+def test_diff_stage_emits_all_four_comparisons_distinguishable_by_column(
     tmp_path, monkeypatch,
 ):
     out = tmp_path / "out"
@@ -277,8 +273,10 @@ def test_diff_stage_emits_both_comparisons_distinguishable_by_column(
     good = ts_diff[ts_diff["model_id"] == "F/good"]
 
     assert "comparison" in good.columns
-    assert set(good["comparison"]) == {"B_minus_A", "C_minus_A"}
-    assert len(good) == 2  # one diff row per comparison from the fake
+    assert set(good["comparison"]) == {
+        "B_minus_A", "C_minus_A", "D_minus_A", "E_minus_A",
+    }
+    assert len(good) == 4  # one diff row per comparison from the fake
 
 
 def _fake_diff_out_files_raising_when(fail_needle):
@@ -298,15 +296,17 @@ def _fake_diff_out_files_always_raising(a_out, other_out, abs_tol):
     raise RuntimeError("truncated .out file")
 
 
-def test_a_failing_b_minus_a_does_not_cost_a_computable_c_minus_a(
+def test_a_failing_b_minus_a_does_not_cost_the_other_three_comparisons(
     tmp_path, monkeypatch,
 ):
-    # b_out is the only bad input; a_out and c_out are perfectly readable,
-    # so C - A must still be computed and persisted. Only b_out -- the input
-    # the failed comparison actually read -- may be deleted... and since it
-    # failed, it must NOT be: it stays for a future retry of B - A.
+    # b_out is the only bad input; a_out, c_out, d_out and e_out are
+    # perfectly readable, so C - A, D - A and E - A must still be computed
+    # and persisted. Only b_out -- the input the failed comparison actually
+    # read -- may be deleted... and since it failed, it must NOT be: it
+    # stays for a future retry of B - A. a_out is read by EVERY comparison,
+    # so with B - A still outstanding it must survive too.
     out = tmp_path / "out"
-    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
+    runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
     store.write_table(runs, out, "runs", partition_by=["family"])
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_when("_B"))
@@ -315,22 +315,21 @@ def test_a_failing_b_minus_a_does_not_cost_a_computable_c_minus_a(
 
     ts_diff = store.read_table(out, "ts_diff")
     good = ts_diff[ts_diff["model_id"] == "F/good"]
-    assert set(good["comparison"]) == {"C_minus_A"}
+    assert set(good["comparison"]) == {"C_minus_A", "D_minus_A", "E_minus_A"}
 
-    # a_out is shared by both comparisons; B - A never succeeded, so a_out
-    # must survive for its retry. b_out (the failed comparison's own input)
-    # survives too. c_out's comparison succeeded and flushed, so it is gone.
     assert good_a.exists()
     assert good_b.exists()
     assert not good_c.exists()
+    assert not good_d.exists()
+    assert not good_e.exists()
 
 
-def test_a_failing_c_minus_a_does_not_cost_a_computable_b_minus_a(
+def test_a_failing_c_minus_a_does_not_cost_the_other_three_comparisons(
     tmp_path, monkeypatch,
 ):
     # Mirror of the above: c_out is the only bad input.
     out = tmp_path / "out"
-    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
+    runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
     store.write_table(runs, out, "runs", partition_by=["family"])
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_raising_when("_C"))
@@ -339,18 +338,20 @@ def test_a_failing_c_minus_a_does_not_cost_a_computable_b_minus_a(
 
     ts_diff = store.read_table(out, "ts_diff")
     good = ts_diff[ts_diff["model_id"] == "F/good"]
-    assert set(good["comparison"]) == {"B_minus_A"}
+    assert set(good["comparison"]) == {"B_minus_A", "D_minus_A", "E_minus_A"}
 
     assert good_a.exists()
     assert not good_b.exists()
     assert good_c.exists()
+    assert not good_d.exists()
+    assert not good_e.exists()
 
 
-def test_both_comparisons_failing_writes_nothing_and_keeps_all_three_files(
+def test_all_four_comparisons_failing_writes_nothing_and_keeps_all_five_files(
     tmp_path, monkeypatch,
 ):
     out = tmp_path / "out"
-    runs, _bad_paths, (good_a, good_b, good_c) = _diff_runs_fixture(tmp_path)
+    runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
     store.write_table(runs, out, "runs", partition_by=["family"])
     monkeypatch.setattr(outdiff, "diff_out_files",
                         _fake_diff_out_files_always_raising)
@@ -362,6 +363,33 @@ def test_both_comparisons_failing_writes_nothing_and_keeps_all_three_files(
     assert good_a.exists()
     assert good_b.exists()
     assert good_c.exists()
+    assert good_d.exists()
+    assert good_e.exists()
+
+
+def test_a_out_is_deleted_only_once_all_four_comparisons_have_flushed(
+    tmp_path, monkeypatch,
+):
+    # Every comparison but E succeeds. Three out of four A-anchored
+    # comparisons flushing is not enough: a_out is read by all four, so it
+    # must survive until E - A (or a retry of it) also flushes.
+    out = tmp_path / "out"
+    runs, _bad_paths, (good_a, good_b, good_c, good_d, good_e) = _diff_runs_fixture(tmp_path)
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_raising_when("_E"))
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    good = ts_diff[ts_diff["model_id"] == "F/good"]
+    assert set(good["comparison"]) == {"B_minus_A", "C_minus_A", "D_minus_A"}
+
+    assert good_a.exists()
+    assert good_e.exists()
+    assert not good_b.exists()
+    assert not good_c.exists()
+    assert not good_d.exists()
 
 
 def _partial_diff_runs_fixture(tmp_path, present_variants):
@@ -420,6 +448,30 @@ def test_a_missing_b_run_still_yields_c_minus_a(tmp_path, monkeypatch):
     assert set(rows["comparison"]) == {"C_minus_A"}
 
 
+def test_a_missing_d_run_still_yields_the_other_three_comparisons(tmp_path, monkeypatch):
+    # A model missing only D (e.g. its D run crashed) must still yield
+    # B - A, C - A and E - A -- D's absence costs only D - A.
+    out = tmp_path / "out"
+    runs, paths = _partial_diff_runs_fixture(
+        tmp_path, [schema.VARIANT_A, schema.VARIANT_B, schema.VARIANT_C,
+                  schema.VARIANT_E])
+    store.write_table(runs, out, "runs", partition_by=["family"])
+    monkeypatch.setattr(outdiff, "diff_out_files",
+                        _fake_diff_out_files_always_succeeding)
+
+    cli.stage_diff(out, abs_tol=1e-9)
+
+    ts_diff = store.read_table(out, "ts_diff")
+    rows = ts_diff[ts_diff["model_id"] == "F/partial"]
+    assert set(rows["comparison"]) == {"B_minus_A", "C_minus_A", "E_minus_A"}
+
+    # a_out is read by every attempted comparison; D was never attempted
+    # (its .out is entirely absent, not merely failed), so the three
+    # attempted comparisons succeeding is not "all of DIFF_COMPARISONS" --
+    # a_out must survive for a future D - A once D actually runs.
+    assert paths[schema.VARIANT_A].exists()
+
+
 def test_a_model_with_only_a_yields_nothing_and_keeps_its_out_file(
     tmp_path, monkeypatch,
 ):
@@ -450,11 +502,14 @@ def test_diff_stage_prints_a_warning_naming_the_failed_model(
     captured = capsys.readouterr()
     assert "F/bad" in captured.out
     # `_fake_diff_out_files_raising_for_bad` fails for every comparison of
-    # this model (it keys off `a_out`, which both read), so both labels must
-    # be identifiable in the warning output -- naming the model alone would
-    # also be satisfied by a message that dropped which comparison failed.
+    # this model (it keys off `a_out`, which all four read), so all four
+    # labels must be identifiable in the warning output -- naming the model
+    # alone would also be satisfied by a message that dropped which
+    # comparison failed.
     assert "B_minus_A" in captured.out
     assert "C_minus_A" in captured.out
+    assert "D_minus_A" in captured.out
+    assert "E_minus_A" in captured.out
 
 
 def test_multi_worker_runs_produce_the_same_results_as_a_single_worker(
@@ -470,8 +525,8 @@ def test_multi_worker_runs_produce_the_same_results_as_a_single_worker(
     runs = store.read_table(out, "runs")
     executed = runs[runs["variant"].isin(schema.VARIANTS)]
 
-    assert len(executed) == 6
-    assert set(executed["variant"]) == {"A", "B", "C"}
+    assert len(executed) == 10
+    assert set(executed["variant"]) == {"A", "B", "C", "D", "E"}
     assert set(executed["status"]) == {schema.Status.OK}
     assert executed["avg_iterations_per_step"].dropna().unique().tolist() == [2.5]
 

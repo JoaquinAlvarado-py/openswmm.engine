@@ -110,16 +110,17 @@ def build_deltas(runs: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
 
 #: Options whose engine-reported value can be checked against the variant's
 #: stated intent, keyed by the `runs` column that carries the echo
-#: (DefaultReportPlugin.cpp prints both under the DYNWAVE-only Analysis
+#: (DefaultReportPlugin.cpp prints all three under the DYNWAVE-only Analysis
 #: Options block; rptparse.parse_scalars reads them into these columns).
-#: OptionsHandler.cpp silently ignores an unrecognised value for either --
-#: no `else`, no warning -- so `options_applied` (what the harness's deck
+#: OptionsHandler.cpp silently ignores an unrecognised value for any of them
+#: -- no `else`, no warning -- so `options_applied` (what the harness's deck
 #: asked for) cannot alone prove the engine actually did it. Without this
 #: check, a typo in an option name or value would read as "the feature has
 #: no effect" across the whole corpus instead of as a broken deck.
 OPTION_ECHO_COLUMNS = {
     "NODE_CONTINUITY": "reported_node_continuity",
     "ANDERSON_ACCEL": "reported_anderson_accel",
+    "SURCHARGE_METHOD": "reported_surcharge_method",
 }
 
 ANOMALY_COLUMNS = ["model_id", "variant", "option", "expected", "reported"]

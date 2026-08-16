@@ -24,10 +24,12 @@ class Status:
 
 
 VARIANT_A = "A"      # our engine, new options explicitly off
-VARIANT_B = "B"      # our engine, Anderson acceleration on
+VARIANT_B = "B"      # our engine, Anderson acceleration on (EXPLICIT/EXTRAN)
 VARIANT_C = "C"      # our engine, semi-implicit (Crank-Nicolson) node continuity on
+VARIANT_D = "D"      # our engine, Anderson acceleration on SEMI_IMPLICIT/EXTRAN
+VARIANT_E = "E"      # our engine, Dynamic Preissmann Slot surcharge method
 VARIANT_REF = "REF"  # the corpus .rpt, parsed but never re-run
-VARIANTS = (VARIANT_A, VARIANT_B, VARIANT_C)
+VARIANTS = (VARIANT_A, VARIANT_B, VARIANT_C, VARIANT_D, VARIANT_E)
 
 # Which counter the "Average ... per Step" line actually reports. The report
 # writer relabels it under FV routing (DefaultReportPlugin.cpp:1194-1203) and

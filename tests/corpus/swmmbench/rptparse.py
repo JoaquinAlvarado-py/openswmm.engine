@@ -31,6 +31,7 @@ SCALAR_KEYS = (
     "min_step", "avg_step", "max_step", "pct_steady_state",
     "avg_iterations_per_step", "iteration_metric_kind",
     "pct_steps_not_converging", "n_steps_est", "total_iterations_est",
+    "reported_routing_model", "reported_surcharge_method",
     "reported_node_continuity", "reported_anderson_accel",
 )
 
@@ -83,6 +84,17 @@ def parse_scalars(text: str) -> dict:
             out["start_date"] = _parse_date(dotted.group("value"))
         elif label == "Ending Date":
             out["end_date"] = _parse_date(dotted.group("value"))
+        elif label == "Flow Routing Method":
+            # DefaultReportPlugin.cpp:556. Printed for EVERY routing model
+            # (FV, DYNWAVE, KINWAVE, STEADY) -- unlike the three echoes
+            # below, this one is never gated and is the stratification key
+            # for them: its presence does not imply theirs.
+            out["reported_routing_model"] = dotted.group("value").strip()
+        elif label == "Surcharge Method":
+            # DefaultReportPlugin.cpp:560, inside the `if (rm == 2)` block
+            # (lines 558-567) -- printed only when routing is DYNWAVE. Absent
+            # for FV/KINWAVE/STEADY reports; that absence is not an anomaly.
+            out["reported_surcharge_method"] = dotted.group("value").strip()
         elif label == "Node Continuity":
             # DefaultReportPlugin.cpp:562-564 echoes what OptionsHandler.cpp
             # actually resolved NODE_CONTINUITY to. OptionsHandler.cpp:443

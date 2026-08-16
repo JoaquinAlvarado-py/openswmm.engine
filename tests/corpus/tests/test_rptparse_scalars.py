@@ -142,6 +142,50 @@ def test_reported_node_continuity_and_anderson_are_none_when_absent():
     assert scalars["reported_anderson_accel"] is None
 
 
+def test_reads_the_reported_routing_model_and_surcharge_method_from_extran1(extran1):
+    # extran1.rpt is a real EPA SWMM 5.2 report (Example 1 of the Extran
+    # Manual). It carries `Flow Routing Method ...... DYNWAVE` and
+    # `Surcharge Method ......... EXTRAN` but -- being genuine EPA SWMM
+    # output, not OpenSWMM's -- it does NOT carry `Node Continuity` or
+    # `Anderson Acceleration`, which are OpenSWMM-only echoes.
+    scalars = rptparse.parse_scalars(extran1)
+
+    assert scalars["reported_routing_model"] == "DYNWAVE"
+    assert scalars["reported_surcharge_method"] == "EXTRAN"
+    assert scalars["reported_node_continuity"] is None
+    assert scalars["reported_anderson_accel"] is None
+
+
+def test_reads_the_reported_routing_model_and_surcharge_method_from_multi_continuity(
+    multi_continuity,
+):
+    scalars = rptparse.parse_scalars(multi_continuity)
+
+    assert scalars["reported_routing_model"] == "DYNWAVE"
+    assert scalars["reported_surcharge_method"] == "EXTRAN"
+    assert scalars["reported_node_continuity"] == "EXPLICIT"
+    assert scalars["reported_anderson_accel"] == "NO"
+
+
+def test_non_dynwave_report_yields_routing_model_but_none_for_the_other_three():
+    # Flow Routing Method is printed for EVERY routing model
+    # (DefaultReportPlugin.cpp:556); Surcharge Method, Node Continuity and
+    # Anderson Acceleration sit inside the DYNWAVE-only `if (rm == 2)` block
+    # (lines 558-567) and are legitimately absent for KINWAVE.
+    report_text = """
+  ****************
+  Analysis Options
+  ****************
+  Flow Routing Method ...... KINWAVE
+"""
+    scalars = rptparse.parse_scalars(report_text)
+
+    assert scalars["reported_routing_model"] == "KINWAVE"
+    assert scalars["reported_surcharge_method"] is None
+    assert scalars["reported_node_continuity"] is None
+    assert scalars["reported_anderson_accel"] is None
+
+
 def test_malformed_continuity_error_value_does_not_raise():
     """Malformed continuity error values like '1.2.3' or '.' must not raise.
 

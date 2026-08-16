@@ -9,7 +9,7 @@ def test_status_vocabulary_is_exactly_the_specified_set():
 
 
 def test_run_variants_exclude_the_reference():
-    assert schema.VARIANTS == ("A", "B", "C")
+    assert schema.VARIANTS == ("A", "B", "C", "D", "E")
     assert schema.VARIANT_REF == "REF"
     assert schema.VARIANT_REF not in schema.VARIANTS
 
