@@ -2965,17 +2965,19 @@ void DWSolver::computeAASkipFlags(const SimulationContext& ctx) {
     }
 
     // Ponded snap: setNodeDepth hard-floors a de-ponding node at
-    // full_depth - FUDGE when the update would drop below full depth
-    // (same snap in both continuity branches). That floor is a C⁰ kink in G
-    // exactly at the ponding boundary, so ponding-eligible nodes at/above
-    // full depth are skipped — without this, AA mixes across the kink and the
-    // blended iterate can jitter around full_depth.
-    if (node_continuity == NodeContinuity::SEMI_IMPLICIT) {
-        for (int i = 0; i < n_nodes_; ++i) {
-            auto ui = static_cast<std::size_t>(i);
-            if (nodeCanPond(ctx, ui) && nodes.depth[ui] >= node_tile_[ui].full_depth)
-                aa_skip_[ui] = 1;
-        }
+    // full_depth - FUDGE when the update would drop below full depth — the
+    // same snap in BOTH continuity branches (SEMI_IMPLICIT and EXPLICIT).
+    // That floor is a C⁰ kink in G exactly at the ponding boundary, so
+    // ponding-eligible nodes at/above full depth are skipped — without this,
+    // AA mixes across the kink and the blended iterate can jitter around
+    // full_depth. Runs in both continuity modes: under EXPLICIT ponded nodes
+    // are flagged is_surcharged = false (setNodeDepth), so the EXTRAN
+    // surcharged-node skip above never covers them and the kink would
+    // otherwise be unprotected in the default EXPLICIT mode.
+    for (int i = 0; i < n_nodes_; ++i) {
+        auto ui = static_cast<std::size_t>(i);
+        if (nodeCanPond(ctx, ui) && nodes.depth[ui] >= node_tile_[ui].full_depth)
+            aa_skip_[ui] = 1;
     }
 
     // DYNAMIC_SLOT: skip AA for nodes incident to a conduit with active slot area
