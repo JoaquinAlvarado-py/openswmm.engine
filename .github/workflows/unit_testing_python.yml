@@ -1,5 +1,8 @@
 name: Unit Testing Python
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, develop]
@@ -29,7 +32,6 @@ jobs:
     name: "Python (${{ matrix.os }})"
     permissions:
       contents: read
-      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +61,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: microsoft/vcpkg
-          ref: 2025.02.14
+          ref: 2026.07.29
           path: vcpkg
 
       - name: Bootstrap vcpkg (macOS)

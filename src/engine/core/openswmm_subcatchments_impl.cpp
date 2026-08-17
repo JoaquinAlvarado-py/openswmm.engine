@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_subcatchments_impl.cpp
  * @brief C API implementation — subcatchment identity, creation, properties, state, bulk.
@@ -7,10 +23,11 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "openswmm_api_common.hpp"
+#include "StringCase.hpp"
 #include "../../../include/openswmm/engine/openswmm_subcatchments.h"
 
 #include <algorithm>
@@ -1046,6 +1063,26 @@ SWMM_ENGINE_API int swmm_aquifer_add(SWMM_Engine engine, const char* id) {
     return SWMM_OK;
 }
 
+SWMM_ENGINE_API int swmm_aquifer_rename(SWMM_Engine engine, int idx, const char* new_id) {
+    CHECK_HANDLE(engine);
+    if (!new_id || new_id[0] == '\0') return SWMM_ERR_BADPARAM;
+    auto& ctx = to_engine(engine)->context();
+    CHECK_EDITABLE(ctx);
+    CHECK_INDEX(idx >= 0 && idx < ctx.aquifers.count());
+
+    // The name lives in TWO stores: aquifers.names backs swmm_aquifer_id, the
+    // NameIndex backs swmm_aquifer_index. Updating one without the other makes
+    // the two disagree. NameIndex::rename does the collision check (and allows
+    // a pure case-respelling of this same entry), so run it first and only
+    // touch the vector once it has accepted.
+    if (!ctx.aquifer_names.rename(idx, new_id)) return SWMM_ERR_BADPARAM;
+    ctx.aquifers.names[static_cast<std::size_t>(idx)] = new_id;
+
+    // No fixup needed elsewhere: [GROUNDWATER] resolves to an aquifer INDEX at
+    // parse time (subcatches.gw_aquifer) and keeps no name string.
+    return SWMM_OK;
+}
+
 namespace {
 // Map a SWMM_AquiferParam code to the backing store vector (input-file units).
 std::vector<double>* aquifer_param_vec(openswmm::SimulationContext& ctx, int param) {
@@ -1199,6 +1236,32 @@ SWMM_ENGINE_API int swmm_snowpack_add(SWMM_Engine engine, const char* id) {
     sp.removal_subcatch.push_back("");
 
     ctx.snowpack_names.add(id);
+    return SWMM_OK;
+}
+
+SWMM_ENGINE_API int swmm_snowpack_rename(SWMM_Engine engine, int idx, const char* new_id) {
+    CHECK_HANDLE(engine);
+    if (!new_id || new_id[0] == '\0') return SWMM_ERR_BADPARAM;
+    auto& ctx = to_engine(engine)->context();
+    CHECK_EDITABLE(ctx);
+    CHECK_INDEX(idx >= 0 && idx < ctx.snowpacks.count());
+    const auto ui = static_cast<std::size_t>(idx);
+
+    // Two stores hold the name and both are read: snowpacks.names backs
+    // swmm_snowpack_id and the [SNOWPACKS] writer, while the NameIndex backs
+    // swmm_snowpack_index and the [SUBCATCHMENTS] snow-pack column. Let
+    // NameIndex::rename arbitrate the collision, then mirror into the vector.
+    const std::string prev = ctx.snowpacks.names[ui];
+    if (!ctx.snowpack_names.rename(idx, new_id)) return SWMM_ERR_BADPARAM;
+    ctx.snowpacks.names[ui] = new_id;
+
+    // subcatches.snowpack_name is the parse-time deferred-resolution string.
+    // PostParseResolver has already turned it into subcatches.snowpack, and no
+    // writer reads it, but keeping it coherent means a re-resolve cannot bind
+    // the subcatchment to a name that no longer exists.
+    for (auto& ref : ctx.subcatches.snowpack_name) {
+        if (openswmm::ieq(ref, prev)) ref = new_id;
+    }
     return SWMM_OK;
 }
 

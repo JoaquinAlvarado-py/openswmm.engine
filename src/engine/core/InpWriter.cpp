@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file InpWriter.cpp
  * @brief Comprehensive .inp serialisation — round-trip identical output.
@@ -26,7 +42,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "InpWriter.hpp"
@@ -49,6 +65,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -181,6 +198,14 @@ static bool hasRegularJunction(const SimulationContext& c) {
 }
 static bool hasVirtualJunction(const SimulationContext& c) {
     for(int j=0;j<c.n_nodes();++j) if(isVirtualNode(c,static_cast<size_t>(j))) return true;
+    return false;
+}
+// True when any virtual junction carries a rendering rim depth, which is what
+// widens [VIRTUAL_JUNCTIONS] to its optional third column. Models without one
+// keep writing the two-column section byte-for-byte.
+static bool hasVirtualJunctionRim(const SimulationContext& c) {
+    for(int j=0;j<c.n_nodes();++j){auto u=static_cast<size_t>(j);
+        if(isVirtualNode(c,u) && u<c.nodes.rim_depth.size() && c.nodes.rim_depth[u]>0.0) return true;}
     return false;
 }
 static bool hasLT(const SimulationContext& c, LinkType t) {
@@ -641,6 +666,17 @@ int writeInpFile(const SimulationContext& ctx_internal,
     // models keep a legacy-clean [OPTIONS] block.
     if (o.ignore_2d)
         std::fprintf(f,"%-20s %s\n",  "IGNORE_2D",         "YES");
+    // Same rule for the two transport engine-selection keys. Both were
+    // dropped on save: a EULERIAN_ARD model came back LEGACY and a
+    // WATER_AGE model came back with age tracking off, silently. They are
+    // written TOGETHER because either alone is worse than neither — a deck
+    // carrying WATER_AGE ON without its EULERIAN_ARD line opens with the
+    // "no age is tracked this simulation" warning instead of the model the
+    // user saved.
+    if (o.quality_solver == QualitySolverKind::EULERIAN_ARD)
+        std::fprintf(f,"%-20s %s\n",  "QUALITY_SOLVER",    "EULERIAN_ARD");
+    if (o.water_age)
+        std::fprintf(f,"%-20s %s\n",  "WATER_AGE",         "ON");
     std::fprintf(f,"\n");
 
     // --- Group 3: Date / time options (START_DATE .. RULE_STEP) ---
@@ -703,8 +739,9 @@ int writeInpFile(const SimulationContext& ctx_internal,
         std::fprintf(f,"%-20s %s\n",  "NODE_CONTINUITY","SEMI_IMPLICIT");
     if (o.anderson_accel)
         std::fprintf(f,"%-20s %s\n",  "ANDERSON_ACCEL", "YES");
-    if (o.virtual_junction_momentum == 1)
-        std::fprintf(f,"%-20s %s\n",  "VIRTUAL_JUNCTION_MOMENTUM", "FULL");
+    // VIRTUAL_JUNCTION_MOMENTUM is not emitted: FULL is retired (see
+    // SimulationOptions.hpp) and virtual_junction_momentum is now always 0,
+    // so writing the key could only ever re-emit the retired value.
 
     // Explicit finite-volume solver knobs. Emitted only under FLOW_ROUTING FV
     // so a DW model's [OPTIONS] block stays legacy-clean; the keys are inert
@@ -1201,14 +1238,25 @@ int writeInpFile(const SimulationContext& ctx_internal,
     std::fprintf(f,"%-16s %12.4f %12.4f %12.4f %12.4f %12.4f\n",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u],ctx.nodes.full_depth[u],ctx.nodes.init_depth[u],ctx.nodes.sur_depth[u],ctx.nodes.ponded_area[u]);
     }}
 
-    // [VIRTUAL_JUNCTIONS] — name + invert elevation; all other geometry is
+    // [VIRTUAL_JUNCTIONS] — name + invert elevation, plus an optional MaxDepth
+    // that is used ONLY to draw the ground surface. All solver geometry is
     // derived from the attached conduits at load time (refactored engine only).
     if(hasVirtualJunction(ctx)){sec(f,"VIRTUAL_JUNCTIONS");
-    std::fprintf(f,";;%-16s %-12s\n","Name","Elev");
-    std::fprintf(f,";;%-16s %-12s\n","----------------","------------");
+    const bool anyRim = hasVirtualJunctionRim(ctx);
+    if(anyRim){
+        std::fprintf(f,";;%-16s %-12s %-12s\n","Name","Elev","MaxDepth");
+        std::fprintf(f,";;%-16s %-12s %-12s\n","----------------","------------","------------");
+    } else {
+        std::fprintf(f,";;%-16s %-12s\n","Name","Elev");
+        std::fprintf(f,";;%-16s %-12s\n","----------------","------------");
+    }
     for(int j=0;j<ctx.n_nodes();++j){auto u=static_cast<size_t>(j);if(!isVirtualNode(ctx,u))continue;
     write_obj_comment(f, ctx.nodes.comments, u);
-    std::fprintf(f,"%-16s %12.4f\n",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u]);
+    const double rim = (u<ctx.nodes.rim_depth.size()) ? ctx.nodes.rim_depth[u] : 0.0;
+    if(rim>0.0)
+        std::fprintf(f,"%-16s %12.4f %12.4f\n",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u],rim);
+    else
+        std::fprintf(f,"%-16s %12.4f\n",ctx.node_names.name_of(j).c_str(),ctx.nodes.invert_elev[u]);
     }}
 
     // [OUTFALLS]
@@ -2080,6 +2128,81 @@ int writeInpFile(const SimulationContext& ctx_internal,
     for(const auto&ps:ctx.plugin_specs){std::fprintf(f,"%s",ps.path.c_str());
     for(const auto&a:ps.init_args)std::fprintf(f," %s",a.c_str());std::fprintf(f,"\n");
     }}
+
+    // [PROCESS_COMPONENTS] — Unified Transport suite D-UT8 (round-trip; the
+    // component config FILES are each component's own to write, never ours).
+    // The config= reference is an external-file slot like any other, so it
+    // goes through emit_path_token (Slice IO-4): an absolute path is rebased
+    // against the destination directory, a relative one passes through.
+    if(!ctx.process_component_specs.empty()){sec(f,"PROCESS_COMPONENTS");
+    for(const auto&pc:ctx.process_component_specs){std::fprintf(f,"%s",pc.id.c_str());
+    if(!pc.config_path.empty()){const std::string cfg=
+    emit_path_token(pc.config_path,dst_dir,force_abs_paths,warnings);
+    std::fprintf(f," config=\"%s\"",cfg.c_str());
+
+    // IO3 carry-alongside: a RELATIVE config= reference resolves against
+    // the .inp's own directory, so saving the deck somewhere else would
+    // leave it dangling. Copy the file the model was actually read from
+    // (resolved_config_path, set at open) next to the written .inp when
+    // the destination differs. Absolute references were rebased by
+    // emit_path_token above and need no copy. Failures WARN, never fail
+    // the save — the deck text itself is intact.
+    namespace fsys=std::filesystem;
+    if(!pc.resolved_config_path.empty()){
+    fsys::path src(pc.resolved_config_path);
+    fsys::path rel(pc.config_path);
+    if(rel.is_relative()&&!dst_dir.empty()){
+    std::error_code ec;
+    fsys::path dst=fsys::path(dst_dir)/rel;
+    if(fsys::exists(src,ec)&&
+    !fsys::equivalent(src,dst,ec)){
+    // Overwriting is REQUIRED for the feature to be correct: re-saving a
+    // model into a folder that already holds last save's copy must refresh
+    // it, or the deck ships with a stale config. But an existing file with
+    // DIFFERENT content may belong to another model in that folder, and
+    // destroying it silently is not something a save should do. Measured
+    // before this guard: a save-as replaced an unrelated model.rxn and
+    // reported nothing.
+    bool replacing_different=false;
+    if(fsys::exists(dst,ec)){
+    std::ifstream a(src,std::ios::binary),b(dst,std::ios::binary);
+    const std::string sa((std::istreambuf_iterator<char>(a)),
+    std::istreambuf_iterator<char>());
+    const std::string sb((std::istreambuf_iterator<char>(b)),
+    std::istreambuf_iterator<char>());
+    replacing_different=(sa!=sb);
+    }
+    if(dst.has_parent_path())fsys::create_directories(dst.parent_path(),ec);
+    fsys::copy_file(src,dst,fsys::copy_options::overwrite_existing,ec);
+    if(ec&&warnings)warnings->push_back(
+    "Could not copy component config '"+pc.resolved_config_path+
+    "' alongside the saved model ("+ec.message()+") — the written "
+    "config=\""+pc.config_path+"\" reference may dangle.");
+    else if(replacing_different&&warnings)warnings->push_back(
+    "Saving this model replaced an existing, different '"+pc.config_path+
+    "' in the destination folder with the copy this model uses.");
+    }}}
+    }
+    for(const auto&a:pc.args)std::fprintf(f," %s=\"%s\"",a.first.c_str(),a.second.c_str());
+    std::fprintf(f,"\n");
+    }}
+
+    // Embedded component sections ([REACTION_*] today) are NOT serialized —
+    // there is no per-component saveData() until IO3, and the intended layout
+    // is an external config file anyway. Say so rather than dropping
+    // user-authored model data silently: whether they were applied or
+    // overridden by an external file, they are gone from the deck we just
+    // wrote.
+    if(warnings && !ctx.embedded_component_sections.empty()){
+    std::string tags;
+    for(const auto&es:ctx.embedded_component_sections){
+    if(!tags.empty())tags+=", ";tags+="["+es.first+"]";}
+    warnings->push_back(
+    "Embedded component sections are NOT written back to the .inp and are "
+    "lost from this save: "+tags+". Move them to an external component "
+    "config file registered in [PROCESS_COMPONENTS] (config=\"model.rxn\") "
+    "to keep them — per-component serialization arrives with plan phase IO3.");
+    }
 
     // [2D_*] — 2D surface-routing model definition (no-op for 1D models
     // and for engine builds without the 2D module).

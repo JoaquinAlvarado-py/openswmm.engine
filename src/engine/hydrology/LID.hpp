@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file LID.hpp
  * @brief Low Impact Development (LID) control modules.
@@ -20,7 +36,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_LID_HPP
@@ -67,13 +83,6 @@ constexpr int N_LAYERS = 4;
 struct LIDGroupSoA {
     LIDType type = LIDType::BIO_CELL;
     int count = 0;
-
-    // Unit-conversion factors for the model's flow units (legacy UCF()).
-    // Layer parameters are converted to internal ft / ft-per-sec at init();
-    // these two factors also drive the underdrain head/rate conversion in
-    // getDrainRate(). Defaults are the US-customary values (issue #102).
-    double ucf_raindepth = 12.0;    ///< ft → in|mm  (RAINDEPTH)
-    double ucf_rainfall  = 43200.0; ///< ft/sec → in/hr|mm/hr  (RAINFALL)
 
     std::vector<int> subcatch_idx;     ///< Which subcatchment this unit belongs to
     std::vector<int> control_idx;      ///< LID control index (into ctx.lid_controls)
@@ -147,8 +156,8 @@ struct LIDGroupSoA {
     // Outputs (per unit)
     std::vector<double> surface_runoff;
     std::vector<double> drain_flow;
-    std::vector<double> evap_loss;
-    std::vector<double> infil_loss;
+    std::vector<double> evap_loss;   ///< Evaporation loss this step (ft of depth)
+    std::vector<double> infil_loss;  ///< Native infiltration loss this step (ft)
 
     // Pollutant drain removal fractions: drain_rmvl[unit * n_pollutants + pollutant]
     std::vector<double> drain_rmvl;  ///< Removal fraction per unit per pollutant
@@ -186,17 +195,9 @@ public:
     const LIDGroupSoA& group(int type_index) const { return groups_[static_cast<size_t>(type_index)]; }
     int numGroups() const { return static_cast<int>(groups_.size()); }
 
-    /// Total water currently stored across all LID units (ft³): per-unit
-    /// stored depth (wb_final_vol, ft) × unit area (ft²). Feeds the
-    /// subcatchment runoff-continuity storage term (issue #102 C).
-    double totalStoredVolume() const;
-    /// Total initial LID storage (ft³): wb_init_vol (ft) × area (ft²).
-    double totalInitVolume() const;
-    /// Cumulative LID exfiltration to native soil (ft³): wb_infil × area.
-    /// Added to the runoff-continuity infiltration term (legacy VlidInfil).
-    double totalInfilVolume() const;
-    /// Cumulative LID evaporation (ft³): wb_evap × area (legacy VlidEvap).
-    double totalEvapVolume() const;
+    /// Total water volume currently stored in all LID units (ft³), for the
+    /// runoff mass balance (legacy lid_getStoredVolume()).
+    double storedVolume() const;
 
     /**
      * @brief Compute LID performance for all units (batch by type).

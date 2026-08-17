@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_subcatchments.h
  * @brief OpenSWMM Engine — Subcatchment C API.
@@ -10,7 +26,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_SUBCATCHMENTS_H
@@ -840,6 +856,23 @@ SWMM_ENGINE_API const char* swmm_aquifer_id(SWMM_Engine engine, int idx);
 SWMM_ENGINE_API int swmm_aquifer_add(SWMM_Engine engine, const char* id);
 
 /**
+ * @brief Rename an aquifer in place.
+ *
+ * @details Updates both the name vector and the name registry so
+ *          swmm_aquifer_id() and swmm_aquifer_index() stay in agreement.
+ *          [GROUNDWATER] holds an aquifer INDEX, not a name, so subcatchment
+ *          references follow automatically.
+ *          Lifecycle: BUILDING or OPENED.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Aquifer index.
+ * @param new_id  New unique name (non-empty). A pure case-respelling of this
+ *                same aquifer is allowed.
+ * @returns SWMM_OK, or SWMM_ERR_BADPARAM on an empty or duplicate name.
+ */
+SWMM_ENGINE_API int swmm_aquifer_rename(SWMM_Engine engine, int idx, const char* new_id);
+
+/**
  * @brief Aquifer parameter codes for swmm_aquifer_get_param / _set_param.
  *
  * @details Values use input-file units (the same columns as the [AQUIFERS]
@@ -968,6 +1001,25 @@ SWMM_ENGINE_API const char* swmm_snowpack_id(SWMM_Engine engine, int idx);
  * @returns SWMM_OK on success, or an error code.
  */
 SWMM_ENGINE_API int swmm_snowpack_add(SWMM_Engine engine, const char* id);
+
+/**
+ * @brief Rename a snow pack in place.
+ *
+ * @details Updates both the name vector (read by swmm_snowpack_id() and the
+ *          [SNOWPACKS] writer) and the name registry (read by
+ *          swmm_snowpack_index() and the [SUBCATCHMENTS] snow-pack column),
+ *          plus the deferred-resolution name held per subcatchment. Melt
+ *          parameters and subcatchment assignments are index-based and follow
+ *          automatically.
+ *          Lifecycle: BUILDING or OPENED.
+ *
+ * @param engine  Engine handle.
+ * @param idx     Snow pack index.
+ * @param new_id  New unique name (non-empty). A pure case-respelling of this
+ *                same snow pack is allowed.
+ * @returns SWMM_OK, or SWMM_ERR_BADPARAM on an empty or duplicate name.
+ */
+SWMM_ENGINE_API int swmm_snowpack_rename(SWMM_Engine engine, int idx, const char* new_id);
 
 /* -------------------------------------------------------------------------
  * Snowpack surface parameters

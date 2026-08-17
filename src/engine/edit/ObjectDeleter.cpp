@@ -1,10 +1,26 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file ObjectDeleter.cpp
  * @brief Implementation of object deletion and cascade analysis.
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "ObjectDeleter.hpp"
@@ -802,6 +818,10 @@ CascadeResult delete_table(SimulationContext& ctx, int table_idx) {
 
     // --- Step 2: erase the table entry ---
     ctx.tables.tables.erase(ctx.tables.tables.begin() + static_cast<std::ptrdiff_t>(table_idx));
+    // Every index at or past table_idx just shifted down by one, so the
+    // name→index map is stale. Erase is the only non-append mutation of the
+    // table store, and it is already O(n) from the renumbering below.
+    ctx.tables.rebuild_index();
 
     // Subcatchment adjustment patterns index ctx.tables (see InpWriter tN)
     auto clear_adj = [&](std::vector<int>& v, const char* field) {

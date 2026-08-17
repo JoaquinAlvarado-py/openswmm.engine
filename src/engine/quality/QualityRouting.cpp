@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file QualityRouting.cpp
  * @brief Water quality routing — batch SoA, numerically identical to legacy.
@@ -9,10 +25,14 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "QualityRouting.hpp"
+
+#include "../transport/components/EulerianArdComponent/ArdConfig.hpp"
+#include "../transport/components/ReactionModule/ReactionLegacyBinding.hpp"
+#include "../transport/components/WaterAgeModule/WaterAgeLegacy.hpp"
 #include "Treatment.hpp"
 #include "../core/SimulationContext.hpp"
 #include "../core/UnitConversion.hpp"
@@ -34,6 +54,35 @@ namespace quality {
 // ZERO_VOLUME defined in QualityRouting.hpp
 
 namespace {
+
+/// The external-load loaders below do two jobs: they accumulate per-pollutant
+/// MASS into qual_mass_in, and they accumulate the node's total external
+/// inflow VOLUME into qual_vol_in. Only the first is pollutant-shaped. E5a's
+/// [TRANSPORT_BOUNDARIES] injects `qual_vol_in * concentration`, so an
+/// MSX-only model (no [POLLUTANTS] — the nh2cl shape) needs the volume half
+/// to run even at np == 0, where every mass loop is already a no-op.
+/// Measured before this: a boundary on an MSX-only deck delivered exactly
+/// 0.0 while the same deck with one inert pollutant row delivered 8.0.
+bool loadersNeeded(int np, const SimulationContext& ctx) {
+    // A1a: water age needs the volume half (and the per-loader age-volume
+    // contributions) even on a deck with no [POLLUTANTS] — the pure-age
+    // model is A1a's motivating configuration (lesson 20).
+    return np > 0 || transport::ardBoundariesNeedExternalVolumes(ctx) ||
+           ctx.options.water_age;
+}
+
+/// A1a: one loader's age-volume contribution — `q · age_source` (a RATE,
+/// age·ft³/s, the age analogue of qual_mass_in). No-op when WATER_AGE is
+/// off or the state is unsized (the ARD engine sizes it at init; the
+/// assemble stage zeroes it each step).
+inline void addAgeVolume(SimulationContext& ctx, int node, double q,
+                         WaterAgeSource src) {
+    if (!ctx.options.water_age) return;
+    auto& s = ctx.water_age_state.node_age_vol_in;
+    const auto un = static_cast<std::size_t>(node);
+    if (un >= s.size()) return;
+    s[un] += q * ctx.water_age_config.source_age(src, node);
+}
 
 void applyLinkQualityForcing(SimulationContext& ctx, int n_pollutants, double dt) {
     if (n_pollutants <= 0) return;
@@ -72,11 +121,21 @@ void QualitySolver::init(int n_nodes, int n_links, int n_pollutants) {
     (void)n_links;
 }
 
-void QualitySolver::execute(SimulationContext& ctx, double dt) {
-    if (n_pollutants_ <= 0) return;
+void QualitySolver::assembleExternalLoads(SimulationContext& ctx, double dt) {
+    if (!loadersNeeded(n_pollutants_, ctx)) return;
 
     // Reset quality assembly arrays on NodeData
     std::fill(ctx.nodes.qual_mass_in.begin(), ctx.nodes.qual_mass_in.end(), 0.0);
+
+    // A1a: size + zero the age-volume accumulator alongside the pollutant
+    // loads (same lifecycle: assembled per routing step by the loaders).
+    if (ctx.options.water_age) {
+        auto& ws = ctx.water_age_state;
+        if (ws.node_age_vol_in.size() !=
+            static_cast<std::size_t>(ctx.n_nodes()))
+            ws.resize(ctx.n_nodes(), ctx.n_links());
+        std::fill(ws.node_age_vol_in.begin(), ws.node_age_vol_in.end(), 0.0);
+    }
     std::fill(ctx.nodes.qual_vol_in.begin(),  ctx.nodes.qual_vol_in.end(),  0.0);
 
     addWetWeatherLoads(ctx, dt);   // Subcatchment washoff → nodes
@@ -84,12 +143,120 @@ void QualitySolver::execute(SimulationContext& ctx, double dt) {
     addDwfLoads(ctx, dt);          // Dry weather pollutant loads → nodes
     addGwLoads(ctx, dt);           // Groundwater inflow pollutant loads → nodes
     addIfaceLoads(ctx, dt);        // Routing interface file loads → nodes
+    addExtInflowLoads(ctx, dt);    // Direct [INFLOWS] CONCEN/MASS loads → nodes
+}
+
+// ============================================================================
+// Add direct external inflow ([INFLOWS] CONCEN/MASS) pollutant loads.
+// Matches legacy routing.c addExternalInflows() pollutant portion:
+//   w = inflow value; if CONCEN, w *= node flow; Node[j].newQual[p] += w
+// ============================================================================
+
+void QualitySolver::addExtInflowLoads(SimulationContext& ctx, double dt) {
+    int np = n_pollutants_;
+    if (!loadersNeeded(np, ctx)) return;
+    auto& nodes = ctx.nodes;
+
+    for (int i = 0; i < ctx.n_nodes(); ++i) {
+        auto ui = static_cast<std::size_t>(i);
+
+        // The direct inflow's own water joins the mixing denominator, matching
+        // legacy findNodeQual(), which divides the accumulated mass rate by
+        // Node[j].inflow — a total that includes the external lateral inflow.
+        double q = nodes.ext_inflow[ui];
+        if (q > 0.0) {
+            nodes.qual_vol_in[ui] += q * dt;
+            addAgeVolume(ctx, i, q, WaterAgeSource::EXTERNAL_INFLOW);
+        }
+
+        if (nodes.ext_qual_mass.empty()) continue;
+        for (int p = 0; p < np; ++p) {
+            auto nd_idx = ui * static_cast<std::size_t>(np) +
+                          static_cast<std::size_t>(p);
+            if (nd_idx >= nodes.ext_qual_mass.size()) continue;
+            double mass_rate = nodes.ext_qual_mass[nd_idx];
+            if (mass_rate == 0.0) continue;
+            if (nd_idx < nodes.qual_mass_in.size())
+                nodes.qual_mass_in[nd_idx] += mass_rate;
+
+            // Legacy lumps direct and interface-file loads into EXTERNAL_INFLOW.
+            auto pi = static_cast<std::size_t>(p);
+            if (pi < ctx.mass_balance.qual_routing_ex_in.size())
+                ctx.mass_balance.qual_routing_ex_in[pi] += mass_rate * dt;
+        }
+    }
+
+    // Runtime-API forced quality mass (swmm_node_set_quality_mass_flux), a
+    // mass RATE like the loads above. Legacy addExternalInflows() delivers it
+    // in exactly this stage and books it as EXTERNAL_INFLOW, positive only
+    // (routing.c: w = Node[j].apiExtQualMassFlux[p]; if (w > 0.0) {
+    // Node[j].newQual[p] += w; massbal_addInflowQual(EXTERNAL_INFLOW, p, w); }).
+    //
+    // It carries no water of its own, so nothing is added to qual_vol_in — the
+    // mixing denominator stays the node's actual inflow, as in legacy.
+    // routing_forcing_qual_inflow remains a diagnostic SUBSET of the external
+    // total (never added to it twice), mirroring routing_forcing_inflow on the
+    // flow side.
+    if (!nodes.user_conc_mass_flux.empty()) {
+        for (int i = 0; i < ctx.n_nodes(); ++i) {
+            auto ui = static_cast<std::size_t>(i);
+            for (int p = 0; p < np; ++p) {
+                auto nd_idx = ui * static_cast<std::size_t>(np) +
+                              static_cast<std::size_t>(p);
+                if (nd_idx >= nodes.user_conc_mass_flux.size()) continue;
+                const double w = nodes.user_conc_mass_flux[nd_idx];
+                if (w <= 0.0) continue;
+                if (nd_idx < nodes.qual_mass_in.size())
+                    nodes.qual_mass_in[nd_idx] += w;
+
+                auto pi = static_cast<std::size_t>(p);
+                if (pi < ctx.mass_balance.qual_routing_ex_in.size())
+                    ctx.mass_balance.qual_routing_ex_in[pi] += w * dt;
+                if (pi < ctx.mass_balance.routing_forcing_qual_inflow.size())
+                    ctx.mass_balance.routing_forcing_qual_inflow[pi] += w * dt;
+            }
+        }
+    }
+}
+
+void QualitySolver::execute(SimulationContext& ctx, double dt) {
+    // R4: an MSX-only model (a reactions component and no [POLLUTANTS]) is a
+    // legitimate shape — EPANET-MSX decks routinely declare no legacy
+    // pollutant. Every stage below is a no-op at np == 0, so letting it
+    // through costs nothing and is the only way reactLegacyNodes/Links run
+    // for such a model. A1b: the pure-age LEGACY model is the same shape —
+    // the age mirror needs the volume accumulation these stages perform.
+    // Without a reactions component or WATER_AGE the early return is
+    // unchanged, so parity is preserved by construction.
+    if (n_pollutants_ <= 0 && !transport::legacyReactionsActive(ctx) &&
+        !ctx.options.water_age)
+        return;
+
+    assembleExternalLoads(ctx, dt);
     accumulateLinkLoads(ctx, dt);
     mixAtNodes(ctx, dt);
     applyTreatment(ctx, dt);       // Treatment before decay (matching legacy order)
-    applyDecay(ctx, dt);
+    // R4: with a reactions component configured, pollutant decay upgrades to
+    // the exact exponential and MSX species react per element via the shared
+    // integrator (ReactionLegacyBinding). Nodes react here (where applyDecay
+    // ran); links react AFTER updateLinkQuality so the mixing pass does not
+    // overwrite them (its internal linear decay is zeroed below). Without a
+    // reactions component the legacy path runs untouched — bit-parity
+    // (G-UT1).
+    if (transport::legacyReactionsActive(ctx)) {
+        transport::reactLegacyNodes(ctx, dt);
+    } else {
+        applyDecay(ctx, dt);
+    }
     updateLinkQuality(ctx, dt);
+    if (transport::legacyReactionsActive(ctx))
+        transport::reactLegacyLinks(ctx, dt);
     applyLinkQualityForcing(ctx, n_pollutants_, dt);
+
+    // A1b: the LEGACY age mirror runs LAST — it reads the fully accumulated
+    // qual_vol_in as its mixing denominator and writes only water_age_state,
+    // so WATER_AGE ON leaves every pollutant trajectory bit-identical.
+    transport::routeLegacyAge(ctx, dt);
 }
 
 // ============================================================================
@@ -113,6 +280,7 @@ void QualitySolver::addWetWeatherLoads(SimulationContext& ctx, double dt) {
         if (q <= 0.0) continue;
 
         ctx.nodes.qual_vol_in[ud] += q * dt;
+        addAgeVolume(ctx, out_node, q, WaterAgeSource::RAINFALL);
 
         for (int p = 0; p < np; ++p) {
             auto sc_idx = ui * static_cast<std::size_t>(np) + static_cast<std::size_t>(p);
@@ -128,6 +296,14 @@ void QualitySolver::addWetWeatherLoads(SimulationContext& ctx, double dt) {
             if (mass_rate > 0.0 && nd_idx < ctx.nodes.qual_mass_in.size()) {
                 ctx.nodes.qual_mass_in[nd_idx] += mass_rate;
             }
+
+            // Mass balance: wet weather quality inflow is attributed HERE, from
+            // the subcatchment's own washoff load — matching legacy
+            // addWetWeatherInflows(): massbal_addInflowQual(WET_WEATHER_INFLOW,
+            // p, q * Subcatch[i].newQual[p]).
+            auto pi = static_cast<std::size_t>(p);
+            if (mass_rate > 0.0 && pi < ctx.mass_balance.qual_routing_wet.size())
+                ctx.mass_balance.qual_routing_wet[pi] += mass_rate * dt;
         }
     }
 
@@ -143,6 +319,9 @@ void QualitySolver::addWetWeatherLoads(SimulationContext& ctx, double dt) {
         if (drain_vol_rate <= 0.0) continue;
 
         ctx.nodes.qual_vol_in[uj] += drain_vol_rate * dt;
+        // LID drain water counts as RAINFALL-age until per-layer LID age
+        // states land (plan phase A4).
+        addAgeVolume(ctx, j, drain_vol_rate, WaterAgeSource::RAINFALL);
 
         for (int p = 0; p < np; ++p) {
             auto nd_idx = uj * static_cast<std::size_t>(np) + static_cast<std::size_t>(p);
@@ -150,6 +329,12 @@ void QualitySolver::addWetWeatherLoads(SimulationContext& ctx, double dt) {
                           ? ctx.nodes.lid_drain_qual_load[nd_idx] : 0.0;
             if (load > 0.0 && nd_idx < ctx.nodes.qual_mass_in.size())
                 ctx.nodes.qual_mass_in[nd_idx] += load;
+
+            // Legacy lid_addDrainInflow() / lid_addDrainRunon() also book drain
+            // loads as WET_WEATHER_INFLOW.
+            auto pi = static_cast<std::size_t>(p);
+            if (load > 0.0 && pi < ctx.mass_balance.qual_routing_wet.size())
+                ctx.mass_balance.qual_routing_wet[pi] += load * dt;
         }
     }
 }
@@ -161,7 +346,7 @@ void QualitySolver::addWetWeatherLoads(SimulationContext& ctx, double dt) {
 
 void QualitySolver::addRdiiLoads(SimulationContext& ctx, double dt) {
     int np = n_pollutants_;
-    if (np <= 0) return;
+    if (!loadersNeeded(np, ctx)) return;
     auto& nodes = ctx.nodes;
 
     for (int i = 0; i < ctx.n_nodes(); ++i) {
@@ -171,6 +356,7 @@ void QualitySolver::addRdiiLoads(SimulationContext& ctx, double dt) {
 
         // Add volume inflow from RDII
         nodes.qual_vol_in[ui] += q * dt;
+        addAgeVolume(ctx, i, q, WaterAgeSource::RDII);
 
         // Add pollutant mass loads: mass_rate = q * c_rdii[p]
         // Matching legacy: w = q * Pollut[p].rdiiConcen
@@ -204,7 +390,7 @@ void QualitySolver::addRdiiLoads(SimulationContext& ctx, double dt) {
 
 void QualitySolver::addDwfLoads(SimulationContext& ctx, double dt) {
     int np = n_pollutants_;
-    if (np <= 0) return;
+    if (!loadersNeeded(np, ctx)) return;
     auto& nodes = ctx.nodes;
 
     for (int i = 0; i < ctx.n_nodes(); ++i) {
@@ -216,6 +402,7 @@ void QualitySolver::addDwfLoads(SimulationContext& ctx, double dt) {
         // which includes DWF, as the mixing denominator). Without this the
         // mass added below is discarded by mixAtNodes when v_in == 0.
         nodes.qual_vol_in[ui] += q * dt;
+        addAgeVolume(ctx, i, q, WaterAgeSource::DWF);
 
         OPENSWMM_IVDEP
         for (int p = 0; p < np; ++p) {
@@ -247,7 +434,7 @@ void QualitySolver::addDwfLoads(SimulationContext& ctx, double dt) {
 
 void QualitySolver::addGwLoads(SimulationContext& ctx, double dt) {
     int np = n_pollutants_;
-    if (np <= 0) return;
+    if (!loadersNeeded(np, ctx)) return;
     auto& nodes = ctx.nodes;
 
     for (int i = 0; i < ctx.n_nodes(); ++i) {
@@ -258,6 +445,7 @@ void QualitySolver::addGwLoads(SimulationContext& ctx, double dt) {
         // Add volume inflow from groundwater (see addDwfLoads: the mass below
         // is discarded by mixAtNodes unless its carrier volume is counted).
         nodes.qual_vol_in[ui] += q * dt;
+        addAgeVolume(ctx, i, q, WaterAgeSource::GW);
 
         OPENSWMM_IVDEP
         for (int p = 0; p < np; ++p) {
@@ -290,7 +478,7 @@ void QualitySolver::addGwLoads(SimulationContext& ctx, double dt) {
 
 void QualitySolver::addIfaceLoads(SimulationContext& ctx, double dt) {
     int np = n_pollutants_;
-    if (np <= 0) return;
+    if (!loadersNeeded(np, ctx)) return;
     auto& nodes = ctx.nodes;
     if (nodes.iface_qual_mass.empty()) return;
 
@@ -301,6 +489,7 @@ void QualitySolver::addIfaceLoads(SimulationContext& ctx, double dt) {
 
         // Add volume inflow from the interface file
         nodes.qual_vol_in[ui] += q * dt;
+        addAgeVolume(ctx, i, q, WaterAgeSource::IFACE);
 
         OPENSWMM_IVDEP
         for (int p = 0; p < np; ++p) {
@@ -511,6 +700,10 @@ void QualitySolver::updateLinkQuality(SimulationContext& ctx, double dt) {
 
             double k = (static_cast<size_t>(p) < poll.k_decay.size())
                 ? poll.k_decay[static_cast<size_t>(p)] : 0.0;
+            // R4: reactions-active runs decay links exactly in
+            // reactLegacyLinks AFTER this mixing pass; the in-mix linear
+            // decay must not double-apply.
+            if (transport::legacyReactionsActive(ctx)) k = 0.0;
 
             double c_new;
 

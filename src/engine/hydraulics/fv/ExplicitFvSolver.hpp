@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file ExplicitFvSolver.hpp
  * @brief Serial/OpenMP CPU reference implementation of the explicit FV 1D solver.
@@ -17,7 +33,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_FV_EXPLICIT_FV_SOLVER_HPP
@@ -31,6 +47,10 @@
 #include "FvOptions.hpp"
 #include "INetworkSolver.hpp"
 #include "NetworkMeshData.hpp"
+
+namespace openswmm::transport::fvkernels {
+struct SpeciesKernelView;  // transport/fvkernels/SpeciesTransportKernels.hpp
+}
 
 namespace openswmm::fv {
 
@@ -80,6 +100,16 @@ public:
         return flood_vol_;
     }
 
+    /// Pass-through classification (clean degree-2 junctions whose faces
+    /// present the neighbouring cells to each other directly; refreshed with
+    /// the structure flows). The publish path reads it to reconstruct those
+    /// nodes' REPORTED heads face-consistently — the solver-internal head
+    /// stays the stable wet-mean, which also serves as the ghost boundary
+    /// state under LTS tier holds.
+    const std::vector<std::uint8_t>& node_passthrough() const noexcept {
+        return node_pass_;
+    }
+
     /// Time-integrated cell discharge (ft³) over the last advance(), used to
     /// publish a routing-step MEAN link flow rather than an end-of-step
     /// snapshot — the snapshot aliases badly when a routing step spans many
@@ -110,9 +140,11 @@ private:
     double censusDt() const;
     void   reconstructState();
     void   computeFaceFlux(int face);
+    /// Species transport forwarders (phase E0): the reconstruction / FCT /
+    /// dispersion bodies live in transport/fvkernels/SpeciesTransportKernels
+    /// and consume this solver's members through the view below.
     void   reconstructScalars(double dt);
-    void   limitSpeciesFluxes(int species, double dt);
-    kernels::FaceFlux adjustedFlux(int face) const;
+    transport::fvkernels::SpeciesKernelView speciesKernelView();
     void   computeFluxes();
     void   limitPositivity(double dt);
 
@@ -171,6 +203,21 @@ private:
     /// tolerance and any cell-side positivity scaling land here and are bled
     /// back into the next solve's forcing. ≈0 in a converged steady state.
     std::vector<double> node_carry_;
+    /// Lateral inflow diverted from a clean degree-2 junction into its two
+    /// incident cells (half each) as a zero-momentum area source, so the node
+    /// KEEPS the pass-through splice. Head-solving such junctions costs the
+    /// split-Riemann ~1 mm of head per junction that pass-through exists to
+    /// avoid — with rain on every junction of a 400-conduit channel that
+    /// integrated into an 18-25% deep bias with exact q (SWASHES §3.3).
+    /// cell_qlat_ is m³/s per cell; node_lat_div_ flags the nodes whose
+    /// forcing.node_lateral must read as zero on every node path.
+    std::vector<double> cell_qlat_;
+    std::vector<std::uint8_t> node_lat_div_;
+    double nodeLateral(const FvStepForcing& forcing,
+                       std::size_t un) const noexcept {
+        if (!node_lat_div_.empty() && node_lat_div_[un]) return 0.0;
+        return forcing.node_lateral ? forcing.node_lateral[un] : 0.0;
+    }
     /// Cached V(full_depth) per node, for the ponding demote test.
     std::vector<double> node_vfull_;
 

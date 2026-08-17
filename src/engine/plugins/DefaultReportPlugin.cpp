@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file DefaultReportPlugin.cpp
  * @brief DefaultReportPlugin — legacy SWMM-compatible .rpt report writer.
@@ -11,7 +27,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "DefaultReportPlugin.hpp"
@@ -26,9 +42,11 @@
 #include <version.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <cmath>
+#include <vector>
 #include <cstring>
 
 namespace openswmm {
@@ -153,8 +171,6 @@ int DefaultReportPlugin::validate(const SimulationContext& /*ctx*/) {
 }
 
 int DefaultReportPlugin::prepare(const SimulationContext& ctx) {
-    std::time(&wall_start_);
-
     // Open the report file early and write preamble (title, input summaries,
     // analysis options) so they are available immediately — even if the
     // simulation crashes before write_summary() is called.
@@ -222,7 +238,7 @@ int DefaultReportPlugin::write_summary(const SimulationContext& ctx) {
     write_results(f, ctx);
 
     // Write analysis timing and close
-    write_timing(f);
+    write_timing(f, ctx);
 
     std::fclose(f);
     file_ = nullptr;
@@ -375,6 +391,20 @@ void DefaultReportPlugin::write_preamble(std::FILE* f,
         std::fprintf(f,
             "\n  -------------------------------------------------------------------------------");
 
+        // Which nodes carry an inflow, resolved in one pass over the inflow
+        // rows instead of a scan of both row sets per node. The old form was
+        // O(n_nodes x n_inflow_rows) — around 10^10 comparisons on a model
+        // with 100k nodes and 100k inflows, all of it inside the report.
+        std::vector<std::uint8_t> has_inflow(
+            static_cast<std::size_t>(ctx.n_nodes()), 0u);
+        auto mark = [&](const std::vector<int>& node_idx) {
+            for (const int n : node_idx)
+                if (n >= 0 && n < ctx.n_nodes())
+                    has_inflow[static_cast<std::size_t>(n)] = 1u;
+        };
+        mark(ctx.ext_inflows.node_idx);
+        mark(ctx.dwf_inflows.node_idx);
+
         for (int i = 0; i < ctx.n_nodes(); ++i) {
             auto ui = static_cast<std::size_t>(i);
             int nt = static_cast<int>(ctx.nodes.type[ui]);
@@ -384,13 +414,7 @@ void DefaultReportPlugin::write_preamble(std::FILE* f,
                 ctx.nodes.invert_elev[ui],
                 ctx.nodes.full_depth[ui],
                 ctx.nodes.ponded_area[ui]);
-            // Check for external inflow
-            bool has_ext = false;
-            for (std::size_t k = 0; k < ctx.ext_inflows.node_idx.size(); ++k)
-                if (ctx.ext_inflows.node_idx[k] == i) { has_ext = true; break; }
-            for (std::size_t k = 0; !has_ext && k < ctx.dwf_inflows.node_idx.size(); ++k)
-                if (ctx.dwf_inflows.node_idx[k] == i) { has_ext = true; break; }
-            if (has_ext) std::fprintf(f, "    Yes");
+            if (has_inflow[ui] != 0u) std::fprintf(f, "    Yes");
         }
         WRITE(f, "");
         WRITE(f, "");
@@ -665,7 +689,11 @@ void DefaultReportPlugin::write_results(std::FILE* f,
             std::fprintf(f, "\n  %s%14.3f%14.3f", label, af, depth_in);
         };
 
+        if (mb.runoff_init_store > 0.0)
+            row("Initial Storage ..........", mb.runoff_init_store);
         row("Total Precipitation ......", mb.runoff_rainfall);
+        if (mb.runoff_runon > 0.0)
+            row("Outfall Runon ............", mb.runoff_runon);
         row("Evaporation Loss .........", mb.runoff_evap);
         row("Infiltration Loss ........", mb.runoff_infil);
         row("Surface Runoff ...........", mb.runoff_runoff);
@@ -996,7 +1024,6 @@ void DefaultReportPlugin::write_results(std::FILE* f,
             double reacted = (up < mb.qual_routing_reacted.size())   ? mb.qual_routing_reacted[up]  : 0.0;
             double init    = (up < mb.qual_routing_init.size())      ? mb.qual_routing_init[up]     : 0.0;
             double final_  = (up < mb.qual_routing_final.size())     ? mb.qual_routing_final[up]    : 0.0;
-
             qrow("Dry Weather Inflow .......", dwf);
             qrow("Wet Weather Inflow .......", wet);
             qrow("Groundwater Inflow .......", gw);
@@ -2267,25 +2294,36 @@ void DefaultReportPlugin::write_results(std::FILE* f,
 // write_timing — analysis timing section
 // ---------------------------------------------------------------------------
 
-void DefaultReportPlugin::write_timing(std::FILE* f) {
+void DefaultReportPlugin::write_timing(std::FILE* f, const SimulationContext& ctx) {
     // =====================================================================
-    // Analysis Timing — matches legacy report_writeRunTime()
+    // Analysis Timing — matches legacy report_writeSysTime()
+    //
+    // The start of the window is ctx.wall_start, stamped by
+    // SWMMEngine::open() before input parsing, mirroring legacy where
+    // report_writeLogo() takes SysTime ahead of project_readInput(). Elapsed
+    // time therefore covers parse + validation + initialization + routing,
+    // not just routing.
     // =====================================================================
     {
         char begin_str[64] = "";
         char end_str[64] = "";
 
-        if (wall_start_ != 0) {
-            const char* ct = std::ctime(&wall_start_);
+        std::time_t wall_end;
+        std::time(&wall_end);
+
+        // A zero wall_start means open() never ran (e.g. the plugin was
+        // driven directly). Fall back to the end time so the section reports
+        // "< 1 sec" rather than seconds-since-the-epoch.
+        std::time_t wall_start = (ctx.wall_start != 0) ? ctx.wall_start : wall_end;
+
+        {
+            const char* ct = std::ctime(&wall_start);
             if (ct) {
                 std::strncpy(begin_str, ct, sizeof(begin_str) - 1);
                 char* nl = std::strchr(begin_str, '\n');
                 if (nl) *nl = '\0';
             }
         }
-
-        std::time_t wall_end;
-        std::time(&wall_end);
         {
             const char* ct = std::ctime(&wall_end);
             if (ct) {
@@ -2299,12 +2337,17 @@ void DefaultReportPlugin::write_timing(std::FILE* f) {
         std::fprintf(f, "\n  Analysis ended on:  %s", end_str);
         std::fprintf(f, "\n  Total elapsed time: ");
 
-        double elapsed_secs = std::difftime(wall_end, wall_start_);
+        double elapsed_secs = std::difftime(wall_end, wall_start);
         if (elapsed_secs < 1.0) {
             std::fprintf(f, "< 1 sec");
         } else {
-            int es = static_cast<int>(elapsed_secs);
-            std::fprintf(f, "%02d:%02d:%02d", es / 3600, (es % 3600) / 60, es % 60);
+            // Legacy rolls whole days into a "d." prefix ahead of hh:mm:ss.
+            long es = static_cast<long>(elapsed_secs);
+            long days = es / 86400L;
+            long rem  = es % 86400L;
+            if (days > 0) std::fprintf(f, "%ld.", days);
+            std::fprintf(f, "%02ld:%02ld:%02ld",
+                         rem / 3600L, (rem % 3600L) / 60L, rem % 60L);
         }
         std::fprintf(f, "\n");
     }

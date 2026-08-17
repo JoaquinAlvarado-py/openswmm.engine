@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file OptionsHandler.cpp
  * @brief [OPTIONS] section handler for the new engine.
@@ -55,7 +71,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "OptionsHandler.hpp"
@@ -152,6 +168,21 @@ void handle_options(SimulationContext& ctx, const std::vector<std::string>& line
             // is ignored).
             else if (rv == "NONE" || rv == "NO_ROUTING") opt.ignore_routing = true;
             else opt.ext_options[key] = val;
+
+        } else if (key == "QUALITY_SOLVER") {
+            // Unified Transport suite, master plan D-UT6. LAGRANGIAN is a
+            // recognised-but-unimplemented value (plan phase T5): fall back to
+            // LEGACY rather than erroring so the file stays portable, and let
+            // the ext_options record surface it for diagnostics.
+            const std::string qv = norm(val);
+            if      (qv == "LEGACY")       opt.quality_solver = QualitySolverKind::LEGACY;
+            else if (qv == "EULERIAN_ARD" || qv == "ARD")
+                opt.quality_solver = QualitySolverKind::EULERIAN_ARD;
+            else opt.ext_options[key] = val;
+
+        } else if (key == "WATER_AGE") {
+            // Water age plan §1 (phase A1a): transported age tracking.
+            opt.water_age = (norm(val) == "ON" || norm(val) == "YES");
 
         // -----------------------------------------------------------------
         // Timesteps
@@ -427,9 +458,29 @@ void handle_options(SimulationContext& ctx, const std::vector<std::string>& line
             else if (nc == "SEMI_IMPLICIT") opt.node_continuity = NodeContinuity::SEMI_IMPLICIT;
 
         } else if (key == "VIRTUAL_JUNCTION_MOMENTUM") {
+            // RETIRED 2026-08-14. FULL is accepted and warned for one release,
+            // then the keyword goes the way of FV_NODE_CELL_COUPLING above.
+            // It was measured to be defective, not merely inaccurate: its
+            // cross-junction term dq4j is sign-inverted with respect to the
+            // per-link convective term it supplements (at constant Q,
+            // Δ(v²A) = −v²ΔA), and it is applied to BOTH adjacent links on top
+            // of each link's own full-length dq4. On SWASHES macdonald-periodic
+            // it destroyed 224-325 % of the routed volume; negating the term
+            // restores mass conservation but still leaves l1 5.24 % against
+            // BASIC's 0.163 % and plain DW's 0.141 %, so there is no
+            // term-level correction worth keeping. Evidence:
+            // epaswmm5_qa suites/swashes plans/VJ_MOMENTUM_SCOPE.md Phase 3.
             const std::string vm = norm(val);
-            if      (vm == "BASIC") opt.virtual_junction_momentum = 0;
-            else if (vm == "FULL")  opt.virtual_junction_momentum = 1;
+            opt.virtual_junction_momentum = 0;
+            if (vm == "FULL") {
+                ctx.warnings.push_back(
+                    "WARNING: VIRTUAL_JUNCTION_MOMENTUM FULL is retired and "
+                    "will be treated as BASIC - the cross-junction momentum "
+                    "term was not mass conserving.");
+                if (ctx.warning_code == 0) {
+                    ctx.warning_code = 101;  // SWMM_WARN_UNKNOWN_OPTION
+                }
+            }
 
         } else if (key == "ANDERSON_ACCEL") {
             const std::string av = norm(val);

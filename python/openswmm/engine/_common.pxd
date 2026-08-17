@@ -1,6 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2026 Caleb Buahin
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # :author: Caleb Buahin
 # :copyright: Copyright (c) 2026 Caleb Buahin
-# :license: MIT
+# :license: Apache-2.0
 #
 # _common.pxd — Shared C declarations for the OpenSWMM Engine C API.
 #
@@ -188,6 +204,7 @@ cdef extern from "openswmm_nodes.h":
     cdef int swmm_node_set_surcharge_depth(SWMM_Engine e, int idx, double depth)
     cdef int swmm_node_set_pond_area(SWMM_Engine e, int idx, double area)
     cdef int swmm_node_set_initial_depth(SWMM_Engine e, int idx, double depth)
+    cdef int swmm_node_set_rim_depth(SWMM_Engine e, int idx, double depth)
     # Virtual junctions (refactored engine only)
     cdef int swmm_node_is_virtual(SWMM_Engine e, int idx, int* is_virtual)
     cdef int swmm_node_set_virtual(SWMM_Engine e, int idx, int make_virtual)
@@ -196,6 +213,7 @@ cdef extern from "openswmm_nodes.h":
     cdef int swmm_node_get_type(SWMM_Engine e, int idx, int* type)
     cdef int swmm_node_get_invert_elev(SWMM_Engine e, int idx, double* elev)
     cdef int swmm_node_get_max_depth(SWMM_Engine e, int idx, double* depth)
+    cdef int swmm_node_get_rim_depth(SWMM_Engine e, int idx, double* depth)
     cdef int swmm_node_get_surcharge_depth(SWMM_Engine e, int idx, double* depth)
     cdef int swmm_node_get_ponded_area(SWMM_Engine e, int idx, double* area)
     cdef int swmm_node_get_initial_depth(SWMM_Engine e, int idx, double* depth)

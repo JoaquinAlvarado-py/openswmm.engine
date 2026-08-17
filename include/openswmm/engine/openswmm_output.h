@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file openswmm_output.h
  * @brief OpenSWMM Engine — Output File Reader C API.
@@ -37,7 +53,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_OUTPUT_H
@@ -257,6 +273,23 @@ SWMM_ENGINE_API const char* swmm_output_get_node_id(SWMM_Output handle,
  */
 SWMM_ENGINE_API const char* swmm_output_get_link_id(SWMM_Output handle,
                                                       int index);
+
+/**
+ * @brief Get the string ID of a species (pollutant) column by index.
+ *
+ * @details The `.out` header carries one name per species column. Reading
+ *          it is the ONLY way to identify a column's meaning: the per-column
+ *          unit field is a three-value concentration enum, so the water-age
+ *          column (`__WATER_AGE__`, reported in HOURS) necessarily reuses a
+ *          concentration code. Consumers plotting or converting a species
+ *          column must key on this name, not on the unit code.
+ *
+ * @param handle  Output reader handle.
+ * @param index   Zero-based species index (0 .. pollut_count-1).
+ * @returns  Null-terminated string owned by the reader, or NULL on error.
+ */
+SWMM_ENGINE_API const char* swmm_output_get_pollut_id(SWMM_Output handle,
+                                                        int index);
 
 /* =========================================================================
  * Per-period result retrieval (all objects, one variable, one period)

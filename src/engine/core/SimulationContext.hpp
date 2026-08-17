@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file SimulationContext.hpp
  * @brief The central, reentrant simulation context for the new engine.
@@ -54,22 +70,27 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #ifndef OPENSWMM_ENGINE_SIMULATION_CONTEXT_HPP
 #define OPENSWMM_ENGINE_SIMULATION_CONTEXT_HPP
 
 #include <cmath>
+#include <ctime>
 #include <functional>
 #include "FilePathPair.hpp"
+#include "../data/ArdConfigData.hpp"
 #include "../data/GageData.hpp"
+#include "../data/WaterAgeData.hpp"
 #include "../data/LinkData.hpp"
 #include "../data/NameIndex.hpp"
 #include "../data/NodeData.hpp"
 #include "../data/NodeSubtypes.hpp"
 #include "../data/LinkSubtypes.hpp"
 #include "../data/PollutantData.hpp"
+#include "../data/ReactionData.hpp"
+#include "../data/SpeciesRegistry.hpp"
 #include "../data/SubcatchData.hpp"
 #include "../data/TableData.hpp"
 #include "SimulationOptions.hpp"
@@ -107,6 +128,35 @@ namespace openswmm {
 struct PluginSpec {
     std::string              path;       ///< Shared library path
     std::vector<std::string> init_args;  ///< Extra tokens from the [PLUGINS] row
+};
+
+// ============================================================================
+// [PROCESS_COMPONENTS] section spec — process-component registrations
+// ============================================================================
+
+/**
+ * @brief One row of [PROCESS_COMPONENTS] (Unified Transport suite, D-UT8).
+ *
+ * @details `id` is a registered component id
+ *          (e.g. `org.hydrocouple.openswmm.reactions`) or — reserved for the
+ *          HC2 phase — a shared-library path exporting
+ *          `hydrocouple_component_info()`. `config_path` is the component's
+ *          external configuration file (the `config="…"` argument), resolved
+ *          relative to the parent .inp per the [2D_MESH_FILE] rules. `args`
+ *          holds any further key="value" pairs verbatim.
+ *
+ * @see plans/transport/TRANSPORT_IO_PLUGIN_CONFIG_PLAN.md §2
+ */
+struct ProcessComponentSpec {
+    std::string id;           ///< Component id (or library path — HC2)
+    std::string config_path;  ///< config="…" argument (may be empty)
+    std::vector<std::pair<std::string, std::string>> args;  ///< other key/value args
+
+    /// Effective path the config was READ from (set by
+    /// resolve_process_components; empty until then). IO3 uses it to copy
+    /// the config file alongside a save-as so relative references never
+    /// dangle in the destination directory.
+    std::string resolved_config_path;
 };
 
 // ============================================================================
@@ -299,6 +349,19 @@ struct SimulationContext {
     /** @brief Current lifecycle state of the engine. */
     EngineState state = EngineState::CREATED;
 
+    /**
+     * @brief Wall-clock time stamped at the start of SWMMEngine::open().
+     *
+     * @details Reported as "Analysis begun on:" and used as the origin for
+     *          "Total elapsed time:" in the .rpt. Stamped before input
+     *          parsing so that parse + cross-reference resolution +
+     *          validation + module initialization are all included in the
+     *          reported elapsed time. This matches legacy, which takes its
+     *          timestamp in report_writeLogo() before project_readInput()
+     *          (see legacy/engine/report.c). Zero until open() runs.
+     */
+    std::time_t wall_start = 0;
+
     // =========================================================================
     // Project title / notes
     // =========================================================================
@@ -464,6 +527,62 @@ struct SimulationContext {
      * @see Legacy: Pollut[], node.newQual[], link.newQual[] in globals.h
      */
     PollutantData pollutants;
+
+    /**
+     * @brief Species registry — the single source of truth for transported
+     *        constituents (master plan §4.1, phase T0a). Pollutants occupy
+     *        the first slots (index-aligned with the legacy pollutant
+     *        index); MSX species append via the reactions component (R1);
+     *        reserved age/temperature species append with phases A1/H1.
+     *        Rebuilt at each open().
+     */
+    SpeciesRegistry species_registry;
+
+    /**
+     * @brief Multispecies reaction system (EPANET-MSX conventions), parsed
+     *        from the reactions component's config file or embedded
+     *        [REACTION_*] sections (phase R1). Compiled bytecode arrives
+     *        with phase R2.
+     */
+    ReactionData reactions;
+
+    /**
+     * @brief Eulerian ARD transport component configuration, parsed from the
+     *        `model.ard` config file registered via [PROCESS_COMPONENTS]
+     *        (phase E3: the dispersion subset — global mode + per-conduit
+     *        overrides). @see data/ArdConfigData.hpp.
+     */
+    ArdConfigData ard_config;
+
+    /**
+     * @brief Water-age tracking (phase A1a): per-source initial ages parsed
+     *        from the waterage component (`model.age`) + the runtime age
+     *        state the engines and loaders share. @see data/WaterAgeData.hpp.
+     */
+    WaterAgeConfigData water_age_config;
+    WaterAgeState      water_age_state;
+
+    /**
+     * @brief Species names as REPORTED (phase A2b): the pollutant names,
+     *        then `__WATER_AGE__` when `[OPTIONS] WATER_AGE` is on.
+     *
+     * @details The `.out` format has exactly one per-species column block,
+     *          so age reports as a trailing pseudo-pollutant column. This
+     *          vector is the single naming truth the output writers and the
+     *          snapshot's `pollut_names` pointer share — built once at open
+     *          so the pointer stays valid for the run. `n_reported_species()`
+     *          is its length and is what the writers must stride by; plain
+     *          `n_pollutants()` remains the TRANSPORT stride for
+     *          `nodes.conc` etc. Keeping the two counts distinct and named
+     *          is deliberate: conflating them is the stride-slip family
+     *          (roadmap lessons 14/15).
+     */
+    std::vector<std::string> reported_species_names;
+
+    /// Length of reported_species_names (pollutants + age when enabled).
+    int n_reported_species() const noexcept {
+        return static_cast<int>(reported_species_names.size());
+    }
 
     /**
      * @brief All time series and rating curves.
@@ -671,6 +790,25 @@ struct SimulationContext {
     std::vector<PluginSpec> plugin_specs;
 
     /**
+     * @brief Process-component registrations parsed from [PROCESS_COMPONENTS].
+     * @details Resolved against the ProcessComponentRegistry during open()
+     *          (after the input read, mirroring the external 2D mesh file);
+     *          each resolved component's config file is parsed and delivered
+     *          to its apply hook. Unified Transport suite D-UT8.
+     */
+    std::vector<ProcessComponentSpec> process_component_specs;
+
+    /**
+     * @brief Embedded component sections found in the legacy .inp
+     *        ([REACTION_*] today; other component families as they land) —
+     *        the D-UT8 embedded-fallback path. (tag, lines) pairs in file
+     *        order; consumed after component resolution with a style
+     *        warning, or reported ignored when the external file wins.
+     */
+    std::vector<std::pair<std::string, std::vector<std::string>>>
+        embedded_component_sections;
+
+    /**
      * @brief Secondary file references parsed from [FILES].
      * @details Mirrors legacy SWMM5's TFile struct array — rainfall,
      *          runoff, RDII, inflows, outflows, hotstart save/use.
@@ -818,6 +956,7 @@ struct SimulationContext {
     struct MassBalance {
         // Runoff totals
         double runoff_rainfall   = 0.0;  ///< Total rainfall volume (ft3)
+        double runoff_runon      = 0.0;  ///< Outfall-routed runon volume (ft3), legacy RUNOFF_RUNON
         double runoff_evap       = 0.0;  ///< Total evaporation volume (ft3)
         double runoff_infil      = 0.0;  ///< Total infiltration volume (ft3)
         double runoff_runoff     = 0.0;  ///< Total surface runoff volume (ft3)
@@ -976,7 +1115,7 @@ struct SimulationContext {
 
         /// Runoff continuity error (fraction).
         double runoff_error() const {
-            double total_in = runoff_rainfall + runoff_init_store;
+            double total_in = runoff_rainfall + runoff_runon + runoff_init_store;
             double total_out = runoff_evap + runoff_infil + runoff_runoff + runoff_final_store;
             return (total_in > 0.0) ? (total_in - total_out) / total_in : 0.0;
         }
@@ -1302,6 +1441,15 @@ struct SimulationContext {
         // Clear inflow-related stores that aren't reset by their owning solvers
         rdii_decay = RDIIDecayData{};
 
+        // E3: transport.ard component config — its apply hook resets it, but
+        // a reopen WITHOUT the component would otherwise inherit the previous
+        // model's dispersion.
+        ard_config = ArdConfigData{};
+
+        // A1a: same stale-on-reopen hygiene for water age.
+        water_age_config = WaterAgeConfigData{};
+        water_age_state.clear();
+
         // Virtual-junction diagnostics
         vj_diag.clear();
 
@@ -1459,20 +1607,18 @@ struct SimulationContext {
     // which kind it wants.
     // =========================================================================
 
-    /** @brief Find a timeseries table by name; -1 if none. */
+    /**
+     * @brief Find a timeseries table by name; -1 if none.
+     * @details O(1) via TableData::by_name. Returns the lowest matching index,
+     *          exactly as the previous linear scan did.
+     */
     int find_timeseries(std::string_view name) const noexcept {
-        for (int i = 0; i < n_tables(); ++i)
-            if (tables[i].type == TableType::TIMESERIES && ieq(tables[i].id, name))
-                return i;
-        return -1;
+        return tables.find_by_kind(name, /*want_timeseries=*/true);
     }
 
     /** @brief Find a curve table (any CURVE_* type) by name; -1 if none. */
     int find_curve(std::string_view name) const noexcept {
-        for (int i = 0; i < n_tables(); ++i)
-            if (tables[i].type != TableType::TIMESERIES && ieq(tables[i].id, name))
-                return i;
-        return -1;
+        return tables.find_by_kind(name, /*want_timeseries=*/false);
     }
 
     /**

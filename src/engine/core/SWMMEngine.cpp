@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file SWMMEngine.cpp
  * @brief Implementation of the SWMMEngine lifecycle manager.
@@ -7,7 +23,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "SWMMEngine.hpp"
@@ -28,6 +44,11 @@
 #include "../hydraulics/TimestepController.hpp"
 #include "../input/PostParseResolver.hpp"
 #include "../plugins/DefaultInputPlugin.hpp"
+#include "../plugins/ProcessComponentRegistry.hpp"
+#include "../transport/components/EulerianArdComponent/ArdConfig.hpp"
+#include "../transport/components/ReactionModule/ReactionLegacyBinding.hpp"
+#include "../transport/components/ReactionModule/ReactionsComponent.hpp"
+#include "../transport/components/WaterAgeModule/WaterAgeComponent.hpp"
 #include "../plugins/DefaultStateIOPlugin.hpp"
 #include "HotStartManager.hpp"
 #include "../../../include/openswmm/plugin_sdk/IPluginComponentInfo.hpp"
@@ -37,10 +58,11 @@
 #ifdef OPENSWMM_HAS_2D
 #include "../2d/input/SectionHandlers2D.hpp"
 #include "../2d/output/Default2DOutputPlugin.hpp"
-#include <filesystem>
 #endif
+#include <filesystem>  // 2D mesh file + [PROCESS_COMPONENTS] path resolution
 
 #include <cstring>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -127,6 +149,18 @@ int SWMMEngine::open(const char* inp_path,
     // Reset context for a fresh run
     ctx_.reset();
 
+    // Zero the load-phase accumulators so a process that opens several models
+    // reports each one separately (see core/PerfTimers.hpp).
+    perf::reset_load();
+
+    // Stamp the report wall clock before any parsing work. Legacy takes this
+    // timestamp in report_writeLogo(), which swmm_open() calls before
+    // project_readInput(), so its "Total elapsed time" covers parse +
+    // validate + init. Stamping here keeps the reported elapsed time
+    // comparable with legacy/PCSWMM instead of excluding the (potentially
+    // very long, on large models) initialization window.
+    std::time(&ctx_.wall_start);
+
     rpt_path_ = rpt_path ? rpt_path : "";
     out_path_ = out_path ? out_path : "";
 
@@ -172,12 +206,16 @@ int SWMMEngine::open(const char* inp_path,
     // the mesh is already SI. The external-mesh path runs its own prescan
     // below and overrides this if both files carry the header.
     if (inp_path && inp_path[0] != '\0') {
+        perf::ScopedTimer _pt(perf::sec_open_prescan2d);
         twoD::prescan2DUnitsHeader(inp_path, surface_router_.options());
     }
 #endif
 
-    if (input_plugin->read(inp_path ? inp_path : "", ctx_) != 0) {
-        return ctx_.error_code != 0 ? ctx_.error_code : SWMM_ERR_PARSE;
+    {
+        perf::ScopedTimer _pt(perf::sec_open_read);
+        if (input_plugin->read(inp_path ? inp_path : "", ctx_) != 0) {
+            return ctx_.error_code != 0 ? ctx_.error_code : SWMM_ERR_PARSE;
+        }
     }
 
 #ifdef OPENSWMM_HAS_2D
@@ -215,6 +253,94 @@ int SWMMEngine::open(const char* inp_path,
     }
 #endif
 
+    // Species registry (master plan §4.1, phase T0a): pollutants occupy the
+    // first slots, index-aligned with the legacy pollutant index. MSX
+    // species (reactions component, below) and reserved species (age A1,
+    // temperature H1) append after. Rebuilt on every open.
+    ctx_.species_registry.clear();
+    for (int p = 0; p < ctx_.n_pollutants(); ++p)
+        ctx_.species_registry.add(ctx_.pollutant_names.name_of(p),
+                                  SpeciesKind::POLLUTANT, std::string{});
+
+    // Resolve [PROCESS_COMPONENTS] registrations (Unified Transport suite
+    // D-UT8, phase IO1): look up each id, read its external config file
+    // (relative to the .inp, [2D_MESH_FILE] path rules), and deliver the
+    // parsed sections to the component's apply hook. Mirrors the external
+    // 2D mesh handling directly above: fatal on strict open, recorded and
+    // survivable on lenient (editor) open. Implemented components register
+    // first (idempotent — overwrites the planned-id placeholder).
+    transport::registerReactionsComponent();
+    transport::registerArdComponent();
+    transport::registerWaterAgeComponent();
+    {
+        std::string base_dir;
+        if (inp_path && inp_path[0] != '\0')
+            base_dir = std::filesystem::path(inp_path).parent_path().string();
+
+        std::vector<std::string> errs;
+        if (!ctx_.process_component_specs.empty())
+            errs = components::resolve_process_components(ctx_, base_dir);
+
+        // Embedded [REACTION_*] fallback (D-UT8): honored with a style
+        // warning when no external reactions component is registered; the
+        // external file wins wholesale otherwise.
+        bool reactions_registered = false;
+        for (const auto& spec : ctx_.process_component_specs)
+            if (spec.id == "org.hydrocouple.openswmm.reactions")
+                reactions_registered = true;
+        transport::applyEmbeddedReactionSections(ctx_, reactions_registered,
+                                                 errs);
+
+        // E5a: [TRANSPORT_BOUNDARIES]/[TRANSPORT_SOURCES] rows reference MSX
+        // species by NAME, and the reactions component may apply before OR
+        // after transport.ard in file order — so the rows are stored raw at
+        // apply and resolved HERE, after every component (and the embedded
+        // fallback) has run. Resolution failures are fatal like any other
+        // component config error.
+        transport::resolveArdTransportRows(ctx_, errs);
+
+        if (!errs.empty()) {
+            for (const auto& e : errs) ctx_.errors.push_back(e);
+            if (!lenient_open_) {
+                ctx_.error_code    = SWMM_ERR_PARSE;
+                ctx_.error_message = errs.front();
+                write_open_failure_report();
+                return SWMM_ERR_PARSE;
+            }
+        }
+
+        // A configured reactions component that no engine will run is a
+        // silent no-result run unless we say so (R4).
+        transport::warnIfLegacyBindingBypassed(ctx_);
+        // The mirror case for E3: dispersion spelled the FV way while the
+        // ARD engine reads it from model.ard.
+        transport::warnIfFvDispersionKeyIgnored(ctx_);
+
+        // A1a/A1b: the reserved species registers so downstream consumers
+        // see the registry truth. Age now tracks under BOTH engines (ARD
+        // mesh row / LEGACY CSTR mirror) — the A1b bypass warning is
+        // retired; IGNORE_QUALITY remains the only bypass and warns via
+        // the waterage component.
+        // A2b: the REPORTED species list — pollutants, then the age
+        // pseudo-column. Built once here so the snapshot's pollut_names
+        // pointer stays valid for the whole run.
+        ctx_.reported_species_names.clear();
+        for (int p = 0; p < ctx_.n_pollutants(); ++p)
+            ctx_.reported_species_names.push_back(
+                ctx_.pollutant_names.name_of(p));
+
+        if (ctx_.options.water_age) {
+            ctx_.species_registry.add("__WATER_AGE__",
+                                      SpeciesKind::RESERVED_AGE, "hours");
+            ctx_.reported_species_names.push_back("__WATER_AGE__");
+            if (ctx_.options.ignore_quality)
+                ctx_.warnings.push_back(
+                    "[OPTIONS] WATER_AGE ON but IGNORE_QUALITY is YES — the "
+                    "quality stage does not run, so no age is tracked this "
+                    "simulation.");
+        }
+    }
+
     // Warn about unknown/skipped sections. Route through push_report_warning so
     // the warning reaches the .rpt (legacy report_writeWarningMsg), not just the
     // API callback. Wording matches legacy input.c ("Unknown section '[X]' ...");
@@ -226,12 +352,18 @@ int SWMMEngine::open(const char* inp_path,
     }
 
     // Resolve cross-references (forward refs, final array sizing, head init)
-    input::resolve_cross_references(ctx_);
+    {
+        perf::ScopedTimer _pt(perf::sec_open_resolve);
+        input::resolve_cross_references(ctx_);
+    }
 
     // Project-level sanity checks + step-clamp warnings (legacy project_validate:
     // WARNING 01/06/07). Must run before the fatal gate below so any warnings it
     // records reach the report.
-    validate_project();
+    {
+        perf::ScopedTimer _pt(perf::sec_open_validate);
+        validate_project();
+    }
 
     // Post-parse validation errors accumulated during resolution (e.g.
     // ERR_TRANSECT_MANNING 227 for a zero channel Manning's n) are fatal:
@@ -375,6 +507,11 @@ int SWMMEngine::initialize() noexcept {
                   "swmm_engine_initialize: must call open() first");
         return SWMM_ERR_WRONG_STATE;
     }
+
+    // Everything from here to init_modules() is the "state seeding" phase —
+    // per-node/per-link loops over ctx_. Closed out just before init_modules(),
+    // which is broken into its own four legs.
+    const auto _pt_state0 = perf::now();
 
     // Apply initial depths/flows from input (all defaults already in NodeData etc.)
     // reset_state() applies init_depth to depth/old_depth/head but volumes need
@@ -699,6 +836,8 @@ int SWMMEngine::initialize() noexcept {
     // Legacy swmm5.c:721 — ReportTime = 1000 * (double)ReportStep
     ctx_.next_report_ms      = 1000.0 * ctx_.options.report_step;
 
+    perf::sec_init_state += perf::since(_pt_state0);
+
     // Initialize all computational modules (batch SoA setup)
     init_modules();
 
@@ -783,6 +922,10 @@ int SWMMEngine::start(int save_results) noexcept {
     // routing-step-size coarsening, and the outfall interface write are all
     // gated on this in step()/postOutputSnapshot().
     do_routing_ = (ctx_.n_nodes() > 0 && !ctx_.options.ignore_routing);
+
+    // Everything up to prepare_all() is interface-file work ([FILES] inflows /
+    // outflows / hotstart / RDII / rainfall).
+    const auto _pt_iface0 = perf::now();
 
     // Open routing interface files ([FILES] USE INFLOWS / SAVE OUTFLOWS) and
     // process headers eagerly — matching legacy routing_open() →
@@ -903,8 +1046,11 @@ int SWMMEngine::start(int save_results) noexcept {
                                   "supported by this engine and was ignored");
     }
 
+    perf::sec_start_iface += perf::since(_pt_iface0);
+
     // Phase 4: call prepare() on all plugins (opens output files/headers)
     if (!plugins_.empty()) {
+        perf::ScopedTimer _pt(perf::sec_start_plugins);
         const int rc = plugins_.prepare_all(ctx_);
         if (rc != 0) {
             set_error(SWMM_ERR_PLUGIN, "swmm_engine_start: plugin prepare() failed");
@@ -1476,10 +1622,8 @@ void SWMMEngine::stepRunoff(double dt_routing) noexcept {
             }
         }
 
-        // A4b. Runoff mass-balance accumulation is deferred to A6c (after the
-        // LID routing adjusts subcatches.runoff by −VlidIn/+VlidOut/+drain);
-        // accumulating here would capture the pre-LID runoff and miss the LID
-        // exchange, leaving the continuity unbalanced (issue #102 D/E).
+        // A4b. Accumulate runoff mass balance totals
+        accumulateRunoffMassBalance(dt_runoff);
 
         // A4b'. Phase 1b auto-save hook — when the runoff interface file
         // is open in SAVE mode, emit one record per substep. saveResults
@@ -1526,25 +1670,34 @@ void SWMMEngine::stepRunoff(double dt_routing) noexcept {
                     continue;
                 }
                 auto usc = static_cast<std::size_t>(sc);
-                // Subcatchment precipitation (ft/sec, internal units) — set by
-                // RunoffSolver from the gage AFTER applying per-subcatchment
-                // rainfall forcing and snowmelt, so the LID sees the same
-                // precip the rest of the subcatchment does (issue #102).
+                // Net precip on the LID surface in INTERNAL units (ft/s) —
+                // set by RunoffSolver::execute() earlier this step, matching
+                // legacy lidInflow += subcatch->rainfall. ctx_.gages.rainfall
+                // holds display in/hr and must not be used here (issue #131:
+                // it saturated LID soils in one step, 43200x the real rate).
                 double rain = ctx_.subcatches.rainfall[usc];
                 // Per-subarea runoff CFS from non-LID area (set by RunoffSolver, Gap #23)
                 double q_imperv = rsoa.imperv_runoff_cfs[usc];
                 double q_perv   = rsoa.perv_runoff_cfs[usc];
                 double lid_area = g.area[uu];
                 // Inflow = rainfall on LID + fraction of non-LID subarea runoff captured
-                double captured_cfs = q_imperv * g.from_imperv[uu]
-                                    + q_perv   * g.from_perv[uu];
-                double q_from_sc = (lid_area > 0.0) ? captured_cfs / lid_area : 0.0;
+                double q_from_sc = 0.0;
+                if (lid_area > 0.0)
+                    q_from_sc = (q_imperv * g.from_imperv[uu]
+                               + q_perv   * g.from_perv[uu]) / lid_area;
+                // Legacy lid.c:1714-1718: when the LID occupies the full
+                // subcatchment (non-LID area snapped to zero), upstream and
+                // outfall runon flows onto the LID units — the runoff solver
+                // has no subarea left to receive it (issue #131).
+                if (rsoa.area[usc] <= 0.0 &&
+                    usc < ctx_.subcatches.total_lid_area_ft2.size() &&
+                    ctx_.subcatches.total_lid_area_ft2[usc] > 0.0) {
+                    double runon_q = ctx_.subcatches.runon_inflow[usc];  // CFS
+                    if (runon_q > 0.0)
+                        q_from_sc += runon_q /
+                            ctx_.subcatches.total_lid_area_ft2[usc];
+                }
                 g.inflow[uu] = rain + q_from_sc;
-                // Remove the captured runon from the subcatchment outlet — that
-                // runoff is now treated by the LID, not discharged. This is the
-                // "− VlidIn" term of legacy subcatch_getRunoff() (#102 D); the
-                // LID's own surface outflow (+ VlidOut) is added back in A6b.
-                ctx_.subcatches.runoff[usc] -= captured_cfs;
             }
         }
 
@@ -1573,25 +1726,24 @@ void SWMMEngine::stepRunoff(double dt_routing) noexcept {
                         g.surface_runoff[uu] * lid_area;  // CFS
                 }
                 // Drain flow (ft/sec * ft² = CFS):
-                //  drain_node >= 0        → external node inflow (lid_addDrainInflow)
-                //  drain_subcatch != self → runon to that subcatch (lid_addDrainRunon)
-                //  no target / self       → discharge to THIS subcatchment's outlet
-                //  The no-target case previously recirculated as runon-to-self,
-                //  which double-feeds the subcatchment and leaks continuity;
-                //  EPA sends it straight to the outlet (issue #102 E).
+                //  drain_node >= 0 → external node inflow
+                //  otherwise → runon to target subcatch next step via lid_drain_runon_cfs
+                //  Matches legacy lid_addDrainRunon(): drain goes to runon, not runoff.
                 if (g.drain_node[uu] >= 0) {
+                    // Route drain to a specific node — add as external inflow
                     auto un = static_cast<std::size_t>(g.drain_node[uu]);
                     if (un < ctx_.nodes.ext_inflow.size()) {
                         ctx_.nodes.ext_inflow[un] += g.drain_flow[uu] * lid_area;  // CFS
                     }
-                } else if (g.drain_subcatch[uu] >= 0 && g.drain_subcatch[uu] != sc) {
-                    auto utsc = static_cast<std::size_t>(g.drain_subcatch[uu]);
+                } else {
+                    // Route drain as runon to target subcatch next step.
+                    int target_sc = (g.drain_subcatch[uu] >= 0)
+                                    ? g.drain_subcatch[uu] : sc;
+                    auto utsc = static_cast<std::size_t>(target_sc);
                     if (utsc < ctx_.subcatches.lid_drain_runon_cfs.size()) {
                         ctx_.subcatches.lid_drain_runon_cfs[utsc] +=
                             g.drain_flow[uu] * lid_area;  // CFS
                     }
-                } else {
-                    ctx_.subcatches.runoff[usc] += g.drain_flow[uu] * lid_area;  // CFS
                 }
 
                 // Gap #26: LID drain quality routing.
@@ -1643,10 +1795,6 @@ void SWMMEngine::stepRunoff(double dt_routing) noexcept {
                 }
             }
         }
-
-        // A6c. Accumulate runoff mass-balance totals now that the LID routing
-        // has finalised subcatches.runoff (moved from A4b — see note there).
-        accumulateRunoffMassBalance(dt_runoff);
 
         // A7. Street sweeping buildup removal (Gap #34)
         // Matches legacy surfqual_sweepBuildup(): per-(subcatch, landuse)
@@ -1925,28 +2073,22 @@ void SWMMEngine::accumulateRunoffMassBalance(double dt_runoff) noexcept {
     // breaking the runoff continuity balance.
     const double LANDAREA_TO_FT2 = 1.0 / ucf::UCF(ucf::LANDAREA, ctx_.options);
 
-    const auto& rsoa = runoff_.soa();
     for (int i = 0; i < ctx_.n_subcatches(); ++i) {
         auto ui = static_cast<std::size_t>(i);
         double area_ft2 = ctx_.subcatches.area[ui] * LANDAREA_TO_FT2;
-        // evap_loss / infil_loss are averaged over the NON-LID area only
-        // (RunoffSolver divides Vevap/Vinfil by soa.area = full − LID area).
-        // Multiplying them by the full subcatchment area double-counts the
-        // loss when LIDs cover part of the subcatchment (issue #102 —
-        // exposed once the LID footprint is actually removed, fix B).
-        double nonlid_area_ft2 = rsoa.area[ui];  // ft²
 
-        // Rainfall volume (ft³) — falls on the whole subcatchment (incl. LID)
+        // Rainfall volume (ft³) — rainfall is already in ft/sec (internal units)
         double rain_ftsec = ctx_.subcatches.rainfall[ui];
         ctx_.mass_balance.runoff_rainfall += rain_ftsec * area_ft2 * dt_runoff;
 
-        // Evaporation volume (ft³) — evap_loss is a non-LID-area-averaged rate
+        // Evaporation volume (ft³) — evap_loss is ft/sec
         ctx_.mass_balance.runoff_evap +=
-            ctx_.subcatches.evap_loss[ui] * nonlid_area_ft2 * dt_runoff;
+            ctx_.subcatches.evap_loss[ui] * area_ft2 * dt_runoff;
 
-        // Infiltration volume (ft³) — infil_loss is a non-LID-area-averaged rate
+        // Infiltration volume (ft³) — infil_loss is area-averaged rate (ft/sec)
+        // Already accounts for pervious fraction (Vinfil / dt / total_area)
         ctx_.mass_balance.runoff_infil +=
-            ctx_.subcatches.infil_loss[ui] * nonlid_area_ft2 * dt_runoff;
+            ctx_.subcatches.infil_loss[ui] * area_ft2 * dt_runoff;
 
         // Surface runoff volume (ft³) — runoff is cfs
         ctx_.mass_balance.runoff_runoff +=
@@ -1961,17 +2103,20 @@ void SWMMEngine::accumulateRunoffMassBalance(double dt_runoff) noexcept {
             ctx_.subcatches.runoff[ui] * dt_runoff;
     }
 
-    // Fold this step's LID exfiltration / evaporation into the runoff-continuity
-    // infil / evap outflow terms (legacy VlidInfil / VlidEvap in subcatch.c).
-    // The LID solver tracks cumulative wb_infil/wb_evap; add the delta since the
-    // previous runoff step. Without this a LID with storage-layer exfiltration
-    // (STORAGE Ksat > 0) loses water that never appears as a continuity outflow.
-    double lid_infil_vol = lid_.totalInfilVolume();
-    double lid_evap_vol  = lid_.totalEvapVolume();
-    ctx_.mass_balance.runoff_infil += (lid_infil_vol - prev_lid_infil_vol_);
-    ctx_.mass_balance.runoff_evap  += (lid_evap_vol  - prev_lid_evap_vol_);
-    prev_lid_infil_vol_ = lid_infil_vol;
-    prev_lid_evap_vol_  = lid_evap_vol;
+    // LID unit losses belong in the runoff mass balance — legacy
+    // evalLidUnit() adds lidEvap/lidInfil × lidArea to the runoff totals
+    // (lid.c:1912-1913). Without them, rain captured by LID units reads as
+    // a runoff continuity error once the LID footprint is excluded from
+    // runoff generation (issue #131). evap_loss/infil_loss are per-step
+    // loss depths (ft).
+    for (int t = 0; t < lid_.numGroups(); ++t) {
+        const auto& g = lid_.group(t);
+        for (int u = 0; u < g.count; ++u) {
+            auto uu = static_cast<std::size_t>(u);
+            ctx_.mass_balance.runoff_evap  += g.evap_loss[uu] * g.area[uu];
+            ctx_.mass_balance.runoff_infil += g.infil_loss[uu] * g.area[uu];
+        }
+    }
 }
 
 // ============================================================================
@@ -2094,10 +2239,6 @@ int SWMMEngine::refreshTreatment(int node_idx, int pollut_idx) noexcept {
  */
 void SWMMEngine::refreshLIDDrainParams() noexcept {
     const auto& drain = ctx_.lid_controls.drain;
-    // Mirror the LID init() unit conversions (issue #102): coeff/expon stay in
-    // user units (converted at compute time by getDrainRate); the head-based
-    // columns convert in|mm → ft and the delay converts hours → seconds.
-    const double ucfRainDepth = ucf::UCF(ucf::RAINDEPTH, ctx_.options);
     for (int t = 0; t < lid_.numGroups(); ++t) {
         auto& g = lid_.group(t);
         for (int i = 0; i < g.count; ++i) {
@@ -2107,10 +2248,10 @@ void SWMMEngine::refreshLIDDrainParams() noexcept {
             const auto& p = drain[static_cast<std::size_t>(li)];
             g.drain_coeff[ui]  = p[0];
             g.drain_expon[ui]  = p[1];
-            g.drain_offset[ui] = p[2] / ucfRainDepth;
-            g.drain_delay[ui]  = p[3] * 3600.0;
-            g.drain_hopen[ui]  = p[4] / ucfRainDepth;
-            g.drain_hclose[ui] = p[5] / ucfRainDepth;
+            g.drain_offset[ui] = p[2];
+            g.drain_delay[ui]  = p[3];
+            g.drain_hopen[ui]  = p[4];
+            g.drain_hclose[ui] = p[5];
         }
     }
 }
@@ -2933,9 +3074,60 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
         inlet_.adjustQualInflows(ctx_, dt_routing);
     }
 
-    // B5. Water quality routing (P8-G13: fill stub bodies)
-    if (ctx_.n_pollutants() > 0 && !ctx_.options.ignore_quality) {
-        quality_.execute(ctx_, dt_routing);
+    // B5. Water quality routing (P8-G13: fill stub bodies).
+    //     QUALITY_SOLVER EULERIAN_ARD (master plan D-UT6, phase E1): the
+    //     external-load assembly is shared with the legacy path; the CSTR
+    //     transport stages are replaced by the ARD engine on the FV cell
+    //     mesh. Lazy first-step init because the transport mesh needs
+    //     Router::init's mod_length/rough_factor. Init failure falls back
+    //     to LEGACY with a warning — never a silent no-quality run.
+    //
+    //     R4: a reactions component keeps the stage alive with zero
+    //     pollutants — an MSX-only model has species to react but no
+    //     [POLLUTANTS] row to gate on. Bypasses that DO skip it
+    //     (EULERIAN_ARD, IGNORE_QUALITY) warn at open rather than running
+    //     silently; see transport::warnIfLegacyBindingBypassed.
+    if ((ctx_.n_pollutants() > 0 ||
+         transport::legacyReactionsActive(ctx_) ||
+         ctx_.options.water_age) &&
+        !ctx_.options.ignore_quality) {
+        if (ctx_.options.quality_solver == QualitySolverKind::EULERIAN_ARD) {
+            if (!ard_init_attempted_) {
+                ard_init_attempted_ = true;
+                const bool ok = ard_.init(ctx_);
+                for (const auto& w : ard_.warnings())
+                    ctx_.warnings.push_back(w);
+                if (!ok)
+                    ctx_.warnings.push_back(
+                        std::string(
+                            "QUALITY_SOLVER EULERIAN_ARD: transport mesh "
+                            "unavailable — falling back to LEGACY quality "
+                            "routing.") +
+                        (ctx_.ard_config.any_dispersion()
+                             ? " The transport.ard dispersion configuration "
+                               "does not apply under the LEGACY engine."
+                             : ""));
+            }
+            if (ard_.initialized()) {
+                quality_.assembleExternalLoads(ctx_, dt_routing);
+                ard_.step(ctx_, dt_routing);
+                // E5b treatment interop: the legacy evaluator runs on the
+                // PUBLISHED node concentrations (same expressions, same
+                // process variables, books its own reacted losses); the
+                // engine then absorbs the treated concentrations back into
+                // its node stores. Ordering note (documented decision):
+                // under ARD treatment applies AFTER the reaction stage at
+                // end of step, where legacy applies it before decay.
+                if (ctx_.treatment.hasAny()) {
+                    quality_.applyTreatment(ctx_, dt_routing);
+                    ard_.absorbTreatedNodeConc(ctx_);
+                }
+            } else {
+                quality_.execute(ctx_, dt_routing);
+            }
+        } else {
+            quality_.execute(ctx_, dt_routing);
+        }
     }
 }
 
@@ -3390,18 +3582,15 @@ void SWMMEngine::updateRoutingMassBalance(double dt_routing) noexcept {
         for (int j = 0; j < ctx_.n_nodes(); ++j) {
             auto uj = static_cast<std::size_t>(j);
 
-            // Wet weather quality inflow: lateral flow × concentration
-            if (ctx_.nodes.lat_flow[uj] > 0.0) {
-                for (int p = 0; p < np; ++p) {
-                    auto qi = uj * static_cast<std::size_t>(np) + static_cast<std::size_t>(p);
-                    if (qi < ctx_.nodes.conc.size()) {
-                        double load = ctx_.nodes.lat_flow[uj] *
-                                      ctx_.nodes.conc[qi] * dt_routing;
-                        if (load > 0.0)
-                            ctx_.mass_balance.qual_routing_wet[static_cast<std::size_t>(p)] += load;
-                    }
-                }
-            }
+            // Wet weather quality inflow is NOT booked here. This used to add
+            // lat_flow * node concentration for every node with lateral flow,
+            // which is wrong twice over: the node's resulting concentration is
+            // not the source's, and lat_flow lumps runoff together with DWF,
+            // GW, RDII and direct [INFLOWS] — so each of those was counted a
+            // second time as "wet weather". It read 0.000 only for as long as
+            // direct pollutant inflows delivered no mass at all. Each source
+            // now books its own load in its own QualitySolver adder, matching
+            // legacy massbal_addInflowQual() call sites.
 
             // Quality outflow at outfalls: inflow × concentration
             if (ctx_.nodes.type[uj] == NodeType::OUTFALL && ctx_.nodes.inflow[uj] > 0.0) {
@@ -3447,16 +3636,10 @@ void SWMMEngine::computeFinalStorage() noexcept {
                  + soa.depth_imperv1[ui] * f1
                  + soa.depth_perv[ui] * fp) * area;
         }
-        // Credit water retained inside LID units — otherwise LID retention
-        // reads as a continuity leak (issue #102 C). Matches legacy
-        // subcatch_getStorage()'s + lid_getStoredVolume() term.
-        ctx_.mass_balance.runoff_final_store += lid_.totalStoredVolume();
+        // Water still held in LID units is runoff-system storage (legacy
+        // massbal counts lid_getStoredVolume() in final storage).
+        ctx_.mass_balance.runoff_final_store += lid_.storedVolume();
     }
-
-    // (LID exfiltration / evaporation are folded into the runoff-continuity
-    //  infil / evap terms per-step in accumulateRunoffMassBalance — this
-    //  function is called every routing step, so cumulative terms cannot be
-    //  added here.)
 
     // B8. Compute routing final storage for mass balance
     //     Sum node volumes + link volumes (matching legacy). Nodes use the
@@ -3470,6 +3653,33 @@ void SWMMEngine::computeFinalStorage() noexcept {
     for (int j = 0; j < ctx_.n_links(); ++j) {
         auto uj = static_cast<std::size_t>(j);
         ctx_.mass_balance.routing_final_storage += ctx_.links.volume[uj];
+    }
+
+    // B8a. Final stored pollutant mass — the closing term of the quality
+    //      ledger, mirroring the opening term recorded in initMassBalance().
+    //      Without it every quality continuity error was reported as the whole
+    //      of the mass still in the system (~51 % on a steady feed).
+    //      Legacy: massbal_getStoredMass().
+    {
+        const int np = ctx_.n_pollutants();
+        for (int p = 0; p < np; ++p) {
+            const auto up = static_cast<std::size_t>(p);
+            if (up >= ctx_.mass_balance.qual_routing_final.size()) break;
+            double m = 0.0;
+            for (int j = 0; j < ctx_.n_nodes(); ++j) {
+                const auto idx = static_cast<std::size_t>(j) *
+                                 static_cast<std::size_t>(np) + up;
+                if (idx < ctx_.nodes.conc.size())
+                    m += ctx_.nodes.conc[idx] * reportedNodeVolume(j);
+            }
+            for (int j = 0; j < ctx_.n_links(); ++j) {
+                const auto uj  = static_cast<std::size_t>(j);
+                const auto idx = uj * static_cast<std::size_t>(np) + up;
+                if (idx < ctx_.links.conc.size())
+                    m += ctx_.links.conc[idx] * ctx_.links.volume[uj];
+            }
+            ctx_.mass_balance.qual_routing_final[up] = m;
+        }
     }
 }
 
@@ -3618,7 +3828,9 @@ void SWMMEngine::postOutputSnapshot(double /*dt_step*/) noexcept {
             snap.link_count       = ctx_.n_links();
             snap.subcatch_count   = ctx_.n_subcatches();
             snap.gage_count       = ctx_.n_gages();
-            snap.pollut_count     = ctx_.n_pollutants();
+            // A2b: the reported species block is pollutants + the water-age
+            // pseudo-column, so consumers stride by the REPORTED count.
+            snap.pollut_count     = ctx_.n_reported_species();
             snap.flow_units_code  = static_cast<int>(ctx_.options.flow_units);
 
             // Legacy-parity interpolation weight at the report instant
@@ -3953,12 +4165,105 @@ void SWMMEngine::postOutputSnapshot(double /*dt_step*/) noexcept {
                 }
             }
 
+            // ---------------------------------------------------------------
+            // Pollutant concentrations.
+            //
+            // These three vectors are what DefaultOutputPlugin (binary .out)
+            // and GeoPackageOutputPlugin write into their pollutant columns.
+            // NOTHING populated them: both readers guard with
+            // `qi < size()` and fall back to 0.0, so every pollutant column
+            // in every .out file was written as ZERO while the header
+            // advertised the column count and unit codes. The engine's own
+            // state was correct throughout (nodes.conc / links.conc carry
+            // the routed values, which is why the transport gates — all of
+            // which read the arrays directly — never saw it).
+            //
+            // Interpolation matches the neighbouring fields AND legacy:
+            //   node.c:502    z = f1*oldQual[p] + wt*newQual[p]
+            //   link.c:724    c = f1*oldQual[p] + f *newQual[p]
+            //   subcatch.c:929-930  runoff == 0 ? 0 : f1*old + wt*new
+            // Concentrations are already in user units (no UCF applies).
+            // IGNORE_QUALITY leaves the vectors EMPTY, which is also what
+            // the writer wants (it sets n_polluts_ = 0 in that mode).
+            //
+            // A2b: the reported block is (pollutants, then water age when
+            // enabled) — see ctx_.reported_species_names. TWO strides are in
+            // play and must not be confused (lessons 14/15): the SOURCE
+            // arrays are np-strided (nodes.conc etc.), the REPORTED arrays
+            // are nr-strided. Age converts SECONDS → HOURS here, the unit
+            // the plan reports it in (§1).
+            if (!ctx_.options.ignore_quality &&
+                ctx_.n_reported_species() > 0) {
+                const auto np_s = static_cast<std::size_t>(ctx_.n_pollutants());
+                const auto nr_s =
+                    static_cast<std::size_t>(ctx_.n_reported_species());
+                const auto nN_s = static_cast<std::size_t>(ctx_.n_nodes());
+                const auto nL_s = static_cast<std::size_t>(ctx_.n_links());
+                const auto nS_s = static_cast<std::size_t>(ctx_.n_subcatches());
+                const bool age_col = ctx_.options.water_age && nr_s > np_s;
+                constexpr double kSecPerHour = 3600.0;
+
+                snap.node_quality.assign(nN_s * nr_s, 0.0);
+                for (std::size_t n = 0; n < nN_s; ++n) {
+                    for (std::size_t p = 0; p < np_s; ++p) {
+                        const std::size_t src = n * np_s + p;
+                        if (src < ctx_.nodes.conc.size() &&
+                            src < ctx_.nodes.conc_old.size())
+                            snap.node_quality[n * nr_s + p] =
+                                f1_rt * ctx_.nodes.conc_old[src] +
+                                f_rt * ctx_.nodes.conc[src];
+                    }
+                    // Age is a published state (already the step's value),
+                    // so it takes no old/new interpolation — there is no
+                    // node_age_old to weight against.
+                    if (age_col && n < ctx_.water_age_state.node_age.size())
+                        snap.node_quality[n * nr_s + np_s] =
+                            ctx_.water_age_state.node_age[n] / kSecPerHour;
+                }
+
+                snap.link_quality.assign(nL_s * nr_s, 0.0);
+                for (std::size_t l = 0; l < nL_s; ++l) {
+                    for (std::size_t p = 0; p < np_s; ++p) {
+                        const std::size_t src = l * np_s + p;
+                        if (src < ctx_.links.conc.size() &&
+                            src < ctx_.links.conc_old.size())
+                            snap.link_quality[l * nr_s + p] =
+                                f1_rt * ctx_.links.conc_old[src] +
+                                f_rt * ctx_.links.conc[src];
+                    }
+                    if (age_col && l < ctx_.water_age_state.link_age.size())
+                        snap.link_quality[l * nr_s + np_s] =
+                            ctx_.water_age_state.link_age[l] / kSecPerHour;
+                }
+
+                // Subcatchment washoff carries legacy's runoff gate: a
+                // subcatchment with no runoff reports 0, not its residual
+                // concentration (subcatch.c:929). Subcatchment AGE is plan
+                // phase A3 (watershed age states), so its column stays 0
+                // here rather than reporting a value it does not track.
+                snap.subcatch_quality.assign(nS_s * nr_s, 0.0);
+                for (std::size_t s = 0; s < nS_s; ++s) {
+                    const bool has_runoff =
+                        (s < ctx_.subcatches.runoff.size() &&
+                         ctx_.subcatches.runoff[s] != 0.0);
+                    if (!has_runoff) continue;
+                    for (std::size_t p = 0; p < np_s; ++p) {
+                        const std::size_t src = s * np_s + p;
+                        if (src < ctx_.subcatches.conc.size() &&
+                            src < ctx_.subcatches.conc_old.size())
+                            snap.subcatch_quality[s * nr_s + p] =
+                                f1_rt * ctx_.subcatches.conc_old[src] +
+                                f_rt * ctx_.subcatches.conc[src];
+                    }
+                }
+            }
+
             // Attach name table pointers (valid for lifetime of ctx_)
             snap.node_ids     = &ctx_.node_names.names();
             snap.link_ids     = &ctx_.link_names.names();
             snap.subcatch_ids = &ctx_.subcatch_names.names();
             snap.gage_ids     = &ctx_.gage_names.names();
-            snap.pollut_names = &ctx_.pollutant_names.names();
+            snap.pollut_names = &ctx_.reported_species_names;
 
             io_thread_.post(std::move(snap));
         }
@@ -4238,6 +4543,11 @@ int SWMMEngine::report() noexcept {
 // ============================================================================
 
 int SWMMEngine::close() noexcept {
+    // Load-phase breakdown. Emitted here rather than from end() so it reports
+    // for a bare open()+close() too — the benchmark harness times open alone,
+    // open+initialize, and the full sequence. (See core/PerfTimers.hpp.)
+    if (perf::enabled()) perf::dump_load();
+
     // Stop IO thread if still running (safe to call even if already stopped)
     io_thread_.stop();
 
@@ -4382,28 +4692,16 @@ void SWMMEngine::applyForcings(double dt) noexcept {
         // mixing during the same routing step.
 
         // ---- Persistent user quality mass flux (user_conc_mass_flux) ----
-        // Applied as additive mass source each step, analogous to user_lat_flow.
-        // mass_rate is in mass/sec; converted to concentration delta via volume.
-        if (!ctx_.nodes.user_conc_mass_flux.empty()) {
-            for (int i = 0; i < ctx_.n_nodes(); ++i) {
-                auto ui = static_cast<std::size_t>(i);
-                double vol = ctx_.nodes.volume[ui];
-                for (int p = 0; p < np; ++p) {
-                    auto flat = ui * static_cast<std::size_t>(np)
-                              + static_cast<std::size_t>(p);
-                    double mass_rate = ctx_.nodes.user_conc_mass_flux[flat];
-                    if (mass_rate == 0.0) continue;
-
-                    // Convert mass flux to concentration: C += (mass_rate * dt) / volume
-                    if (vol > 0.0) {
-                        ctx_.nodes.conc[flat] += mass_rate * dt / vol;
-                    }
-                    // Track cumulative forced quality mass (mass = rate * dt)
-                    ctx_.mass_balance.routing_forcing_qual_inflow[
-                        static_cast<std::size_t>(p)] += mass_rate * dt;
-                }
-            }
-        }
+        // NOT applied here. It used to be a post-quality concentration bump
+        // (C += mass_rate*dt/volume), which the next routing step's mixing
+        // overwrote, so the forced mass was booked in the ledger but never
+        // actually entered the system. It is delivered in the loader stage
+        // instead — QualitySolver::addExtInflowLoads() — exactly as legacy
+        // addExternalInflows() does it (routing.c: Node[j].newQual[p] += w;
+        // massbal_addInflowQual(EXTERNAL_INFLOW, p, w)). That is also the
+        // only place that reaches BOTH the legacy CSTR mixing and the ARD
+        // node stores. This mirrors the forced-lateral-inflow treatment,
+        // which likewise counts as external inflow (issue #113).
     }
 }
 
@@ -4586,10 +4884,10 @@ void SWMMEngine::emit_progress() noexcept {
 // ============================================================================
 
 void SWMMEngine::init_modules() noexcept {
-    initHydraulics();
-    initHydrology();
-    initQuality();
-    initGeometry();
+    { perf::ScopedTimer _pt(perf::sec_init_hydraulics); initHydraulics(); }
+    { perf::ScopedTimer _pt(perf::sec_init_hydrology);  initHydrology();  }
+    { perf::ScopedTimer _pt(perf::sec_init_quality);    initQuality();    }
+    { perf::ScopedTimer _pt(perf::sec_init_geometry);   initGeometry();   }
     initMassBalance();
 
     // Allocate forcing arrays to match object counts
@@ -4930,33 +5228,13 @@ void SWMMEngine::initHydraulics() noexcept {
  *          states, and initializes snow, groundwater, and LID solvers.
  */
 void SWMMEngine::initHydrology() noexcept {
-    // 1. Pre-populate each subcatchment's total LID footprint (ft²) BEFORE the
-    //    runoff solver initialises. RunoffSolver::init() sizes the pervious /
-    //    impervious subareas as (full_area − total_lid_area_ft2), but lid_.init()
-    //    (which normally fills total_lid_area_ft2) runs later in the init
-    //    sequence — so without this pre-pass the runoff solver reads zero LID
-    //    area and the LID footprint is never removed from the runoff-producing
-    //    area, making LIDs a near-noop on subcatchment runoff (issue #102 B).
-    //    lid_.init() recomputes the identical sum later; this is idempotent.
-    {
-        int n_sc = ctx_.n_subcatches();
-        if (n_sc > 0) {
-            const double ucfLen2 = ucf::UCF(ucf::LENGTH, ctx_.options)
-                                 * ucf::UCF(ucf::LENGTH, ctx_.options);
-            ctx_.subcatches.total_lid_area_ft2.assign(
-                static_cast<std::size_t>(n_sc), 0.0);
-            const auto& lu = ctx_.lid_usage;
-            for (int j = 0; j < lu.count(); ++j) {
-                auto uj = static_cast<std::size_t>(j);
-                int sc = lu.subcatch_index[uj];
-                if (sc < 0 || sc >= n_sc) continue;
-                int num = (uj < lu.number.size()) ? lu.number[uj] : 1;
-                if (num < 1) num = 1;
-                ctx_.subcatches.total_lid_area_ft2[static_cast<std::size_t>(sc)]
-                    += lu.area[uj] * static_cast<double>(num) / ucfLen2;  // → ft²
-            }
-        }
-    }
+    // 1. LID solver — must run before the runoff solver: it fills
+    //    ctx_.subcatches.total_lid_area_ft2, which RunoffSolver::init()
+    //    subtracts from the runoff-generating area (Gap #23). With the
+    //    order reversed the array is still zeroed, the subtraction is a
+    //    no-op, and the LID footprint's rainfall is counted twice
+    //    (issue #131).
+    lid_.init(ctx_);
 
     // 2. Runoff solver: populate RunoffSoA from subcatchment properties
     runoff_.init(ctx_);
@@ -5267,8 +5545,8 @@ void SWMMEngine::initHydrology() noexcept {
         }
     }
 
-    // 7. LID solver
-    lid_.init(ctx_);
+    // 7. LID solver: initialized first (step 1) so total_lid_area_ft2 is
+    //    populated before RunoffSolver::init() consumes it.
 
     // Gap #82: LID parameter validation
     {
@@ -5330,6 +5608,48 @@ void SWMMEngine::initHydrology() noexcept {
 void SWMMEngine::initQuality() noexcept {
     // 7. Quality solver
     quality_.init(ctx_.n_nodes(), ctx_.n_links(), ctx_.n_pollutants());
+
+    // Seed initial concentrations from [POLLUTANTS] Cinit. A wet node/link
+    // starts at the pollutant's initial concentration, a dry one at zero —
+    // legacy qualrout.c qualrout_init(), called from routing_open() at the
+    // same point in the sequence (after the router has set initial depths).
+    // Without this every run started clean and "Initial Stored Mass" was
+    // always 0.
+    {
+        const int np = ctx_.n_pollutants();
+        if (np > 0) {
+            // Legacy qualrout.c: static const double ZeroDepth = 0.003281 (1 mm).
+            constexpr double zero_depth = 0.003281;
+            for (int i = 0; i < ctx_.n_nodes(); ++i) {
+                const auto ui = static_cast<std::size_t>(i);
+                const bool wet = ctx_.nodes.depth[ui] > zero_depth;
+                for (int p = 0; p < np; ++p) {
+                    const auto idx = ui * static_cast<std::size_t>(np) +
+                                     static_cast<std::size_t>(p);
+                    if (idx >= ctx_.nodes.conc.size()) continue;
+                    const double c = wet
+                        ? ctx_.pollutants.init_conc[static_cast<std::size_t>(p)]
+                        : 0.0;
+                    ctx_.nodes.conc[idx]     = c;
+                    ctx_.nodes.conc_old[idx] = c;
+                }
+            }
+            for (int j = 0; j < ctx_.n_links(); ++j) {
+                const auto uj = static_cast<std::size_t>(j);
+                const bool wet = ctx_.links.depth[uj] > zero_depth;
+                for (int p = 0; p < np; ++p) {
+                    const auto idx = uj * static_cast<std::size_t>(np) +
+                                     static_cast<std::size_t>(p);
+                    if (idx >= ctx_.links.conc.size()) continue;
+                    const double c = wet
+                        ? ctx_.pollutants.init_conc[static_cast<std::size_t>(p)]
+                        : 0.0;
+                    ctx_.links.conc[idx]     = c;
+                    ctx_.links.conc_old[idx] = c;
+                }
+            }
+        }
+    }
 
     // 10. Treatment: resize for nodes x pollutants + compile expressions
     if (ctx_.n_pollutants() > 0 && ctx_.n_nodes() > 0) {
@@ -5678,6 +5998,11 @@ void SWMMEngine::assembleRunon(double dt_runoff) noexcept {
             double vol = ctx_.subcatches.outfall_runon_vol[ui];
             if (vol > 0.0) {
                 ctx_.subcatches.runon_inflow[ui] += vol / dt_runoff;
+                // Water re-entering the runoff system from an outfall is new
+                // inflow to its mass balance (legacy runoff.c:520
+                // RUNOFF_RUNON) — without this, LID or subarea uptake of the
+                // routed volume reads as a continuity error (issue #131).
+                ctx_.mass_balance.runoff_runon += vol;
                 ctx_.subcatches.outfall_runon_vol[ui] = 0.0;
             }
         }
@@ -5923,8 +6248,6 @@ double SWMMEngine::reportedNodeVolume(int i, double depth,
 void SWMMEngine::initMassBalance() noexcept {
     // 14. Mass balance: record initial storage (nodes + links, matching legacy)
     ctx_.mass_balance.reset();
-    prev_lid_infil_vol_ = 0.0;  // reset per-step LID infil/evap delta trackers
-    prev_lid_evap_vol_  = 0.0;
     for (int j = 0; j < ctx_.n_nodes(); ++j) {
         // Legacy-convention node volume (junctions => 0) so init storage matches
         // legacy; the internal volume-state is unchanged.
@@ -5935,6 +6258,32 @@ void SWMMEngine::initMassBalance() noexcept {
             ctx_.links.volume[static_cast<std::size_t>(j)];
     }
 
+    // Initial stored pollutant mass, from the concentrations initQuality()
+    // seeded out of [POLLUTANTS] Cinit. Legacy: massbal_open() sums
+    // Node[j].newQual[p] * Node[j].newVolume + Link[j].newQual[p] * link volume
+    // into QualTotals[p].initStorage.
+    {
+        const int np = ctx_.n_pollutants();
+        for (int p = 0; p < np; ++p) {
+            const auto up = static_cast<std::size_t>(p);
+            if (up >= ctx_.mass_balance.qual_routing_init.size()) break;
+            double m = 0.0;
+            for (int j = 0; j < ctx_.n_nodes(); ++j) {
+                const auto idx = static_cast<std::size_t>(j) *
+                                 static_cast<std::size_t>(np) + up;
+                if (idx < ctx_.nodes.conc.size())
+                    m += ctx_.nodes.conc[idx] * reportedNodeVolume(j);
+            }
+            for (int j = 0; j < ctx_.n_links(); ++j) {
+                const auto uj  = static_cast<std::size_t>(j);
+                const auto idx = uj * static_cast<std::size_t>(np) + up;
+                if (idx < ctx_.links.conc.size())
+                    m += ctx_.links.conc[idx] * ctx_.links.volume[uj];
+            }
+            ctx_.mass_balance.qual_routing_init[up] = m;
+        }
+    }
+
     // Record initial runoff storage
     for (int j = 0; j < ctx_.n_subcatches(); ++j) {
         // Initial surface storage approximated from initial depth * area
@@ -5942,9 +6291,9 @@ void SWMMEngine::initMassBalance() noexcept {
         ctx_.mass_balance.runoff_init_store +=
             ctx_.subcatches.ponded_depth[uj] * ctx_.subcatches.area[uj];
     }
-    // Initial LID storage (INITSAT-filled soil/storage layers) — symmetric with
-    // the final-storage LID credit so the runoff continuity balances (#102 C).
-    ctx_.mass_balance.runoff_init_store += lid_.totalInitVolume();
+    // Initial water in LID units (InitSat + wilting-point soil moisture) is
+    // part of runoff storage, mirroring the final-storage accounting.
+    ctx_.mass_balance.runoff_init_store += lid_.storedVolume();
 
     // Record initial groundwater storage
     // Legacy: GwaterTotals.initStorage += gwater_getVolume(j) * Subcatch[j].area

@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file XSectBatch.cpp
  * @brief Data-oriented batch cross-section geometry — shape-grouped SoA.
@@ -14,7 +30,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "XSectBatch.hpp"
@@ -156,6 +172,15 @@ void XSectGroups::attachTransectTables(const SimulationContext& ctx) {
 
             int ci = ctx.links.xsect_curve[uj];
             if (ci >= 0 && static_cast<std::size_t>(ci) < ctx.transect_tables.size()) {
+                // These are raw pointers INTO a vector element. They stay
+                // valid only because every API that can append to
+                // ctx.transect_tables is gated to BUILDING/OPENED
+                // (CHECK_GEOMETRY / CHECK_TOPOLOGY), so nothing can grow the
+                // store once this capture has happened. Pinned by
+                // test_engine_transect_table_stability. Relaxing that gate
+                // requires giving transect_tables stable element addresses
+                // first — std::deque is a drop-in, nothing indexes it
+                // contiguously.
                 const auto& td = ctx.transect_tables[static_cast<std::size_t>(ci)];
                 g.area_tables[uk]  = td.area_tbl;
                 g.hrad_tables[uk]  = td.hrad_tbl;

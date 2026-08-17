@@ -107,6 +107,27 @@ add_gtest_unit(test_engine_section_order_parity   test_section_order_parity.cpp)
 add_gtest_unit(test_engine_capi_file_paths        test_capi_file_paths.cpp)
 add_gtest_unit(test_engine_events_section         test_events_section.cpp)
 add_gtest_unit(test_engine_report_options_api     test_report_options_api.cpp)
+# Legacy parity for the .rpt analysis-timing block: the wall clock starts at
+# open() (before parsing) as in report_writeLogo(), and elapsed time rolls
+# whole days into a "d." prefix as in report_writeSysTime().
+add_gtest_unit(test_engine_report_timing          test_report_timing.cpp)
+add_gtest_unit(test_engine_ard_transport          test_ard_transport.cpp)
+add_gtest_unit(test_engine_process_components     test_process_components.cpp)
+add_gtest_unit(test_engine_reactions_config       test_reactions_config.cpp)
+add_gtest_unit(test_engine_reaction_expressions   test_reaction_expressions.cpp)
+add_gtest_unit(test_engine_reaction_integrators   test_reaction_integrators.cpp)
+add_gtest_unit(test_engine_reaction_legacy_binding test_reaction_legacy_binding.cpp)
+add_gtest_unit(test_engine_ard_dispersion         test_ard_dispersion.cpp)
+add_gtest_unit(test_engine_reaction_ard_binding   test_reaction_ard_binding.cpp)
+add_gtest_unit(test_engine_ard_transport_bcs      test_ard_transport_bcs.cpp)
+add_gtest_unit(test_engine_ard_e5b                test_ard_e5b.cpp)
+add_gtest_unit(test_engine_ard_node_store         test_ard_node_store.cpp)
+add_gtest_unit(test_engine_water_age              test_water_age.cpp)
+add_gtest_unit(test_engine_output_quality         test_output_quality.cpp)
+# In-place rename for snow packs / aquifers / inlets / streets / LID controls.
+# Without these APIs the GUI registries flushed a renamed object as a NEW one,
+# duplicating it in the engine and orphaning the original.
+add_gtest_unit(test_engine_object_rename          test_object_rename.cpp)
 add_gtest_unit(test_engine_options_api_units      test_options_api_units.cpp)
 add_gtest_unit(test_engine_climate_api             test_climate_api.cpp)
 add_gtest_unit(test_engine_hotstart          test_hotstart.cpp)
@@ -123,6 +144,10 @@ target_compile_definitions(test_engine_xsection PRIVATE
 )
 # STREET cross-section end-to-end (parse → street transect → routing).
 add_gtest_unit(test_engine_street_xsect      test_street_xsect.cpp)
+# ctx.transect_tables must keep cached element pointers valid as it grows —
+# XSectBatch and Link cache raw double* into its elements at initialize() and
+# swmm_link_set_xsect can append afterwards. Guards the deque choice.
+add_gtest_unit(test_engine_transect_table_stability test_transect_table_stability.cpp)
 # STREET cross-section programmatic builder API (set/get xsect + get_params).
 add_gtest_unit(test_engine_street_xsect_api  test_street_xsect_api.cpp)
 # Standalone cross-section geometry API + SWMM_XSectShape enum parity guard.
@@ -144,6 +169,7 @@ endif()
 # snowpack surfaces, inlet params/type, LID layers/type).
 add_gtest_unit(test_engine_editor_roundtrip_api test_editor_roundtrip_api.cpp)
 add_gtest_unit(test_engine_virtual_junction test_virtual_junction.cpp)
+add_gtest_unit(test_engine_fv_node_head_consistency test_fv_node_head_consistency.cpp)
 
 add_gtest_unit(test_engine_infiltration     test_infiltration.cpp)
 target_compile_definitions(test_engine_infiltration PRIVATE
@@ -163,6 +189,11 @@ add_gtest_unit(test_engine_gage_scalefactor test_gage_scalefactor.cpp)
 add_gtest_unit(test_engine_subcatch_scale_factors test_subcatch_scale_factors.cpp)
 add_gtest_unit(test_engine_gage_attributes  test_gage_attributes.cpp)
 add_gtest_unit(test_engine_gage_file_roundtrip test_gage_file_roundtrip.cpp)
+
+# USER_CSV rain-file loading (documented in the manual, previously never read —
+# such a gage contributed zero rainfall silently) plus the guard that the
+# resolved-series API cannot drift from what updateAllGages applies.
+add_gtest_unit(test_engine_gage_rain_series test_gage_rain_series.cpp)
 add_gtest_unit(test_engine_climate          test_climate.cpp)
 add_gtest_unit(test_engine_lid              test_lid.cpp)
 target_compile_definitions(test_engine_lid PRIVATE

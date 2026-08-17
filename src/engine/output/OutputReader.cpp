@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file OutputReader.cpp
  * @brief OutputReader — reads SWMM 5.x binary .out files.
@@ -13,7 +29,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "OutputReader.hpp"
@@ -93,6 +109,12 @@ const char* OutputReader::node_id(int index) const {
 const char* OutputReader::link_id(int index) const {
     if (index < 0 || index >= n_links_) return nullptr;
     return link_ids_[static_cast<std::size_t>(index)].c_str();
+}
+
+const char* OutputReader::pollut_id(int index) const {
+    if (index < 0 || static_cast<std::size_t>(index) >= pollut_ids_.size())
+        return nullptr;
+    return pollut_ids_[static_cast<std::size_t>(index)].c_str();
 }
 
 // ============================================================================
@@ -348,6 +370,9 @@ bool OutputReader::readIDs() {
     if (!readIDList(n_subcatch_, subcatch_ids_)) return false;
     if (!readIDList(n_nodes_, node_ids_))        return false;
     if (!readIDList(n_links_, link_ids_))        return false;
+    // The species (pollutant) ID list — emitted by the writer immediately
+    // after the link IDs since the format's inception, but never read.
+    if (!readIDList(n_polluts_, pollut_ids_))    return false;
 
     return true;
 }
