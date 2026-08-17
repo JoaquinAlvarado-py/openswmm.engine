@@ -2917,7 +2917,8 @@ void SWMMEngine::stepRouting(double dt_routing) noexcept {
         // sign convention was ruled on (DynamicWave.cpp, pre-existing). The
         // ruling is settled: the engine accumulates sumdqdh POSITIVE with
         // dQ_net/dH = −sumdqdh and the Crank-Nicolson denominator is
-        // A + 0.5·dt·sumdqdh (see the fix in commit 93e69073), so adding the
+        // A + 0.5·dt·sumdqdh (see the fix in commit f0bc24e7; the parallel
+        // cherry-pick d2ddc272 mirrors it), so adding the
         // positive coupling conductance G there is identical damping in both
         // branches — EXTRAN's surcharge denominator and SEMI_IMPLICIT's
         // unified denominator both grow with sumdqdh.
