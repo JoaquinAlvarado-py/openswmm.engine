@@ -2239,6 +2239,10 @@ int SWMMEngine::refreshTreatment(int node_idx, int pollut_idx) noexcept {
  */
 void SWMMEngine::refreshLIDDrainParams() noexcept {
     const auto& drain = ctx_.lid_controls.drain;
+    // Mirror the LID init() unit conversions (issue #102): coeff/expon stay in
+    // user units (converted at compute time by getDrainRate); the head-based
+    // columns convert in|mm → ft and the delay converts hours → seconds.
+    const double ucfRainDepth = ucf::UCF(ucf::RAINDEPTH, ctx_.options);
     for (int t = 0; t < lid_.numGroups(); ++t) {
         auto& g = lid_.group(t);
         for (int i = 0; i < g.count; ++i) {
@@ -2248,10 +2252,10 @@ void SWMMEngine::refreshLIDDrainParams() noexcept {
             const auto& p = drain[static_cast<std::size_t>(li)];
             g.drain_coeff[ui]  = p[0];
             g.drain_expon[ui]  = p[1];
-            g.drain_offset[ui] = p[2];
-            g.drain_delay[ui]  = p[3];
-            g.drain_hopen[ui]  = p[4];
-            g.drain_hclose[ui] = p[5];
+            g.drain_offset[ui] = p[2] / ucfRainDepth;
+            g.drain_delay[ui]  = p[3] * 3600.0;
+            g.drain_hopen[ui]  = p[4] / ucfRainDepth;
+            g.drain_hclose[ui] = p[5] / ucfRainDepth;
         }
     }
 }

@@ -84,6 +84,12 @@ struct LIDGroupSoA {
     LIDType type = LIDType::BIO_CELL;
     int count = 0;
 
+    // Underdrain head/rate conversion factors (US/SI, per the model's flow
+    // units). drain_coeff/drain_expon stay in user units and are converted
+    // inside getDrainRate() exactly as legacy getStorageDrainRate (issue #102).
+    double ucf_raindepth = 1.0;   ///< UCF(RAINDEPTH): in|mm → ft
+    double ucf_rainfall  = 1.0;   ///< UCF(RAINFALL): in/hr|mm/hr → ft/sec
+
     std::vector<int> subcatch_idx;     ///< Which subcatchment this unit belongs to
     std::vector<int> control_idx;      ///< LID control index (into ctx.lid_controls)
     std::vector<double> area;          ///< Unit area (ft2)
