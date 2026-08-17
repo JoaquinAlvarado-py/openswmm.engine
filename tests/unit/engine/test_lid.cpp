@@ -54,9 +54,11 @@ static SimulationContext makeLidContext(
     const std::array<double,7>& soil,
     const std::array<double,4>& storage,
     const std::array<double,6>& drain,
-    double area = 1000.0, double width = 50.0, double init_sat = 0.0)
+    double area = 1000.0, double width = 50.0, double init_sat = 0.0,
+    FlowUnits flow_units = FlowUnits::CFS)
 {
     SimulationContext ctx;
+    ctx.options.flow_units = flow_units;
 
     // Add one subcatchment
     ctx.subcatch_names.add("S1");
@@ -155,6 +157,48 @@ TEST(LIDModelBuilder, SingleBioCellPopulated) {
     EXPECT_NEAR(g.stor_thick[0], 1.0 / 12.0, 1e-10);
     EXPECT_NEAR(g.drain_coeff[0], 0.5, 1e-10);
     EXPECT_NEAR(g.area[0], 1000.0, 1e-10);  // ft² (US: UCF(LENGTH)=1)
+}
+
+// SI-unit mirror of SingleBioCellPopulated: exercises the same layer
+// conversions under the metric unit system (flow_units CMS → unit_system 1,
+// UCF(RAINDEPTH)=304.8 mm→ft, UCF(RAINFALL)=1097280 mm/hr→ft/sec,
+// UCF(LENGTH)=0.3048 m→ft). Locks in the ~10^5-10^6x unit bug that the
+// swmm6_rel sync's unit-conversion restore (06e1846f, issue #102) cured:
+// with the conversions missing, a 30 mm soil column would read as 30 ft and
+// a 5 mm/hr Ksat as 5 ft/sec.
+TEST(LIDModelBuilder, SingleBioCellPopulatedSI) {
+    auto ctx = makeLidContext("BC",
+        {20.0, 0.0, 0.1, 1.0, 0.0},   // surface: 20mm store, n=0.1, slope=1%
+        {30.0, 0.45, 0.20, 0.10, 5.0, 30.0, 6.0},  // soil: 30mm thick, Ksat 5mm/hr
+        {40.0, 0.5, 0.0, 0.0},         // storage: 40mm thick, void ratio 0.5
+        {0.5, 0.5, 0.0, 0.0, 0.0, 0.0}, // drain
+        1000.0, 50.0, 0.0, FlowUnits::CMS);
+
+    LIDSolver solver;
+    solver.init(ctx);
+
+    const auto& g = solver.group(0); // BIO_CELL
+    EXPECT_EQ(g.count, 1);
+    // Usage area/width arrive in m²/m and are converted to ft²/ft.
+    EXPECT_NEAR(g.area[0], 1000.0 / (0.3048 * 0.3048), 1e-6);
+    EXPECT_NEAR(g.full_width[0], 50.0 / 0.3048, 1e-10);
+    // Layer depths arrive in mm and are converted to internal ft.
+    EXPECT_NEAR(g.surf_store[0], 20.0 / 304.8, 1e-12);
+    EXPECT_NEAR(g.soil_thick[0], 30.0 / 304.8, 1e-12);
+    EXPECT_NEAR(g.stor_thick[0], 40.0 / 304.8, 1e-12);
+    EXPECT_NEAR(g.soil_suction[0], 6.0 / 304.8, 1e-12);
+    // Conductivity arrives in mm/hr and is converted to internal ft/sec.
+    EXPECT_NEAR(g.soil_ksat[0], 5.0 / 1097280.0, 1e-14);
+    // Porosity / field capacity / wilting point are dimensionless.
+    EXPECT_NEAR(g.soil_poros[0], 0.45, 1e-10);
+    EXPECT_NEAR(g.soil_fc[0], 0.20, 1e-10);
+    EXPECT_NEAR(g.soil_wp[0], 0.10, 1e-10);
+    // Void ratio → fraction (0.5 → 0.5/1.5).
+    EXPECT_NEAR(g.stor_void[0], 0.5 / 1.5, 1e-10);
+    // Drain coeff stays in user units; per-unit conversion factors recorded.
+    EXPECT_NEAR(g.drain_coeff[0], 0.5, 1e-10);
+    EXPECT_NEAR(g.ucf_raindepth, 304.8, 1e-10);
+    EXPECT_NEAR(g.ucf_rainfall, 1097280.0, 1e-10);
 }
 
 TEST(LIDModelBuilder, InitialSaturationSetsState) {
