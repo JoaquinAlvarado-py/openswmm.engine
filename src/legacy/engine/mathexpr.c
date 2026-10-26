@@ -847,10 +847,15 @@ double mathexpr_eval(MathExpr* expr, double (*getVariableValue)(int))
             if (stackindex < 0)
                 break;
             r2 = ExprStack[stackindex];
-            if (r2 <= 0.0)
-                r2 = 0.0;
-            else
+            /* --- NUM-51 domain guard (the 5.3.0-corrected rule): a negative
+             * base has a real power only for a whole exponent; a fractional
+             * exponent and a zero base evaluate to 0. A NaN base is absorbed
+             * (both sign tests false); a NaN exponent with a positive base
+             * still propagates from pow(). Comparison stays exact. */
+            if (r2 > 0.0 || (r2 < 0.0 && r1 == floor(r1)))
                 r2 = pow(r2, r1);
+            else
+                r2 = 0.0;
             ExprStack[stackindex] = r2;
             break;
         }

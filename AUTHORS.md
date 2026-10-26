@@ -19,6 +19,11 @@ OpenSWMM is built on the EPA SWMM 5.x foundation and extended by the contributor
   spatial fields, 1D network ROM, cross-layer coupling) is in progress on a feature
   branch and is not yet part of a release.
 
+- **Joaquín Alvarado** (@JoaquinAlvarado-py) -- Reported and fixed NUM-51:
+  powers of non-positive bases in the `[TREATMENT]`, `[GWF]` and control-rule
+  expression evaluators returned NaN in the new engine and wrong values in
+  the legacy engine.
+
 - **GitHub Copilot coding agent** -- `swmm_NODE_OUTFLOW` in the `getNodeValue` API and
   both binding trees (PR #85), and Error 227 for zero channel Manning's *n* in the
   transect reader, in both the legacy and refactored engines (PR #77).

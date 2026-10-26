@@ -769,7 +769,15 @@ double evaluate(const TreatExpr& expr, double c, double dt, double hrt, double q
                 stk.push(b != 0.0 ? a / b : 0.0);
                 break;
             case TokenType::POW:
-                stk.push(std::pow(a, b));
+                // NUM-51 domain guard (corrected 5.3.0 legacy rule): a
+                // negative base has a real power only for a whole exponent;
+                // a fractional exponent of a negative base, and any power of
+                // a zero base, is 0. NaN bases are absorbed (both sign tests
+                // false - the 5.3.0 rule's behavior); NaN exponents with a
+                // positive base still propagate from pow(). Overflow is
+                // unchanged. Keeps the result finite for domain errors
+                // without deviating from the C rule.
+                stk.push((a > 0.0 || (a < 0.0 && b == std::floor(b))) ? std::pow(a, b) : 0.0);
                 break;
             default:
                 break;
@@ -1133,7 +1141,15 @@ double evaluate(const TreatExpr& expr, double c, double dt, double hrt, double q
                 stk.push(b != 0.0 ? a / b : 0.0);
                 break;
             case TokenType::POW:
-                stk.push(std::pow(a, b));
+                // NUM-51 domain guard (corrected 5.3.0 legacy rule): a
+                // negative base has a real power only for a whole exponent;
+                // a fractional exponent of a negative base, and any power of
+                // a zero base, is 0. NaN bases are absorbed (both sign tests
+                // false - the 5.3.0 rule's behavior); NaN exponents with a
+                // positive base still propagate from pow(). Overflow is
+                // unchanged. Keeps the result finite for domain errors
+                // without deviating from the C rule.
+                stk.push((a > 0.0 || (a < 0.0 && b == std::floor(b))) ? std::pow(a, b) : 0.0);
                 break;
             default:
                 break;

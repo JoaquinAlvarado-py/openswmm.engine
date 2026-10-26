@@ -23,6 +23,10 @@ retroactive.
 
 ## [Unreleased]
 
+### Power of a non-positive base in expression evaluators (2026-10-26)
+
+- The `^` operator in `[TREATMENT]`, `[GWF]` and control-rule expressions no longer returns NaN for domain errors: whole-number exponents of a negative base are real (`(TSS - 13)^2` with TSS = 10 gives 9 in both engines); a fractional exponent of a negative base and any power of a zero base evaluate to 0, matching the out-of-domain behavior of `sqrt()` (swmm-code-review NUM-51). This is a domain guard, not a general non-finite guarantee: overflow still yields `inf` and a NaN exponent with a positive base still propagates from `pow()`, as in the corrected legacy rule; a NaN base is absorbed as the 5.3.0-corrected rule does. The legacy engine previously collapsed *every* negative-base power to 0 (so `(TSS - 13)^2` gave 0 and `(TSS - 12)^3` collapsed inside `30 + (TSS - 12)^3`), and the new engine returned NaN for fractional exponents, which a `[TREATMENT]` equation turned into a poisoned node concentration. This intentionally ends bit-for-bit parity with shipped EPA 5.2.4/5.3.0 for signed-power expressions.
+
 ### Portable development wheels and legacy option parsing (2026-10-24)
 
 - ARM64 engine builds use the portable CPU baseline by default. Local builds can opt into `-mcpu=native` with `OPENSWMM_NATIVE_CPU=ON`. Linux base and OpenMP companion wheel builds now reject SVE/SME and AVX-512 instructions before the release gates can pass.

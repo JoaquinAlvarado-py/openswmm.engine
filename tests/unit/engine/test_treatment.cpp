@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <cmath>
 #include <string>
+#include <vector>
 
 #include "quality/Treatment.hpp"
 #include "data/QualityData.hpp"
@@ -340,4 +341,99 @@ TEST(TreatApply, ConcentrationZeroSetsToZero) {
     ASSERT_EQ(parse("C = 0.0", expr), 0);
     double cOut = applyTreatment(expr, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     EXPECT_NEAR(cOut, 0.0, 1e-10);
+}
+
+// ============================================================================
+// NUM-51: power of a non-positive base
+//
+// `^` in treatment expressions must never produce a non-finite value:
+// whole-number exponents of a negative base are real; a fractional exponent
+// of a negative base (and any power of a zero base) is 0, matching the
+// out-of-domain behavior of sqrt() in both engines. Regression for the
+// swmm-code-review NUM-51 finding (reproducer: NUM-51_power.inp).
+// ============================================================================
+
+TEST(TreatNum51, NegativeBaseWholeExponentIsReal) {
+    TreatExpr expr;
+    ASSERT_EQ(parse("C = (C - 13)^2", expr), 0);
+    EXPECT_DOUBLE_EQ(evaluate(expr, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0), 9.0);
+
+    TreatExpr expr3;
+    ASSERT_EQ(parse("C = 30 + (C - 12)^3", expr3), 0);
+    EXPECT_DOUBLE_EQ(evaluate(expr3, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0), 22.0);
+}
+
+TEST(TreatNum51, FractionalPowerOfNegativeBaseIsZero) {
+    TreatExpr expr;
+    ASSERT_EQ(parse("C = 5 + (C - 14)^0.5", expr), 0);
+    EXPECT_DOUBLE_EQ(evaluate(expr, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0), 5.0);
+
+    TreatExpr expr2;
+    ASSERT_EQ(parse("C = (C - 12)^1.5", expr2), 0);
+    EXPECT_DOUBLE_EQ(evaluate(expr2, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0), 0.0);
+}
+
+TEST(TreatNum51, BaseZeroStaysZero) {
+    TreatExpr expr;
+    ASSERT_EQ(parse("C = (C - 13)^2", expr), 0);
+    EXPECT_DOUBLE_EQ(evaluate(expr, 13.0, 0.0, 0.0, 0.0, 0.0, 0.0), 0.0); // 0^2 -> 0 in legacy
+
+    TreatExpr expr0;
+    ASSERT_EQ(parse("C = (C - 13)^0", expr0), 0);
+    EXPECT_DOUBLE_EQ(evaluate(expr0, 13.0, 0.0, 0.0, 0.0, 0.0, 0.0), 0.0); // 0^0 -> 0 in legacy
+}
+
+TEST(TreatNum51, CoTreatmentPollutantReferenceWholeExponent) {
+    // Extended evaluator (bare co-pollutant reference, e.g. TSS in [TREATMENT])
+    TreatExpr expr;
+    ASSERT_EQ(parse("C = 30 + (TSS - 12)^3", expr, std::vector<std::string>{"TSS"}), 0);
+    const double cin[] = {10.0};
+    const double removal[] = {0.0};
+    const double cpollut[] = {10.0};
+    EXPECT_DOUBLE_EQ(evaluate(expr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cin, removal, 1, 0.0, cpollut),
+                     22.0);
+}
+
+TEST(TreatNum51, CoTreatmentPollutantReferenceFractionalExponent) {
+    TreatExpr expr;
+    ASSERT_EQ(parse("C = 5 + (TSS - 14)^0.5", expr, std::vector<std::string>{"TSS"}), 0);
+    const double cin[] = {10.0};
+    const double removal[] = {0.0};
+    const double cpollut[] = {10.0};
+    EXPECT_DOUBLE_EQ(evaluate(expr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cin, removal, 1, 0.0, cpollut),
+                     5.0);
+}
+
+TEST(TreatNum51, CoTreatmentNoNaNWithNegativeBase) {
+    TreatExpr expr;
+    ASSERT_EQ(parse("C = (TSS - 14)^0.5", expr, std::vector<std::string>{"TSS"}), 0);
+    const double cin[] = {10.0};
+    const double removal[] = {0.0};
+    const double cpollut[] = {10.0};
+    double result = evaluate(expr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cin, removal, 1, 0.0, cpollut);
+    EXPECT_EQ(result, result); // never NaN
+    EXPECT_DOUBLE_EQ(result, 0.0);
+}
+
+TEST(TreatNum51, ComputedNearWholeExponentPinsExactFloorCompare) {
+    // The exponent comparison stays exact (b == floor(b)), matching the C
+    // rule: 2.0000000000000004 is fractional, so a negative base yields 0
+    // rather than ~4. Pinned on purpose - a tolerance would disagree with
+    // mathexpr.c and recreate cross-evaluator drift. Exactly 2 stays real.
+    TreatExpr expr;
+    ASSERT_EQ(parse("C = (C - 15)^2", expr), 0);
+    EXPECT_DOUBLE_EQ(evaluate(expr, 13.0, 0.0, 0.0, 0.0, 0.0, 0.0), 4.0);
+
+    TreatExpr nearExpr;
+    ASSERT_EQ(parse("C = (C - 15)^2.0000000000000004", nearExpr), 0);
+    EXPECT_DOUBLE_EQ(evaluate(nearExpr, 13.0, 0.0, 0.0, 0.0, 0.0, 0.0), 0.0);
+
+    TreatExpr coExpr;
+    ASSERT_EQ(parse("C = (TSS - 15)^2.0000000000000004", coExpr, std::vector<std::string>{"TSS"}),
+              0);
+    const double cin[] = {13.0};
+    const double removal[] = {0.0};
+    const double cpollut[] = {13.0};
+    EXPECT_DOUBLE_EQ(evaluate(coExpr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cin, removal, 1, 0.0, cpollut),
+                     0.0);
 }

@@ -390,3 +390,101 @@ TEST(MathExprGW, ScientificNotation) {
     double vars[] = {100.0};
     EXPECT_NEAR(evaluate_fast(expr, vars), 0.15, 1e-15);
 }
+
+// ============================================================================
+// NUM-51: power of a non-positive base
+//
+// The `^` operator must never produce a non-finite value: whole-number
+// exponents of a negative base are real; a fractional exponent of a negative
+// base (and any power of a zero base) is 0, matching the out-of-domain
+// behavior of sqrt(), log() and log10() in both engines. Regression for the
+// swmm-code-review NUM-51 finding (reproducer: NUM-51_power.inp).
+// ============================================================================
+
+TEST(MathExprNum51, NegativeBaseWholeExponentIsReal) {
+    Expression expr;
+    ASSERT_EQ(parse("(tss - 13)^2", expr), 0);
+    double result =
+        evaluate(expr, [](const std::string& name) { return name == "tss" ? 10.0 : 0.0; });
+    EXPECT_DOUBLE_EQ(result, 9.0);
+
+    Expression expr3;
+    ASSERT_EQ(parse("30 + (tss - 12)^3", expr3), 0);
+    double result3 =
+        evaluate(expr3, [](const std::string& name) { return name == "tss" ? 10.0 : 0.0; });
+    EXPECT_DOUBLE_EQ(result3, 22.0);
+}
+
+TEST(MathExprNum51, FractionalPowerOfNegativeBaseIsZero) {
+    Expression expr;
+    ASSERT_EQ(parse("5 + (tss - 14)^0.5", expr), 0);
+    double result =
+        evaluate(expr, [](const std::string& name) { return name == "tss" ? 10.0 : 0.0; });
+    EXPECT_DOUBLE_EQ(result, 5.0);
+
+    Expression expr2;
+    ASSERT_EQ(parse("(tss - 12)^1.5", expr2), 0);
+    double result2 =
+        evaluate(expr2, [](const std::string& name) { return name == "tss" ? 10.0 : 0.0; });
+    EXPECT_DOUBLE_EQ(result2, 0.0);
+}
+
+TEST(MathExprNum51, BaseZeroStaysZero) {
+    Expression expr;
+    ASSERT_EQ(parse("(tss - 13)^2", expr), 0);
+    double result = evaluate(expr, [](const std::string&) { return 13.0; });
+    EXPECT_DOUBLE_EQ(result, 0.0); // 0^2 evaluates to 0 in legacy
+
+    Expression expr0;
+    ASSERT_EQ(parse("(tss - 13)^0", expr0), 0);
+    double result0 = evaluate(expr0, [](const std::string&) { return 13.0; });
+    EXPECT_DOUBLE_EQ(result0, 0.0); // 0^0 evaluates to 0 in legacy
+
+    Expression exprn;
+    ASSERT_EQ(parse("(tss - 13)^-1", exprn), 0);
+    double resultn = evaluate(exprn, [](const std::string&) { return 13.0; });
+    EXPECT_DOUBLE_EQ(resultn, 0.0); // 0^-1 evaluates to 0 in legacy
+}
+
+TEST(MathExprNum51, EvaluateFastMatchesEvaluate) {
+    Expression expr;
+    ASSERT_EQ(parse("0.5 * (hsw - hgw)^2", expr), 0);
+    const char* names[] = {"hgw", "hsw"};
+    bind_variables(expr, names, 2);
+
+    double below[] = {5.0, 3.0}; // base -2, whole exponent -> real
+    EXPECT_DOUBLE_EQ(evaluate_fast(expr, below), 2.0);
+}
+
+TEST(MathExprNum51, EvaluateFastFractionalPowerOfNegativeIsZero) {
+    Expression expr;
+    ASSERT_EQ(parse("min(1 + (hsw - hgw)^-0.5, 2)", expr), 0);
+    const char* names[] = {"hgw", "hsw"};
+    bind_variables(expr, names, 2);
+
+    double vars[] = {1.0, 0.0}; // base -1, fractional exponent -> 0
+    EXPECT_DOUBLE_EQ(evaluate_fast(expr, vars), 1.0);
+}
+
+TEST(MathExprNum51, ComputedNearWholeExponentPinsExactFloorCompare) {
+    // The exponent comparison stays exact (b == floor(b)), matching the C
+    // rule: 2.0000000000000004 is fractional, so a negative base yields 0
+    // rather than ~4. Pinned on purpose - a tolerance would disagree with
+    // mathexpr.c and recreate cross-evaluator drift. Exactly 2 stays real.
+    Expression expr;
+    ASSERT_EQ(parse("(tss - 15)^2", expr), 0);
+    double result = evaluate(expr, [](const std::string&) { return 13.0; });
+    EXPECT_DOUBLE_EQ(result, 4.0);
+
+    Expression nearExpr;
+    ASSERT_EQ(parse("(tss - 15)^2.0000000000000004", nearExpr), 0);
+    double nearResult = evaluate(nearExpr, [](const std::string&) { return 13.0; });
+    EXPECT_DOUBLE_EQ(nearResult, 0.0);
+
+    Expression fastExpr;
+    ASSERT_EQ(parse("1 + (tss - 15)^2.0000000000000004", fastExpr), 0);
+    const char* names[] = {"tss"};
+    bind_variables(fastExpr, names, 1);
+    double fastVars[] = {13.0};
+    EXPECT_DOUBLE_EQ(evaluate_fast(fastExpr, fastVars), 1.0);
+}

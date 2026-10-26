@@ -323,7 +323,17 @@ double evaluate(const Expression& expr,
                 stk.push(b != 0 ? a / b : 0);
                 break;
             case TokenType::POW:
-                stk.push(std::pow(a, b));
+                // NUM-51 domain guard (corrected 5.3.0 legacy rule): a
+                // negative base has a real power only for a whole exponent;
+                // a fractional exponent of a negative base, and any power of
+                // a zero base, is 0. Not a general non-finite guarantee:
+                // overflow still yields inf, and a NaN exponent with a
+                // positive base still propagates from pow(). A NaN base is
+                // absorbed because both sign comparisons are false - the
+                // 5.3.0 rule's own behavior. 0^0/0^-1 intentionally keep the
+                // legacy results (0), and the exponent comparison is exact
+                // (b == floor(b)) so every evaluator agrees with the C rule.
+                stk.push((a > 0.0 || (a < 0.0 && b == std::floor(b))) ? std::pow(a, b) : 0.0);
                 break;
             default:
                 break;
@@ -603,7 +613,13 @@ double evaluate_fast(const Expression& expr, const double* vars) noexcept {
         }
         case TokenType::POW: {
             double b = stk[--sp];
-            stk[sp - 1] = std::pow(stk[sp - 1], b);
+            // NUM-51: same domain guard as evaluate() (corrected 5.3.0 rule).
+            // NaN bases are absorbed, a zero base and fractional exponents of
+            // a negative base are 0 - all evaluators must agree exactly.
+            // Overflow still yields inf; NaN exponents with a positive base
+            // still propagate from pow().
+            const double a = stk[sp - 1];
+            stk[sp - 1] = (a > 0.0 || (a < 0.0 && b == std::floor(b))) ? std::pow(a, b) : 0.0;
             break;
         }
         case TokenType::FUNC_ABS:
