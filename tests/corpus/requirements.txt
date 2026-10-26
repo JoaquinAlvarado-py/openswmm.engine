@@ -1,0 +1,5 @@
+pandas>=2.0
+pyarrow>=14.0
+numpy>=1.21
+psutil>=5.9
+pytest>=8.0

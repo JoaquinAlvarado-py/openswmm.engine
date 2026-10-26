@@ -1,0 +1,31 @@
+  OpenSWMM Engine - VERSION 6.0 (Build 6.0.0a3)
+  ------------------------------------------------------------
+
+  FV routing deck
+
+  ****************
+  Analysis Options
+  ****************
+  Flow Units ............... CMS
+  Starting Date ............ 01/01/2004 00:00:00
+  Ending Date .............. 01/01/2004 02:00:00
+  Routing Time Step ........ 10.00 sec
+
+
+  **************************        Volume        Volume
+  Flow Routing Continuity        hectare-m      10^6 ltr
+  **************************     ---------     ---------
+  External Inflow ..........         1.000         0.000
+  External Outflow .........         1.000         0.000
+  Continuity Error (%) .....         0.250
+
+
+  *************************
+  Routing Time Step Summary
+  *************************
+  Minimum Time Step           :    10.00 sec
+  Average Time Step           :    10.00 sec
+  Maximum Time Step           :    10.00 sec
+  % of Time in Steady State   :     0.00
+  Average Substeps per Step   :   142.00
+  % of Steps Not Converging   :      n/a
